@@ -1,0 +1,152 @@
+{
+  "version": 5,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "ONNXRUNTIME_VERSION": "1.27.0",
+        "DIN_BUILD_TESTING": "ON",
+        "DIN_ENABLE_NVTX": "ON"
+      }
+    },
+    {
+      "name": "clang-cl",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_MAKE_PROGRAM": "ninja.exe",
+        "CMAKE_C_COMPILER": "clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "clang-cl.exe"
+      }
+    },
+    {
+      "name": "clang",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "msvc",
+      "hidden": true,
+      "inherits": "base"
+    },
+    {
+      "name": "windows-x64",
+      "description": "Configure for Windows x64 with Ninja, and ONNX Runtime 1.27.0.",
+      "inherits": [
+        "msvc"
+      ],
+      "cacheVariables": {
+        "CMAKE_SYSTEM_PROCESSOR": "AMD64",
+        "ONNXRUNTIME_ARCH": "x64",
+        "TRT_RTX_DOWNLOAD_URL": "https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6/TensorRT-RTX-1.6.1.120-Windows-amd64-cuda-13.4-Release-external.zip"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Win"
+        }
+      }
+    },
+    {
+      "name": "windows-arm64",
+      "description": "Configure for Windows ARM64 with Ninja, MSVC, ONNX Runtime 1.27.0, and TensorRT RTX.",
+      "inherits": [
+        "msvc"
+      ],
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_SYSTEM_PROCESSOR": "ARM64",
+        "ONNXRUNTIME_ARCH": "arm64",
+        "TRT_RTX_DOWNLOAD_URL": "https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6/TensorRT-RTX-1.6.1.120-Windows-arm64-cuda-13.4-Release-external.zip"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "WinARM"
+        }
+      }
+    },
+    {
+      "name": "linux-x64",
+      "description": "Configure for Linux x64 with Ninja, clang, ONNX Runtime 1.27.0, and TensorRT RTX.",
+      "inherits": [
+        "clang"
+      ],
+      "cacheVariables": {
+        "CMAKE_SYSTEM_PROCESSOR": "x86_64",
+        "ONNXRUNTIME_ARCH": "x64",
+        "TRT_RTX_DOWNLOAD_URL": "https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6/TensorRT-RTX-1.6.1.120-Linux-x86_64-cuda-13.4-Release-external.tar.zst"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Linux"
+        }
+      }
+    },
+    {
+      "name": "linux-arm64",
+      "description": "Configure for Linux ARM64 with Ninja, clang, ONNX Runtime 1.27.0, and TensorRT RTX.",
+      "inherits": [
+        "clang"
+      ],
+      "cacheVariables": {
+        "CMAKE_SYSTEM_PROCESSOR": "aarch64",
+        "ONNXRUNTIME_ARCH": "arm64",
+        "TRT_RTX_DOWNLOAD_URL": "https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6/TensorRT-RTX-1.6.1.120-Linux-aarch64-cuda-13.4-Release-external.tar.zst"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Spark"
+        }
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-debug",
+      "configurePreset": "windows-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-x64-release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-arm64-debug",
+      "configurePreset": "windows-arm64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-arm64-release",
+      "configurePreset": "windows-arm64",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-x64-debug",
+      "configurePreset": "linux-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "linux-x64-release",
+      "configurePreset": "linux-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-arm64-debug",
+      "configurePreset": "linux-arm64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "linux-arm64-release",
+      "configurePreset": "linux-arm64",
+      "configuration": "Release"
+    }
+  ]
+}

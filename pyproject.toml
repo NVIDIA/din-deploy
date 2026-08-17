@@ -1,0 +1,112 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind", "setuptools>=69", "wheel"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "din-deploy"
+version = "0.1.0"
+description = "Optimized local ONNX inference samples."
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "onnx",
+    "datasets",
+    "huggingface_hub",
+    "onnxruntime",
+    "onnxruntime-ep-nv-tensorrt-rtx",
+    "numpy",
+    "onnxscript",
+    "safetensors",
+    "tqdm",
+    "nanobind",
+    "matplotlib",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+parakeet = [
+    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+    "jiwer",
+    "librosa>=0.10.2",
+    "numba>=0.59",
+    "nvidia-modelopt",
+    "soundfile",
+]
+nemotron = [
+    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+    "librosa>=0.10.2",
+    "numba>=0.59",
+    "PyYAML",
+    "sentencepiece",
+    "soundfile",
+]
+nemotron-reference = [
+    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+]
+sam2 = [
+    "av",
+    "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+]
+quantization = [
+    "nvidia-modelopt",
+]
+flux = [
+    "accelerate",
+    "comfy-kitchen>=0.2.22",
+    "diffusers",
+    "nvidia-modelopt",
+    "pillow",
+    "transformers",
+]
+
+[project.scripts]
+parakeet-tdt = "rnnt.parakeet_tdt.cli:main"
+nemotron-asr = "rnnt.nemotron_asr.cli:main"
+rnnt-quantize-encoder = "rnnt.validation.quantization:main"
+
+[tool.scikit-build]
+wheel.packages = [
+    "asr/rnnt/python/rnnt",
+]
+wheel.py-api = "cp312"
+
+[tool.scikit-build.cmake.define]
+DIN_ENABLE_PARAKEET_PYTHON_BINDINGS = "ON"
+DIN_ENABLE_NEMOTRON_PYTHON_BINDINGS = "ON"
+
+[tool.pytest.ini_options]
+testpaths = ["asr/rnnt/python/tests"]
+pythonpath = ["asr/rnnt/python", "asr/rnnt/python/tests", "vision/sam2/python"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["asr/rnnt/python/rnnt", "asr/rnnt/python/tools", "asr/rnnt/python/tests", "vision/sam2/python"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"asr/rnnt/python/tools/*.py" = ["E402"]
