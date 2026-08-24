@@ -408,9 +408,9 @@ void WhisperPipeline::SetupDecodePath()
     }
     // We disable UMA for these since we make use of the double buffering on a CPU and GPU tensor
     // to submit async to the GPU while already overwriting the host value for the next inference.
-    dec_input_ids_.emplace(*decoder_, std::vector<int64_t>{1, 1}, /*use_device_io=*/true, /*disable_uma=*/ true);
-    dec_write_idx_.emplace(*decoder_, std::vector<int64_t>{1}, /*use_device_io=*/true, /*disable_uma=*/ true);
-    dec_nonpad_.emplace(*decoder_, std::vector<int64_t>{1}, /*use_device_io=*/true, /*disable_uma=*/ true);
+    dec_input_ids_.emplace(*decoder_, std::vector<int64_t>{1, 1}, /*use_device_io=*/true, /*disable_uma=*/true);
+    dec_write_idx_.emplace(*decoder_, std::vector<int64_t>{1}, /*use_device_io=*/true, /*disable_uma=*/true);
+    dec_nonpad_.emplace(*decoder_, std::vector<int64_t>{1}, /*use_device_io=*/true, /*disable_uma=*/true);
 
     // Runtime choice: use the CUDA argmax kernel only when it was compiled in, the
     // decoder's EP device is an NVIDIA GPU, and it wasn't disabled on the CLI;

@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -18,10 +19,12 @@ env:
 
 jobs:
   changes:
-    name: Determine EP build requirement
+    name: Determine build and export requirements
     runs-on: ubuntu-24.04
     outputs:
       build_trt_rtx_ep: ${{ steps.ep-build.outputs.build_trt_rtx_ep }}
+      parakeet_python_changed: ${{ steps.ep-build.outputs.parakeet_python_changed }}
+      whisper_python_changed: ${{ steps.ep-build.outputs.whisper_python_changed }}
 
     steps:
       - name: Check out source
@@ -29,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine whether to build the TensorRT RTX EP
+      - name: Determine build and export requirements
         id: ep-build
         shell: bash
         env:
@@ -41,12 +44,29 @@ jobs:
              ! git cat-file -e "${BASE_SHA}^{commit}"; then
             # There is no reliable comparison base for manually dispatched or initial runs.
             build_trt_rtx_ep=ON
-          elif git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -Eq '^(cmake/|CMakePresets\.json$)'; then
-            build_trt_rtx_ep=ON
+            whisper_python_changed=true
+            parakeet_python_changed=true
           else
-            build_trt_rtx_ep=OFF
+            changed_files="$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA")"
+            if grep -Eq '^(cmake/|CMakePresets\.json$)' <<< "$changed_files"; then
+              build_trt_rtx_ep=ON
+            else
+              build_trt_rtx_ep=OFF
+            fi
+            if grep -Eq '^asr/whisper/.*\.py$' <<< "$changed_files"; then
+              whisper_python_changed=true
+            else
+              whisper_python_changed=false
+            fi
+            if grep -Eq '^asr/rnnt/python/.*\.py$' <<< "$changed_files"; then
+              parakeet_python_changed=true
+            else
+              parakeet_python_changed=false
+            fi
           fi
           echo "build_trt_rtx_ep=$build_trt_rtx_ep" >> "$GITHUB_OUTPUT"
+          echo "whisper_python_changed=$whisper_python_changed" >> "$GITHUB_OUTPUT"
+          echo "parakeet_python_changed=$parakeet_python_changed" >> "$GITHUB_OUTPUT"
 
   clang-format:
     name: clang-format
@@ -113,11 +133,11 @@ jobs:
         run: ctest --test-dir out/build/linux-x64 --build-config Release --show-only=human
 
       - name: Upload build output
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: linux-x64-release
-          if-no-files-found: warn
+          if-no-files-found: error
           path: out/build/linux-x64/bin/Release/
 
   linux-arm64:
@@ -155,11 +175,11 @@ jobs:
         run: ctest --test-dir out/build/linux-arm64 --build-config Release --show-only=human
 
       - name: Upload build output
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: linux-arm64-release
-          if-no-files-found: warn
+          if-no-files-found: error
           path: out/build/linux-arm64/bin/Release/
 
   windows-x64:
@@ -201,12 +221,404 @@ jobs:
         run: ctest --test-dir out/build/windows-x64 --build-config Release --show-only=human
 
       - name: Upload build output
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64-release
-          if-no-files-found: warn
+          if-no-files-found: error
           path: out/build/windows-x64/bin/Release/
+
+  export-whisper-tiny:
+    name: Export Whisper Tiny ONNX
+    runs-on: ubuntu-24.04
+    needs: changes
+    timeout-minutes: 90
+    outputs:
+      artifact_name: ${{ steps.model-key.outputs.artifact_name }}
+      artifact_run_id: ${{ steps.final-artifact.outputs.run_id }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compute model artifact key
+        id: model-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_hash="$(
+            git ls-files -z -- 'asr/whisper/*.py' 'asr/whisper/**/*.py' \
+              | xargs -0 sha256sum \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          echo "source_hash=$source_hash" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=asr-whisper-tiny-onnx-v1-${source_hash:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve reusable model artifact
+        id: existing-artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_ARTIFACT: ${{ steps.model-key.outputs.artifact_name }}
+          PYTHON_CHANGED: ${{ needs.changes.outputs.whisper_python_changed }}
+        run: |
+          set -euo pipefail
+          artifact_run_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MODEL_ARTIFACT}&per_page=100" \
+              --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
+          )"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ||
+                "$PYTHON_CHANGED" == "true" ||
+                -z "$artifact_run_id" ]]; then
+            echo "export=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "export=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "run_id=$artifact_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.existing-artifact.outputs.export == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Whisper export dependencies
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch onnx onnxscript safetensors transformers
+
+      - name: Export Whisper Tiny ONNX
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        env:
+          MODEL_ID: openai/whisper-tiny
+          MODEL_OUTPUT: artifacts/ci/whisper-tiny
+          SOURCE_HASH: ${{ steps.model-key.outputs.source_hash }}
+        run: |
+          set -uo pipefail
+          precision=fp16
+          python asr/whisper/model_export/export_whisper.py \
+            --model "$MODEL_ID" \
+            --output "$MODEL_OUTPUT" \
+            --device cpu \
+            --dtype "$precision"
+          export_status=$?
+          if [[ $export_status -ne 0 ]]; then
+            echo "::warning::FP16 export failed; retrying once with FP32."
+            rm -rf "$MODEL_OUTPUT"
+            precision=fp32
+            python asr/whisper/model_export/export_whisper.py \
+              --model "$MODEL_ID" \
+              --output "$MODEL_OUTPUT" \
+              --device cpu \
+              --dtype "$precision"
+          fi
+          set -e
+          test -f "$MODEL_OUTPUT/encoder.onnx"
+          test -f "$MODEL_OUTPUT/decoder.onnx"
+          test -f "$MODEL_OUTPUT/mel.onnx"
+          test -f "$MODEL_OUTPUT/vocab.json"
+          export MODEL_OUTPUT MODEL_ID SOURCE_HASH PRECISION="$precision"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path(os.environ["MODEL_OUTPUT"])
+          manifest = {
+              "model_id": os.environ["MODEL_ID"],
+              "precision": os.environ["PRECISION"],
+              "source_hash": os.environ["SOURCE_HASH"],
+              "commit": os.environ["GITHUB_SHA"],
+          }
+          (output / "ci-export-manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload Whisper Tiny ONNX
+        if: steps.existing-artifact.outputs.export == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.model-key.outputs.artifact_name }}
+          path: artifacts/ci/whisper-tiny/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Select model artifact run
+        id: final-artifact
+        shell: bash
+        env:
+          EXPORTED: ${{ steps.existing-artifact.outputs.export }}
+          EXISTING_RUN_ID: ${{ steps.existing-artifact.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXPORTED" == "true" ]]; then
+            echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=$EXISTING_RUN_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+  export-parakeet:
+    name: Export Parakeet TDT ONNX
+    runs-on: ubuntu-24.04
+    needs: changes
+    timeout-minutes: 120
+    outputs:
+      artifact_name: ${{ steps.model-key.outputs.artifact_name }}
+      artifact_run_id: ${{ steps.final-artifact.outputs.run_id }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compute model artifact key
+        id: model-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_hash="$(
+            git ls-files -z -- 'asr/rnnt/python/*.py' 'asr/rnnt/python/**/*.py' \
+              | xargs -0 sha256sum \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          echo "source_hash=$source_hash" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=asr-parakeet-tdt-onnx-v1-${source_hash:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve reusable model artifact
+        id: existing-artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_ARTIFACT: ${{ steps.model-key.outputs.artifact_name }}
+          PYTHON_CHANGED: ${{ needs.changes.outputs.parakeet_python_changed }}
+        run: |
+          set -euo pipefail
+          artifact_run_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MODEL_ARTIFACT}&per_page=100" \
+              --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
+          )"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ||
+                "$PYTHON_CHANGED" == "true" ||
+                -z "$artifact_run_id" ]]; then
+            echo "export=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "export=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "run_id=$artifact_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.existing-artifact.outputs.export == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Parakeet export dependencies
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            torch \
+            onnx \
+            onnxscript \
+            soundfile \
+            "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"
+
+      - name: Export Parakeet TDT ONNX
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        env:
+          MODEL_ID: nvidia/parakeet-tdt-0.6b-v3
+          MODEL_OUTPUT: artifacts/ci/parakeet-tdt
+          PYTHONPATH: asr/rnnt/python
+          SOURCE_HASH: ${{ steps.model-key.outputs.source_hash }}
+        run: |
+          set -uo pipefail
+          precision=float16
+          python asr/rnnt/python/tools/export_parakeet_tdt_onnx.py \
+            --model "$MODEL_ID" \
+            --output "$MODEL_OUTPUT" \
+            --device cpu \
+            --dtype "$precision" \
+            --external-data
+          export_status=$?
+          if [[ $export_status -ne 0 ]]; then
+            echo "::warning::FP16 export failed; retrying once with FP32."
+            rm -rf "$MODEL_OUTPUT"
+            precision=float32
+            python asr/rnnt/python/tools/export_parakeet_tdt_onnx.py \
+              --model "$MODEL_ID" \
+              --output "$MODEL_OUTPUT" \
+              --device cpu \
+              --dtype "$precision" \
+              --external-data
+          fi
+          set -e
+          test -f "$MODEL_OUTPUT/preprocessor.onnx"
+          test -f "$MODEL_OUTPUT/encoder.onnx"
+          test -f "$MODEL_OUTPUT/predict_step.onnx"
+          test -f "$MODEL_OUTPUT/metadata.json"
+          test -f "$MODEL_OUTPUT/tokenizer.json"
+          export MODEL_OUTPUT MODEL_ID SOURCE_HASH PRECISION="$precision"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path(os.environ["MODEL_OUTPUT"])
+          manifest = {
+              "model_id": os.environ["MODEL_ID"],
+              "precision": os.environ["PRECISION"],
+              "source_hash": os.environ["SOURCE_HASH"],
+              "commit": os.environ["GITHUB_SHA"],
+          }
+          (output / "ci-export-manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload Parakeet TDT ONNX
+        if: steps.existing-artifact.outputs.export == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.model-key.outputs.artifact_name }}
+          path: artifacts/ci/parakeet-tdt/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Select model artifact run
+        id: final-artifact
+        shell: bash
+        env:
+          EXPORTED: ${{ steps.existing-artifact.outputs.export }}
+          EXISTING_RUN_ID: ${{ steps.existing-artifact.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXPORTED" == "true" ]]; then
+            echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=$EXISTING_RUN_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux-x64-asr-runtime:
+    name: Linux x64 / CPU / ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.2.1-runtime-ubuntu24.04
+    needs: [linux-x64, export-whisper-tiny, export-parakeet]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: whisper-tiny
+            label: Whisper Tiny
+            executable: din_asr_whisper_cli
+          - model: parakeet-tdt
+            label: Parakeet TDT
+            executable: din_asr_parakeet_tdt_cli
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-release
+          path: runtime
+
+      - name: Download Whisper Tiny model artifact
+        if: matrix.model == 'whisper-tiny'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-tiny.outputs.artifact_name }}
+          path: models/whisper-tiny
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-tiny.outputs.artifact_run_id }}
+
+      - name: Download Parakeet TDT model artifact
+        if: matrix.model == 'parakeet-tdt'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-parakeet.outputs.artifact_name }}
+          path: models/parakeet-tdt
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-parakeet.outputs.artifact_run_id }}
+
+      - name: Run C++ CPU smoke test
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/runtime
+        run: |
+          set -euxo pipefail
+          chmod +x "runtime/${{ matrix.executable }}"
+          "runtime/${{ matrix.executable }}" \
+            assets/sample.wav \
+            --model-dir "models/${{ matrix.model }}" \
+            --provider cpu
+
+  windows-x64-asr-runtime:
+    name: Windows x64 / CPU / ${{ matrix.label }}
+    runs-on: windows-2025
+    needs: [windows-x64, export-whisper-tiny, export-parakeet]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: whisper-tiny
+            label: Whisper Tiny
+            executable: din_asr_whisper_cli.exe
+          - model: parakeet-tdt
+            label: Parakeet TDT
+            executable: din_asr_parakeet_tdt_cli.exe
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-release
+          path: runtime
+
+      - name: Download Whisper Tiny model artifact
+        if: matrix.model == 'whisper-tiny'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-tiny.outputs.artifact_name }}
+          path: models/whisper-tiny
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-tiny.outputs.artifact_run_id }}
+
+      - name: Download Parakeet TDT model artifact
+        if: matrix.model == 'parakeet-tdt'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-parakeet.outputs.artifact_name }}
+          path: models/parakeet-tdt
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-parakeet.outputs.artifact_run_id }}
+
+      - name: Run C++ CPU smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "runtime/${{ matrix.executable }}" "assets/sample.wav" --model-dir "models/${{ matrix.model }}" --provider cpu
 
 #  windows-arm64:
 #    name: Windows 11 / MSVC / ARM64

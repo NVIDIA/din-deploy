@@ -890,7 +890,8 @@ Ort::ConstMemoryInfo OrtRunner::DeviceMemory()
 }
 
 template <typename T>
-TensorBuffer<T>::TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma)
+TensorBuffer<T>::TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io,
+                              bool disable_uma)
     : runner_(&runner)
     , use_device_io_(use_device_io)
     , use_unified_memory_(use_device_io && runner.UsesUnifiedMemory() && !disable_uma)
