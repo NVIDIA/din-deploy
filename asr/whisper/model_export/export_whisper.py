@@ -522,13 +522,21 @@ def export_decoder(model, out_dir, device, dtype, max_length, enc_frames, use_sd
 
 
 def _save_tokenizer(model_id, out_dir):
+    import json
+
     from transformers import WhisperTokenizer
 
     tok = WhisperTokenizer.from_pretrained(model_id)
     tok.save_pretrained(out_dir)
     vocab = out_dir / "vocab.json"
     if not vocab.exists():
-        raise RuntimeError(f"tokenizer did not produce vocab.json in {out_dir}")
+        # Transformers 5 writes a unified tokenizer.json for Whisper instead of
+        # the legacy GPT-2 vocab.json. The C++ decoder consumes the same token-to-id
+        # mapping, so materialize it from the tokenizer API when needed.
+        vocab.write_text(
+            json.dumps(tok.get_vocab(), ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(f"  saved tokenizer ({vocab.name} + friends)")
 
 

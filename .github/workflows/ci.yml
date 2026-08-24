@@ -302,12 +302,14 @@ jobs:
         run: |
           set -uo pipefail
           precision=fp16
+          set +e
           python asr/whisper/model_export/export_whisper.py \
             --model "$MODEL_ID" \
             --output "$MODEL_OUTPUT" \
             --device cpu \
             --dtype "$precision"
           export_status=$?
+          set -e
           if [[ $export_status -ne 0 ]]; then
             echo "::warning::FP16 export failed; retrying once with FP32."
             rm -rf "$MODEL_OUTPUT"
@@ -318,7 +320,6 @@ jobs:
               --device cpu \
               --dtype "$precision"
           fi
-          set -e
           test -f "$MODEL_OUTPUT/encoder.onnx"
           test -f "$MODEL_OUTPUT/decoder.onnx"
           test -f "$MODEL_OUTPUT/mel.onnx"
@@ -444,6 +445,7 @@ jobs:
         run: |
           set -uo pipefail
           precision=float16
+          set +e
           python asr/rnnt/python/tools/export_parakeet_tdt_onnx.py \
             --model "$MODEL_ID" \
             --output "$MODEL_OUTPUT" \
@@ -451,6 +453,7 @@ jobs:
             --dtype "$precision" \
             --external-data
           export_status=$?
+          set -e
           if [[ $export_status -ne 0 ]]; then
             echo "::warning::FP16 export failed; retrying once with FP32."
             rm -rf "$MODEL_OUTPUT"
@@ -462,7 +465,6 @@ jobs:
               --dtype "$precision" \
               --external-data
           fi
-          set -e
           test -f "$MODEL_OUTPUT/preprocessor.onnx"
           test -f "$MODEL_OUTPUT/encoder.onnx"
           test -f "$MODEL_OUTPUT/predict_step.onnx"
