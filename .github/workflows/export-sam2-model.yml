@@ -15,6 +15,9 @@ on:
       python_changed:
         required: true
         type: string
+      source_ref:
+        required: true
+        type: string
     outputs:
       artifact_name:
         value: ${{ jobs.export.outputs.artifact_name }}
@@ -37,6 +40,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
 
       - name: Compute model artifact key
         id: model-key
@@ -117,6 +122,7 @@ jobs:
           MODEL_ID: ${{ inputs.model_id }}
           MODEL_OUTPUT: artifacts/ci/${{ inputs.model_slug }}
           SOURCE_HASH: ${{ steps.model-key.outputs.source_hash }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euxo pipefail
           python vision/sam2/python/export_sam2_onnx.py \
@@ -151,7 +157,7 @@ jobs:
               "model_id": os.environ["MODEL_ID"],
               "precision": "float16",
               "source_hash": os.environ["SOURCE_HASH"],
-              "commit": os.environ["GITHUB_SHA"],
+              "commit": os.environ["SOURCE_REF"],
           }
           (output / "ci-export-manifest.json").write_text(
               json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
