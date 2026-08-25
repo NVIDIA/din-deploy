@@ -24,11 +24,12 @@ jobs:
     outputs:
       build_trt_rtx_ep: ${{ steps.ep-build.outputs.build_trt_rtx_ep }}
       parakeet_python_changed: ${{ steps.ep-build.outputs.parakeet_python_changed }}
+      sam2_python_changed: ${{ steps.ep-build.outputs.sam2_python_changed }}
       whisper_python_changed: ${{ steps.ep-build.outputs.whisper_python_changed }}
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -46,11 +47,13 @@ jobs:
             build_trt_rtx_ep=ON
             whisper_python_changed=false
             parakeet_python_changed=false
+            sam2_python_changed=false
           elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             # There is no reliable comparison base for initial runs.
             build_trt_rtx_ep=ON
             whisper_python_changed=true
             parakeet_python_changed=true
+            sam2_python_changed=true
           else
             changed_files="$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA")"
             if grep -Eq '^(cmake/|CMakePresets\.json$)' <<< "$changed_files"; then
@@ -68,10 +71,16 @@ jobs:
             else
               parakeet_python_changed=false
             fi
+            if grep -Eq '^vision/sam2/python/.*\.py$' <<< "$changed_files"; then
+              sam2_python_changed=true
+            else
+              sam2_python_changed=false
+            fi
           fi
           echo "build_trt_rtx_ep=$build_trt_rtx_ep" >> "$GITHUB_OUTPUT"
           echo "whisper_python_changed=$whisper_python_changed" >> "$GITHUB_OUTPUT"
           echo "parakeet_python_changed=$parakeet_python_changed" >> "$GITHUB_OUTPUT"
+          echo "sam2_python_changed=$sam2_python_changed" >> "$GITHUB_OUTPUT"
 
   clang-format:
     name: clang-format
@@ -79,7 +88,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install clang-format
         shell: bash
@@ -117,10 +126,10 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Restore CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: out/build/linux-x64/_deps
           key: linux-x64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
@@ -139,7 +148,7 @@ jobs:
 
       - name: Upload build output
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-x64-release
           if-no-files-found: error
@@ -161,10 +170,10 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Restore CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: out/build/linux-arm64/_deps
           key: linux-arm64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
@@ -181,7 +190,7 @@ jobs:
 
       - name: Upload build output
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-arm64-release
           if-no-files-found: error
@@ -195,7 +204,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -208,7 +217,7 @@ jobs:
           cuda: '13.2.0'
 
       - name: Restore CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: out/build/windows-x64/_deps
           key: windows-x64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
@@ -227,7 +236,7 @@ jobs:
 
       - name: Upload build output
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-x64-release
           if-no-files-found: error
@@ -244,7 +253,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Compute model artifact key
         id: model-key
@@ -283,7 +292,7 @@ jobs:
 
       - name: Set up Python
         if: steps.existing-artifact.outputs.export == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -348,7 +357,7 @@ jobs:
 
       - name: Upload Whisper Tiny ONNX
         if: steps.existing-artifact.outputs.export == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.model-key.outputs.artifact_name }}
           path: artifacts/ci/whisper-tiny/
@@ -380,7 +389,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Compute model artifact key
         id: model-key
@@ -419,7 +428,7 @@ jobs:
 
       - name: Set up Python
         if: steps.existing-artifact.outputs.export == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -493,7 +502,7 @@ jobs:
 
       - name: Upload Parakeet TDT ONNX
         if: steps.existing-artifact.outputs.export == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.model-key.outputs.artifact_name }}
           path: artifacts/ci/parakeet-tdt/
@@ -591,6 +600,46 @@ jobs:
       fallback_precision: float32
       python_changed: ${{ needs.changes.outputs.parakeet_python_changed }}
 
+  export-sam2-tiny:
+    name: Export SAM2.1 Hiera Tiny ONNX
+    needs: changes
+    uses: ./.github/workflows/export-sam2-model.yml
+    with:
+      model_slug: sam2.1-hiera-tiny
+      model_label: SAM2.1 Hiera Tiny
+      model_id: facebook/sam2.1-hiera-tiny
+      python_changed: ${{ needs.changes.outputs.sam2_python_changed }}
+
+  export-sam2-small:
+    name: Export SAM2.1 Hiera Small ONNX
+    needs: changes
+    uses: ./.github/workflows/export-sam2-model.yml
+    with:
+      model_slug: sam2.1-hiera-small
+      model_label: SAM2.1 Hiera Small
+      model_id: facebook/sam2.1-hiera-small
+      python_changed: ${{ needs.changes.outputs.sam2_python_changed }}
+
+  export-sam2-base-plus:
+    name: Export SAM2.1 Hiera Base Plus ONNX
+    needs: changes
+    uses: ./.github/workflows/export-sam2-model.yml
+    with:
+      model_slug: sam2.1-hiera-base-plus
+      model_label: SAM2.1 Hiera Base Plus
+      model_id: facebook/sam2.1-hiera-base-plus
+      python_changed: ${{ needs.changes.outputs.sam2_python_changed }}
+
+  export-sam2-large:
+    name: Export SAM2.1 Hiera Large ONNX
+    needs: changes
+    uses: ./.github/workflows/export-sam2-model.yml
+    with:
+      model_slug: sam2.1-hiera-large
+      model_label: SAM2.1 Hiera Large
+      model_id: facebook/sam2.1-hiera-large
+      python_changed: ${{ needs.changes.outputs.sam2_python_changed }}
+
   linux-x64-asr-runtime:
     name: Linux x64 / CPU / ${{ matrix.label }}
     runs-on: ubuntu-24.04
@@ -637,17 +686,17 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download Linux build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: linux-x64-release
           path: runtime
 
       - name: Download Whisper Tiny model artifact
         if: matrix.model == 'whisper-tiny'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-tiny.outputs.artifact_name }}
           path: models/whisper-tiny
@@ -657,7 +706,7 @@ jobs:
 
       - name: Download Whisper Base model artifact
         if: matrix.model == 'whisper-base'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-base.outputs.artifact_name }}
           path: models/whisper-base
@@ -667,7 +716,7 @@ jobs:
 
       - name: Download Whisper Small model artifact
         if: matrix.model == 'whisper-small'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-small.outputs.artifact_name }}
           path: models/whisper-small
@@ -677,7 +726,7 @@ jobs:
 
       - name: Download Whisper Medium model artifact
         if: matrix.model == 'whisper-medium'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-medium.outputs.artifact_name }}
           path: models/whisper-medium
@@ -687,7 +736,7 @@ jobs:
 
       - name: Download Whisper Large v3 model artifact
         if: matrix.model == 'whisper-large-v3'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-large-v3.outputs.artifact_name }}
           path: models/whisper-large-v3
@@ -697,7 +746,7 @@ jobs:
 
       - name: Download Whisper Large v3 Turbo model artifact
         if: matrix.model == 'whisper-large-v3-turbo'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-large-v3-turbo.outputs.artifact_name }}
           path: models/whisper-large-v3-turbo
@@ -707,7 +756,7 @@ jobs:
 
       - name: Download Parakeet TDT model artifact
         if: matrix.model == 'parakeet-tdt'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-parakeet.outputs.artifact_name }}
           path: models/parakeet-tdt
@@ -717,7 +766,7 @@ jobs:
 
       - name: Download Nemotron model artifact
         if: matrix.model == 'nemotron-3.5-asr-streaming-0.6b'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-nemotron.outputs.artifact_name }}
           path: models/nemotron-3.5-asr-streaming-0.6b
@@ -782,17 +831,17 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download Windows build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: windows-x64-release
           path: runtime
 
       - name: Download Whisper Tiny model artifact
         if: matrix.model == 'whisper-tiny'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-tiny.outputs.artifact_name }}
           path: models/whisper-tiny
@@ -802,7 +851,7 @@ jobs:
 
       - name: Download Whisper Base model artifact
         if: matrix.model == 'whisper-base'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-base.outputs.artifact_name }}
           path: models/whisper-base
@@ -812,7 +861,7 @@ jobs:
 
       - name: Download Whisper Small model artifact
         if: matrix.model == 'whisper-small'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-small.outputs.artifact_name }}
           path: models/whisper-small
@@ -822,7 +871,7 @@ jobs:
 
       - name: Download Whisper Medium model artifact
         if: matrix.model == 'whisper-medium'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-medium.outputs.artifact_name }}
           path: models/whisper-medium
@@ -832,7 +881,7 @@ jobs:
 
       - name: Download Whisper Large v3 model artifact
         if: matrix.model == 'whisper-large-v3'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-large-v3.outputs.artifact_name }}
           path: models/whisper-large-v3
@@ -842,7 +891,7 @@ jobs:
 
       - name: Download Whisper Large v3 Turbo model artifact
         if: matrix.model == 'whisper-large-v3-turbo'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-whisper-large-v3-turbo.outputs.artifact_name }}
           path: models/whisper-large-v3-turbo
@@ -852,7 +901,7 @@ jobs:
 
       - name: Download Parakeet TDT model artifact
         if: matrix.model == 'parakeet-tdt'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-parakeet.outputs.artifact_name }}
           path: models/parakeet-tdt
@@ -862,7 +911,7 @@ jobs:
 
       - name: Download Nemotron model artifact
         if: matrix.model == 'nemotron-3.5-asr-streaming-0.6b'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.export-nemotron.outputs.artifact_name }}
           path: models/nemotron-3.5-asr-streaming-0.6b
@@ -876,6 +925,185 @@ jobs:
           $ErrorActionPreference = "Stop"
           & "runtime/${{ matrix.executable }}" "assets/sample.wav" --model-dir "models/${{ matrix.model }}" --provider cpu
 
+  linux-x64-sam2-runtime:
+    name: Linux x64 / CPU / ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.2.1-runtime-ubuntu24.04
+    needs:
+      - linux-x64
+      - export-sam2-tiny
+      - export-sam2-small
+      - export-sam2-base-plus
+      - export-sam2-large
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: sam2.1-hiera-tiny
+            label: SAM2.1 Hiera Tiny
+          - model: sam2.1-hiera-small
+            label: SAM2.1 Hiera Small
+          - model: sam2.1-hiera-base-plus
+            label: SAM2.1 Hiera Base Plus
+          - model: sam2.1-hiera-large
+            label: SAM2.1 Hiera Large
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-x64-release
+          path: runtime
+
+      - name: Download SAM2.1 Hiera Tiny model artifact
+        if: matrix.model == 'sam2.1-hiera-tiny'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-tiny.outputs.artifact_name }}
+          path: models/sam2.1-hiera-tiny
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-tiny.outputs.artifact_run_id }}
+
+      - name: Download SAM2.1 Hiera Small model artifact
+        if: matrix.model == 'sam2.1-hiera-small'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-small.outputs.artifact_name }}
+          path: models/sam2.1-hiera-small
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-small.outputs.artifact_run_id }}
+
+      - name: Download SAM2.1 Hiera Base Plus model artifact
+        if: matrix.model == 'sam2.1-hiera-base-plus'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-base-plus.outputs.artifact_name }}
+          path: models/sam2.1-hiera-base-plus
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-base-plus.outputs.artifact_run_id }}
+
+      - name: Download SAM2.1 Hiera Large model artifact
+        if: matrix.model == 'sam2.1-hiera-large'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-large.outputs.artifact_name }}
+          path: models/sam2.1-hiera-large
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-large.outputs.artifact_run_id }}
+
+      - name: Run C++ CPU smoke test
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/runtime
+        run: |
+          set -euxo pipefail
+          base64 --decode assets/sam2-ci.png.base64 > assets/sam2-ci.png
+          mkdir -p "out/${{ matrix.model }}"
+          chmod +x runtime/din_sam2_cli
+          runtime/din_sam2_cli \
+            assets/sam2-ci.png \
+            assets/sam2-ci-prompt.json \
+            "out/${{ matrix.model }}" \
+            --model-dir "models/${{ matrix.model }}" \
+            --provider cpu
+
+  windows-x64-sam2-runtime:
+    name: Windows x64 / CPU / ${{ matrix.label }}
+    runs-on: windows-2025
+    needs:
+      - windows-x64
+      - export-sam2-tiny
+      - export-sam2-small
+      - export-sam2-base-plus
+      - export-sam2-large
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: sam2.1-hiera-tiny
+            label: SAM2.1 Hiera Tiny
+          - model: sam2.1-hiera-small
+            label: SAM2.1 Hiera Small
+          - model: sam2.1-hiera-base-plus
+            label: SAM2.1 Hiera Base Plus
+          - model: sam2.1-hiera-large
+            label: SAM2.1 Hiera Large
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-x64-release
+          path: runtime
+
+      - name: Download SAM2.1 Hiera Tiny model artifact
+        if: matrix.model == 'sam2.1-hiera-tiny'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-tiny.outputs.artifact_name }}
+          path: models/sam2.1-hiera-tiny
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-tiny.outputs.artifact_run_id }}
+
+      - name: Download SAM2.1 Hiera Small model artifact
+        if: matrix.model == 'sam2.1-hiera-small'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-small.outputs.artifact_name }}
+          path: models/sam2.1-hiera-small
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-small.outputs.artifact_run_id }}
+
+      - name: Download SAM2.1 Hiera Base Plus model artifact
+        if: matrix.model == 'sam2.1-hiera-base-plus'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-base-plus.outputs.artifact_name }}
+          path: models/sam2.1-hiera-base-plus
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-base-plus.outputs.artifact_run_id }}
+
+      - name: Download SAM2.1 Hiera Large model artifact
+        if: matrix.model == 'sam2.1-hiera-large'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export-sam2-large.outputs.artifact_name }}
+          path: models/sam2.1-hiera-large
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-sam2-large.outputs.artifact_run_id }}
+
+      - name: Run C++ CPU smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $imageBytes = [Convert]::FromBase64String(
+            (Get-Content -LiteralPath "assets/sam2-ci.png.base64" -Raw).Trim()
+          )
+          [IO.File]::WriteAllBytes("assets/sam2-ci.png", $imageBytes)
+          New-Item -ItemType Directory -Force -Path "out/${{ matrix.model }}" | Out-Null
+          & "runtime/din_sam2_cli.exe" `
+            "assets/sam2-ci.png" `
+            "assets/sam2-ci-prompt.json" `
+            "out/${{ matrix.model }}" `
+            --model-dir "models/${{ matrix.model }}" `
+            --provider cpu
+
 #  windows-arm64:
 #    name: Windows 11 / MSVC / ARM64
 #    runs-on: windows-11-vs2026-arm
@@ -884,7 +1112,7 @@ jobs:
 #
 #    steps:
 #      - name: Check out source
-#        uses: actions/checkout@v4
+#        uses: actions/checkout@v7
 #
 #      - name: Install CUDA
 #        shell: pwsh
@@ -945,7 +1173,7 @@ jobs:
 #            -DevCmdArguments "-arch=arm64 -host_arch=arm64"
 #
 #      - name: Restore CMake dependencies
-#        uses: actions/cache@v4
+#        uses: actions/cache@v6
 #        with:
 #          path: out/build/windows-arm64/_deps
 #          key: windows-arm64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
@@ -980,7 +1208,7 @@ jobs:
 #
 #      - name: Upload build output
 #        if: always()
-#        uses: actions/upload-artifact@v4
+#        uses: actions/upload-artifact@v7
 #        with:
 #          name: windows-arm64-release
 #          if-no-files-found: warn

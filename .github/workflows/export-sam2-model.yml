@@ -1,4 +1,4 @@
-name: Export ASR model
+name: Export SAM2 model
 
 on:
   workflow_call:
@@ -11,20 +11,6 @@ on:
         type: string
       model_id:
         required: true
-        type: string
-      exporter:
-        required: true
-        type: string
-      precision:
-        required: true
-        type: string
-      fallback_precision:
-        required: false
-        default: ''
-        type: string
-      attention:
-        required: false
-        default: sdpa
         type: string
       python_changed:
         required: true
@@ -56,30 +42,17 @@ jobs:
         id: model-key
         shell: bash
         env:
-          EXPORTER: ${{ inputs.exporter }}
           MODEL_SLUG: ${{ inputs.model_slug }}
         run: |
           set -euo pipefail
-          case "$EXPORTER" in
-            whisper)
-              source_globs=('asr/whisper/*.py' 'asr/whisper/**/*.py')
-              ;;
-            parakeet|nemotron)
-              source_globs=('asr/rnnt/python/*.py' 'asr/rnnt/python/**/*.py')
-              ;;
-            *)
-              echo "Unsupported exporter: $EXPORTER" >&2
-              exit 2
-              ;;
-          esac
           source_hash="$(
-            git ls-files -z -- "${source_globs[@]}" \
+            git ls-files -z -- 'vision/sam2/python/*.py' 'vision/sam2/python/**/*.py' \
               | xargs -0 sha256sum \
               | sha256sum \
               | cut -d' ' -f1
           )"
           echo "source_hash=$source_hash" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=asr-${MODEL_SLUG}-onnx-v1-${source_hash:0:16}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=vision-${MODEL_SLUG}-onnx-v1-${source_hash:0:16}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve reusable model artifact
         id: existing-artifact
@@ -120,103 +93,54 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Whisper export dependencies
-        if: steps.existing-artifact.outputs.export == 'true' && inputs.exporter == 'whisper'
+      - name: Install SAM2 export dependencies
+        if: steps.existing-artifact.outputs.export == 'true'
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install onnx onnxscript safetensors transformers
-
-      - name: Install NeMo export dependencies
-        if: steps.existing-artifact.outputs.export == 'true' && inputs.exporter != 'whisper'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch \
+            torchvision
+          python -m pip install \
+            huggingface_hub \
+            numpy \
             onnx \
             onnxscript \
-            soundfile \
-            "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"
+            "sam-2 @ git+https://github.com/facebookresearch/sam2.git"
 
-      - name: Export ONNX model
+      - name: Export SAM2 ONNX
         if: steps.existing-artifact.outputs.export == 'true'
         shell: bash
         env:
-          ATTENTION: ${{ inputs.attention }}
-          EXPORTER: ${{ inputs.exporter }}
-          FALLBACK_PRECISION: ${{ inputs.fallback_precision }}
           MODEL_ID: ${{ inputs.model_id }}
           MODEL_OUTPUT: artifacts/ci/${{ inputs.model_slug }}
-          PRECISION: ${{ inputs.precision }}
-          PYTHONPATH: asr/rnnt/python
           SOURCE_HASH: ${{ steps.model-key.outputs.source_hash }}
         run: |
-          set -uo pipefail
-          run_export() {
-            local precision="$1"
-            case "$EXPORTER" in
-              whisper)
-                python asr/whisper/model_export/export_whisper.py \
-                  --model "$MODEL_ID" \
-                  --output "$MODEL_OUTPUT" \
-                  --device cpu \
-                  --dtype "$precision" \
-                  --attention "$ATTENTION"
-                ;;
-              parakeet)
-                python asr/rnnt/python/tools/export_parakeet_tdt_onnx.py \
-                  --model "$MODEL_ID" \
-                  --output "$MODEL_OUTPUT" \
-                  --device cpu \
-                  --dtype "$precision" \
-                  --external-data
-                ;;
-              nemotron)
-                python asr/rnnt/python/tools/export_nemotron_onnx.py \
-                  --model "$MODEL_ID" \
-                  --output "$MODEL_OUTPUT" \
-                  --device cpu \
-                  --dtype "$precision" \
-                  --external-data
-                ;;
-            esac
-          }
+          set -euxo pipefail
+          python vision/sam2/python/export_sam2_onnx.py \
+            --model "$MODEL_ID" \
+            --output "$MODEL_OUTPUT" \
+            --device cpu \
+            --dtype float16 \
+            --max-points 3
 
-          selected_precision="$PRECISION"
-          set +e
-          run_export "$selected_precision"
-          export_status=$?
-          set -e
-          if [[ $export_status -ne 0 ]]; then
-            if [[ -z "$FALLBACK_PRECISION" ]]; then
-              exit "$export_status"
-            fi
-            echo "::warning::$PRECISION export failed; retrying once with $FALLBACK_PRECISION."
-            rm -rf "$MODEL_OUTPUT"
-            selected_precision="$FALLBACK_PRECISION"
-            run_export "$selected_precision"
-          fi
-
-          case "$EXPORTER" in
-            whisper)
-              required_files=(encoder.onnx decoder.onnx mel.onnx vocab.json)
-              ;;
-            parakeet)
-              required_files=(preprocessor.onnx encoder.onnx predict_step.onnx metadata.json tokenizer.json)
-              ;;
-            nemotron)
-              required_files=(preprocessor.onnx encoder_step.onnx predict_step.onnx metadata.json vocab.txt decoder_init_hidden.f32 decoder_init_cell.f32)
-              ;;
-          esac
+          required_files=(
+            image_preprocess.onnx
+            image_encoder.onnx
+            sam2_decoder.onnx
+            sam2_decoder_propagate.onnx
+            memory_attention.onnx
+            memory_encoder.onnx
+            mask_postprocess.onnx
+            metadata.json
+          )
           for required_file in "${required_files[@]}"; do
             test -f "$MODEL_OUTPUT/$required_file"
           done
 
-          export MODEL_ID MODEL_OUTPUT SELECTED_PRECISION="$selected_precision" SOURCE_HASH
+          export MODEL_ID MODEL_OUTPUT SOURCE_HASH
           python - <<'PY'
           import json
           import os
@@ -225,7 +149,7 @@ jobs:
           output = Path(os.environ["MODEL_OUTPUT"])
           manifest = {
               "model_id": os.environ["MODEL_ID"],
-              "precision": os.environ["SELECTED_PRECISION"],
+              "precision": "float16",
               "source_hash": os.environ["SOURCE_HASH"],
               "commit": os.environ["GITHUB_SHA"],
           }
@@ -234,7 +158,7 @@ jobs:
           )
           PY
 
-      - name: Upload ONNX model
+      - name: Upload SAM2 ONNX
         if: steps.existing-artifact.outputs.export == 'true'
         uses: actions/upload-artifact@v7
         with:
