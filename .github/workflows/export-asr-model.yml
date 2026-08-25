@@ -101,12 +101,24 @@ jobs:
           fi
           echo "run_id=$artifact_run_id" >> "$GITHUB_OUTPUT"
 
+      - name: Reclaim runner disk space
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/share/dotnet
+          df -h /
+
       - name: Set up Python
         if: steps.existing-artifact.outputs.export == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
 
       - name: Install Whisper export dependencies
         if: steps.existing-artifact.outputs.export == 'true' && inputs.exporter == 'whisper'
@@ -114,7 +126,8 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install torch onnx onnxscript safetensors transformers
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install onnx onnxscript safetensors transformers
 
       - name: Install NeMo export dependencies
         if: steps.existing-artifact.outputs.export == 'true' && inputs.exporter != 'whisper'
@@ -122,8 +135,8 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
-            torch \
             onnx \
             onnxscript \
             soundfile \
