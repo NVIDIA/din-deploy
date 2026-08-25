@@ -12,9 +12,6 @@ on:
       model_id:
         required: true
         type: string
-      python_changed:
-        required: true
-        type: string
       source_ref:
         required: true
         type: string
@@ -41,7 +38,32 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           ref: ${{ inputs.source_ref }}
+
+      - name: Determine export requirement
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            force=false
+          elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            force=true
+          elif git diff --quiet "$BASE_SHA" "$SOURCE_REF" -- \
+            'vision/sam2/python/*.py' \
+            'vision/sam2/python/**/*.py' \
+            '.github/workflows/export-sam2-model.yml' \
+            '.github/workflows/sam2.yml'; then
+            force=false
+          else
+            force=true
+          fi
+          echo "force=$force" >> "$GITHUB_OUTPUT"
 
       - name: Compute model artifact key
         id: model-key
@@ -63,16 +85,16 @@ jobs:
         id: existing-artifact
         shell: bash
         env:
+          FORCE_EXPORT: ${{ steps.changes.outputs.force }}
           GH_TOKEN: ${{ github.token }}
           MODEL_ARTIFACT: ${{ steps.model-key.outputs.artifact_name }}
-          PYTHON_CHANGED: ${{ inputs.python_changed }}
         run: |
           set -euo pipefail
           artifact_run_id="$(
             gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MODEL_ARTIFACT}&per_page=100" \
               --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
           )"
-          if [[ "$PYTHON_CHANGED" == "true" || -z "$artifact_run_id" ]]; then
+          if [[ "$FORCE_EXPORT" == "true" || -z "$artifact_run_id" ]]; then
             echo "export=true" >> "$GITHUB_OUTPUT"
           else
             echo "export=false" >> "$GITHUB_OUTPUT"

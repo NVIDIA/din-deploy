@@ -18,59 +18,6 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
 jobs:
-  changes:
-    name: Determine build and export requirements
-    runs-on: ubuntu-24.04
-    outputs:
-      build_trt_rtx_ep: ${{ steps.requirements.outputs.build_trt_rtx_ep }}
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Determine build and export requirements
-        id: requirements
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            build_trt_rtx_ep=ON
-            sam2_python_changed=false
-          elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
-            build_trt_rtx_ep=ON
-            sam2_python_changed=true
-          else
-            changed_files="$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA")"
-            if grep -Eq '^(cmake/|CMakePresets\.json$)' <<< "$changed_files"; then
-              build_trt_rtx_ep=ON
-            else
-              build_trt_rtx_ep=OFF
-            fi
-            if grep -Eq '^vision/sam2/python/.*\.py$' <<< "$changed_files"; then
-              sam2_python_changed=true
-            else
-              sam2_python_changed=false
-            fi
-          fi
-          echo "build_trt_rtx_ep=$build_trt_rtx_ep" >> "$GITHUB_OUTPUT"
-          mkdir -p ci-requirements
-          {
-            echo "source_ref=$GITHUB_SHA"
-            echo "sam2_python_changed=$sam2_python_changed"
-          } > ci-requirements/requirements.env
-
-      - name: Upload model export requirements
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-requirements
-          path: ci-requirements/requirements.env
-          if-no-files-found: error
-
   clang-format:
     name: clang-format
     runs-on: ubuntu-24.04
@@ -102,7 +49,6 @@ jobs:
   linux-x64:
     name: Ubuntu 24.04 / Clang / x64
     runs-on: ubuntu-24.04
-    needs: changes
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
     timeout-minutes: 90
 
@@ -127,7 +73,7 @@ jobs:
         shell: bash
         run: |
           cmake --preset linux-x64 \
-            -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
+            -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
         run: cmake --build --preset linux-x64-release --parallel
@@ -146,7 +92,6 @@ jobs:
   linux-arm64:
     name: Ubuntu 24.04 / Clang / ARM64
     runs-on: ubuntu-24.04-arm
-    needs: changes
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
     timeout-minutes: 90
 
@@ -169,7 +114,7 @@ jobs:
 
       - name: Configure
         shell: bash
-        run: cmake --preset linux-arm64 -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
+        run: cmake --preset linux-arm64 -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
         run: cmake --build --preset linux-arm64-release --parallel
@@ -188,7 +133,6 @@ jobs:
   windows-x64:
     name: Windows Server 2025 / MSVC / x64
     runs-on: windows-2025
-    needs: changes
     timeout-minutes: 90
 
     steps:
@@ -215,7 +159,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --preset windows-x64 `
-            -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
+            -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
         run: cmake --build --preset windows-x64-release --parallel

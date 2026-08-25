@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 100
     outputs:
       build_run_id: ${{ steps.build.outputs.run_id }}
-      source_ref: ${{ steps.read.outputs.source_ref }}
+      source_ref: ${{ steps.build.outputs.source_ref }}
 
     steps:
       - name: Resolve successful Build run
@@ -58,22 +58,7 @@ jobs:
             exit 1
           fi
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-
-      - name: Download Build requirements
-        uses: actions/download-artifact@v8
-        with:
-          name: ci-requirements
-          path: ci-requirements
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.build.outputs.run_id }}
-
-      - name: Read source revision
-        id: read
-        shell: bash
-        run: |
-          set -euo pipefail
-          source ci-requirements/requirements.env
+          source_ref="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq .head_sha)"
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
 
   export-tiny:
