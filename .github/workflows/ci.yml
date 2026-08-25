@@ -40,13 +40,9 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             build_trt_rtx_ep=ON
-            whisper_python_changed=false
-            nvidia_asr_python_changed=false
             sam2_python_changed=false
           elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             build_trt_rtx_ep=ON
-            whisper_python_changed=true
-            nvidia_asr_python_changed=true
             sam2_python_changed=true
           else
             changed_files="$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA")"
@@ -54,16 +50,6 @@ jobs:
               build_trt_rtx_ep=ON
             else
               build_trt_rtx_ep=OFF
-            fi
-            if grep -Eq '^asr/whisper/.*\.py$' <<< "$changed_files"; then
-              whisper_python_changed=true
-            else
-              whisper_python_changed=false
-            fi
-            if grep -Eq '^asr/rnnt/python/.*\.py$' <<< "$changed_files"; then
-              nvidia_asr_python_changed=true
-            else
-              nvidia_asr_python_changed=false
             fi
             if grep -Eq '^vision/sam2/python/.*\.py$' <<< "$changed_files"; then
               sam2_python_changed=true
@@ -75,8 +61,6 @@ jobs:
           mkdir -p ci-requirements
           {
             echo "source_ref=$GITHUB_SHA"
-            echo "whisper_python_changed=$whisper_python_changed"
-            echo "nvidia_asr_python_changed=$nvidia_asr_python_changed"
             echo "sam2_python_changed=$sam2_python_changed"
           } > ci-requirements/requirements.env
 

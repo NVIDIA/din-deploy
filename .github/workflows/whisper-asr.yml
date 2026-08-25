@@ -26,7 +26,6 @@ jobs:
     timeout-minutes: 100
     outputs:
       build_run_id: ${{ steps.build.outputs.run_id }}
-      python_changed: ${{ steps.read.outputs.python_changed }}
       source_ref: ${{ steps.read.outputs.source_ref }}
 
     steps:
@@ -69,118 +68,148 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ steps.build.outputs.run_id }}
 
-      - name: Read Whisper requirements
+      - name: Read source revision
         id: read
         shell: bash
         run: |
           set -euo pipefail
           source ci-requirements/requirements.env
-          echo "python_changed=$whisper_python_changed" >> "$GITHUB_OUTPUT"
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
 
-  export:
-    name: Export ${{ matrix.label }} ONNX
+  export-tiny:
+    name: Export Whisper Tiny ONNX
     needs: requirements
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - slug: whisper-tiny
-            label: Whisper Tiny
-            model_id: openai/whisper-tiny
-            precision: fp16
-            fallback_precision: fp32
-            attention: sdpa
-          - slug: whisper-base
-            label: Whisper Base
-            model_id: openai/whisper-base
-            precision: fp32
-            fallback_precision: ''
-            attention: sdpa
-          - slug: whisper-small
-            label: Whisper Small
-            model_id: openai/whisper-small
-            precision: fp16
-            fallback_precision: fp32
-            attention: math
-          - slug: whisper-medium
-            label: Whisper Medium
-            model_id: openai/whisper-medium
-            precision: fp32
-            fallback_precision: ''
-            attention: sdpa
-          - slug: whisper-large-v3
-            label: Whisper Large v3
-            model_id: openai/whisper-large-v3
-            precision: fp16
-            fallback_precision: fp32
-            attention: sdpa
-          - slug: whisper-large-v3-turbo
-            label: Whisper Large v3 Turbo
-            model_id: openai/whisper-large-v3-turbo
-            precision: fp16
-            fallback_precision: fp32
-            attention: sdpa
-    uses: ./.github/workflows/export-asr-model.yml
+    uses: ./.github/workflows/export-whisper-model.yml
     with:
-      model_slug: ${{ matrix.slug }}
-      model_label: ${{ matrix.label }}
-      model_id: ${{ matrix.model_id }}
-      exporter: whisper
-      precision: ${{ matrix.precision }}
-      fallback_precision: ${{ matrix.fallback_precision }}
-      attention: ${{ matrix.attention }}
-      python_changed: ${{ needs.requirements.outputs.python_changed }}
+      model_slug: whisper-tiny
+      model_label: Whisper Tiny
+      model_id: openai/whisper-tiny
+      precision: fp16
+      fallback_precision: fp32
+      attention: sdpa
+      source_ref: ${{ needs.requirements.outputs.source_ref }}
+
+  export-base:
+    name: Export Whisper Base ONNX
+    needs: requirements
+    uses: ./.github/workflows/export-whisper-model.yml
+    with:
+      model_slug: whisper-base
+      model_label: Whisper Base
+      model_id: openai/whisper-base
+      precision: fp32
+      attention: sdpa
+      source_ref: ${{ needs.requirements.outputs.source_ref }}
+
+  export-small:
+    name: Export Whisper Small ONNX
+    needs: requirements
+    uses: ./.github/workflows/export-whisper-model.yml
+    with:
+      model_slug: whisper-small
+      model_label: Whisper Small
+      model_id: openai/whisper-small
+      precision: fp16
+      fallback_precision: fp32
+      attention: math
+      source_ref: ${{ needs.requirements.outputs.source_ref }}
+
+  export-medium:
+    name: Export Whisper Medium ONNX
+    needs: requirements
+    uses: ./.github/workflows/export-whisper-model.yml
+    with:
+      model_slug: whisper-medium
+      model_label: Whisper Medium
+      model_id: openai/whisper-medium
+      precision: fp32
+      attention: sdpa
+      source_ref: ${{ needs.requirements.outputs.source_ref }}
+
+  export-large-v3:
+    name: Export Whisper Large v3 ONNX
+    needs: requirements
+    uses: ./.github/workflows/export-whisper-model.yml
+    with:
+      model_slug: whisper-large-v3
+      model_label: Whisper Large v3
+      model_id: openai/whisper-large-v3
+      precision: fp16
+      fallback_precision: fp32
+      attention: sdpa
+      source_ref: ${{ needs.requirements.outputs.source_ref }}
+
+  export-large-v3-turbo:
+    name: Export Whisper Large v3 Turbo ONNX
+    needs: requirements
+    uses: ./.github/workflows/export-whisper-model.yml
+    with:
+      model_slug: whisper-large-v3-turbo
+      model_label: Whisper Large v3 Turbo
+      model_id: openai/whisper-large-v3-turbo
+      precision: fp16
+      fallback_precision: fp32
+      attention: sdpa
       source_ref: ${{ needs.requirements.outputs.source_ref }}
 
   artifacts:
-    name: Resolve Whisper artifacts
-    needs: [requirements, export]
+    name: Collect Whisper artifacts
+    needs:
+      - export-tiny
+      - export-base
+      - export-small
+      - export-medium
+      - export-large-v3
+      - export-large-v3-turbo
     runs-on: ubuntu-24.04
     outputs:
-      models: ${{ steps.resolve.outputs.models }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.requirements.outputs.source_ref }}
-
-      - name: Resolve model artifacts
-        id: resolve
+      - name: Build runtime matrix
+        id: matrix
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          BASE_NAME: ${{ needs.export-base.outputs.artifact_name }}
+          BASE_RUN_ID: ${{ needs.export-base.outputs.artifact_run_id }}
+          LARGE_NAME: ${{ needs.export-large-v3.outputs.artifact_name }}
+          LARGE_RUN_ID: ${{ needs.export-large-v3.outputs.artifact_run_id }}
+          MEDIUM_NAME: ${{ needs.export-medium.outputs.artifact_name }}
+          MEDIUM_RUN_ID: ${{ needs.export-medium.outputs.artifact_run_id }}
+          SMALL_NAME: ${{ needs.export-small.outputs.artifact_name }}
+          SMALL_RUN_ID: ${{ needs.export-small.outputs.artifact_run_id }}
+          TINY_NAME: ${{ needs.export-tiny.outputs.artifact_name }}
+          TINY_RUN_ID: ${{ needs.export-tiny.outputs.artifact_run_id }}
+          TURBO_NAME: ${{ needs.export-large-v3-turbo.outputs.artifact_name }}
+          TURBO_RUN_ID: ${{ needs.export-large-v3-turbo.outputs.artifact_run_id }}
         run: |
-          set -euo pipefail
-          source_hash="$(
-            git ls-files -z -- 'asr/whisper/*.py' 'asr/whisper/**/*.py' \
-              | xargs -0 sha256sum \
-              | sha256sum \
-              | cut -d' ' -f1
-          )"
-          models='{}'
-          for slug in \
-            whisper-tiny \
-            whisper-base \
-            whisper-small \
-            whisper-medium \
-            whisper-large-v3 \
-            whisper-large-v3-turbo; do
-            artifact_name="asr-${slug}-onnx-v1-${source_hash:0:16}"
-            artifact_run_id="$(
-              gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100" \
-                --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
-            )"
-            test -n "$artifact_run_id"
-            models="$(jq \
-              --arg slug "$slug" \
-              --arg name "$artifact_name" \
-              --arg run_id "$artifact_run_id" \
-              '. + {($slug): {name: $name, run_id: $run_id}}' \
-              <<< "$models")"
-          done
-          echo "models=$(jq -c . <<< "$models")" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          models = [
+              ("whisper-tiny", "Whisper Tiny", "TINY"),
+              ("whisper-base", "Whisper Base", "BASE"),
+              ("whisper-small", "Whisper Small", "SMALL"),
+              ("whisper-medium", "Whisper Medium", "MEDIUM"),
+              ("whisper-large-v3", "Whisper Large v3", "LARGE"),
+              ("whisper-large-v3-turbo", "Whisper Large v3 Turbo", "TURBO"),
+          ]
+          matrix = {
+              "include": [
+                  {
+                      "slug": slug,
+                      "label": label,
+                      "artifact_name": os.environ[f"{key}_NAME"],
+                      "artifact_run_id": os.environ[f"{key}_RUN_ID"],
+                  }
+                  for slug, label, key in models
+              ]
+          }
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+          PY
 
   linux-runtime:
     name: Linux x64 / CPU / ${{ matrix.label }}
@@ -190,20 +219,7 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - slug: whisper-tiny
-            label: Whisper Tiny
-          - slug: whisper-base
-            label: Whisper Base
-          - slug: whisper-small
-            label: Whisper Small
-          - slug: whisper-medium
-            label: Whisper Medium
-          - slug: whisper-large-v3
-            label: Whisper Large v3
-          - slug: whisper-large-v3-turbo
-            label: Whisper Large v3 Turbo
+      matrix: ${{ fromJSON(needs.artifacts.outputs.matrix) }}
 
     steps:
       - name: Check out source
@@ -223,11 +239,11 @@ jobs:
       - name: Download model artifact
         uses: actions/download-artifact@v8
         with:
-          name: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].name }}
+          name: ${{ matrix.artifact_name }}
           path: models/${{ matrix.slug }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].run_id }}
+          run-id: ${{ matrix.artifact_run_id }}
 
       - name: Run C++ CPU smoke test
         shell: bash
@@ -248,20 +264,7 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - slug: whisper-tiny
-            label: Whisper Tiny
-          - slug: whisper-base
-            label: Whisper Base
-          - slug: whisper-small
-            label: Whisper Small
-          - slug: whisper-medium
-            label: Whisper Medium
-          - slug: whisper-large-v3
-            label: Whisper Large v3
-          - slug: whisper-large-v3-turbo
-            label: Whisper Large v3 Turbo
+      matrix: ${{ fromJSON(needs.artifacts.outputs.matrix) }}
 
     steps:
       - name: Check out source
@@ -281,11 +284,11 @@ jobs:
       - name: Download model artifact
         uses: actions/download-artifact@v8
         with:
-          name: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].name }}
+          name: ${{ matrix.artifact_name }}
           path: models/${{ matrix.slug }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].run_id }}
+          run-id: ${{ matrix.artifact_run_id }}
 
       - name: Run C++ CPU smoke test
         shell: pwsh
