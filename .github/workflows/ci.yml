@@ -40,9 +40,14 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BASE_SHA" ]] || \
-             ! git cat-file -e "${BASE_SHA}^{commit}"; then
-            # There is no reliable comparison base for manually dispatched or initial runs.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            # Artifact keys already include the Python source hash, so manual runs
+            # only export models whose exact artifact does not exist yet.
+            build_trt_rtx_ep=ON
+            whisper_python_changed=false
+            parakeet_python_changed=false
+          elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            # There is no reliable comparison base for initial runs.
             build_trt_rtx_ep=ON
             whisper_python_changed=true
             parakeet_python_changed=true
@@ -268,8 +273,7 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MODEL_ARTIFACT}&per_page=100" \
               --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
           )"
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ||
-                "$PYTHON_CHANGED" == "true" ||
+          if [[ "$PYTHON_CHANGED" == "true" ||
                 -z "$artifact_run_id" ]]; then
             echo "export=true" >> "$GITHUB_OUTPUT"
           else
@@ -405,8 +409,7 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MODEL_ARTIFACT}&per_page=100" \
               --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
           )"
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ||
-                "$PYTHON_CHANGED" == "true" ||
+          if [[ "$PYTHON_CHANGED" == "true" ||
                 -z "$artifact_run_id" ]]; then
             echo "export=true" >> "$GITHUB_OUTPUT"
           else
@@ -511,11 +514,97 @@ jobs:
             echo "run_id=$EXISTING_RUN_ID" >> "$GITHUB_OUTPUT"
           fi
 
+  export-whisper-base:
+    name: Export Whisper Base ONNX
+    needs: changes
+    uses: ./.github/workflows/export-asr-model.yml
+    with:
+      model_slug: whisper-base
+      model_label: Whisper Base
+      model_id: openai/whisper-base
+      exporter: whisper
+      precision: fp32
+      python_changed: ${{ needs.changes.outputs.whisper_python_changed }}
+
+  export-whisper-small:
+    name: Export Whisper Small ONNX
+    needs: changes
+    uses: ./.github/workflows/export-asr-model.yml
+    with:
+      model_slug: whisper-small
+      model_label: Whisper Small
+      model_id: openai/whisper-small
+      exporter: whisper
+      precision: fp16
+      fallback_precision: fp32
+      attention: math
+      python_changed: ${{ needs.changes.outputs.whisper_python_changed }}
+
+  export-whisper-medium:
+    name: Export Whisper Medium ONNX
+    needs: changes
+    uses: ./.github/workflows/export-asr-model.yml
+    with:
+      model_slug: whisper-medium
+      model_label: Whisper Medium
+      model_id: openai/whisper-medium
+      exporter: whisper
+      precision: fp32
+      python_changed: ${{ needs.changes.outputs.whisper_python_changed }}
+
+  export-whisper-large-v3:
+    name: Export Whisper Large v3 ONNX
+    needs: changes
+    uses: ./.github/workflows/export-asr-model.yml
+    with:
+      model_slug: whisper-large-v3
+      model_label: Whisper Large v3
+      model_id: openai/whisper-large-v3
+      exporter: whisper
+      precision: fp16
+      fallback_precision: fp32
+      python_changed: ${{ needs.changes.outputs.whisper_python_changed }}
+
+  export-whisper-large-v3-turbo:
+    name: Export Whisper Large v3 Turbo ONNX
+    needs: changes
+    uses: ./.github/workflows/export-asr-model.yml
+    with:
+      model_slug: whisper-large-v3-turbo
+      model_label: Whisper Large v3 Turbo
+      model_id: openai/whisper-large-v3-turbo
+      exporter: whisper
+      precision: fp16
+      fallback_precision: fp32
+      python_changed: ${{ needs.changes.outputs.whisper_python_changed }}
+
+  export-nemotron:
+    name: Export Nemotron 3.5 ASR Streaming ONNX
+    needs: changes
+    uses: ./.github/workflows/export-asr-model.yml
+    with:
+      model_slug: nemotron-3.5-asr-streaming-0.6b
+      model_label: Nemotron 3.5 ASR Streaming 0.6B
+      model_id: nvidia/nemotron-3.5-asr-streaming-0.6b
+      exporter: nemotron
+      precision: float16
+      fallback_precision: float32
+      python_changed: ${{ needs.changes.outputs.parakeet_python_changed }}
+
   linux-x64-asr-runtime:
     name: Linux x64 / CPU / ${{ matrix.label }}
     runs-on: ubuntu-24.04
     container: nvidia/cuda:13.2.1-runtime-ubuntu24.04
-    needs: [linux-x64, export-whisper-tiny, export-parakeet]
+    needs:
+      - linux-x64
+      - export-whisper-tiny
+      - export-whisper-base
+      - export-whisper-small
+      - export-whisper-medium
+      - export-whisper-large-v3
+      - export-whisper-large-v3-turbo
+      - export-parakeet
+      - export-nemotron
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -524,9 +613,27 @@ jobs:
           - model: whisper-tiny
             label: Whisper Tiny
             executable: din_asr_whisper_cli
+          - model: whisper-base
+            label: Whisper Base
+            executable: din_asr_whisper_cli
+          - model: whisper-small
+            label: Whisper Small
+            executable: din_asr_whisper_cli
+          - model: whisper-medium
+            label: Whisper Medium
+            executable: din_asr_whisper_cli
+          - model: whisper-large-v3
+            label: Whisper Large v3
+            executable: din_asr_whisper_cli
+          - model: whisper-large-v3-turbo
+            label: Whisper Large v3 Turbo
+            executable: din_asr_whisper_cli
           - model: parakeet-tdt
             label: Parakeet TDT
             executable: din_asr_parakeet_tdt_cli
+          - model: nemotron-3.5-asr-streaming-0.6b
+            label: Nemotron 3.5 ASR Streaming 0.6B
+            executable: din_asr_nemotron_cli
 
     steps:
       - name: Check out source
@@ -548,6 +655,56 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.export-whisper-tiny.outputs.artifact_run_id }}
 
+      - name: Download Whisper Base model artifact
+        if: matrix.model == 'whisper-base'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-base.outputs.artifact_name }}
+          path: models/whisper-base
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-base.outputs.artifact_run_id }}
+
+      - name: Download Whisper Small model artifact
+        if: matrix.model == 'whisper-small'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-small.outputs.artifact_name }}
+          path: models/whisper-small
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-small.outputs.artifact_run_id }}
+
+      - name: Download Whisper Medium model artifact
+        if: matrix.model == 'whisper-medium'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-medium.outputs.artifact_name }}
+          path: models/whisper-medium
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-medium.outputs.artifact_run_id }}
+
+      - name: Download Whisper Large v3 model artifact
+        if: matrix.model == 'whisper-large-v3'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-large-v3.outputs.artifact_name }}
+          path: models/whisper-large-v3
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-large-v3.outputs.artifact_run_id }}
+
+      - name: Download Whisper Large v3 Turbo model artifact
+        if: matrix.model == 'whisper-large-v3-turbo'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-large-v3-turbo.outputs.artifact_name }}
+          path: models/whisper-large-v3-turbo
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-large-v3-turbo.outputs.artifact_run_id }}
+
       - name: Download Parakeet TDT model artifact
         if: matrix.model == 'parakeet-tdt'
         uses: actions/download-artifact@v4
@@ -557,6 +714,16 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.export-parakeet.outputs.artifact_run_id }}
+
+      - name: Download Nemotron model artifact
+        if: matrix.model == 'nemotron-3.5-asr-streaming-0.6b'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-nemotron.outputs.artifact_name }}
+          path: models/nemotron-3.5-asr-streaming-0.6b
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-nemotron.outputs.artifact_run_id }}
 
       - name: Run C++ CPU smoke test
         shell: bash
@@ -573,7 +740,16 @@ jobs:
   windows-x64-asr-runtime:
     name: Windows x64 / CPU / ${{ matrix.label }}
     runs-on: windows-2025
-    needs: [windows-x64, export-whisper-tiny, export-parakeet]
+    needs:
+      - windows-x64
+      - export-whisper-tiny
+      - export-whisper-base
+      - export-whisper-small
+      - export-whisper-medium
+      - export-whisper-large-v3
+      - export-whisper-large-v3-turbo
+      - export-parakeet
+      - export-nemotron
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -582,9 +758,27 @@ jobs:
           - model: whisper-tiny
             label: Whisper Tiny
             executable: din_asr_whisper_cli.exe
+          - model: whisper-base
+            label: Whisper Base
+            executable: din_asr_whisper_cli.exe
+          - model: whisper-small
+            label: Whisper Small
+            executable: din_asr_whisper_cli.exe
+          - model: whisper-medium
+            label: Whisper Medium
+            executable: din_asr_whisper_cli.exe
+          - model: whisper-large-v3
+            label: Whisper Large v3
+            executable: din_asr_whisper_cli.exe
+          - model: whisper-large-v3-turbo
+            label: Whisper Large v3 Turbo
+            executable: din_asr_whisper_cli.exe
           - model: parakeet-tdt
             label: Parakeet TDT
             executable: din_asr_parakeet_tdt_cli.exe
+          - model: nemotron-3.5-asr-streaming-0.6b
+            label: Nemotron 3.5 ASR Streaming 0.6B
+            executable: din_asr_nemotron_cli.exe
 
     steps:
       - name: Check out source
@@ -606,6 +800,56 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.export-whisper-tiny.outputs.artifact_run_id }}
 
+      - name: Download Whisper Base model artifact
+        if: matrix.model == 'whisper-base'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-base.outputs.artifact_name }}
+          path: models/whisper-base
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-base.outputs.artifact_run_id }}
+
+      - name: Download Whisper Small model artifact
+        if: matrix.model == 'whisper-small'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-small.outputs.artifact_name }}
+          path: models/whisper-small
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-small.outputs.artifact_run_id }}
+
+      - name: Download Whisper Medium model artifact
+        if: matrix.model == 'whisper-medium'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-medium.outputs.artifact_name }}
+          path: models/whisper-medium
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-medium.outputs.artifact_run_id }}
+
+      - name: Download Whisper Large v3 model artifact
+        if: matrix.model == 'whisper-large-v3'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-large-v3.outputs.artifact_name }}
+          path: models/whisper-large-v3
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-large-v3.outputs.artifact_run_id }}
+
+      - name: Download Whisper Large v3 Turbo model artifact
+        if: matrix.model == 'whisper-large-v3-turbo'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-whisper-large-v3-turbo.outputs.artifact_name }}
+          path: models/whisper-large-v3-turbo
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-whisper-large-v3-turbo.outputs.artifact_run_id }}
+
       - name: Download Parakeet TDT model artifact
         if: matrix.model == 'parakeet-tdt'
         uses: actions/download-artifact@v4
@@ -615,6 +859,16 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.export-parakeet.outputs.artifact_run_id }}
+
+      - name: Download Nemotron model artifact
+        if: matrix.model == 'nemotron-3.5-asr-streaming-0.6b'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.export-nemotron.outputs.artifact_name }}
+          path: models/nemotron-3.5-asr-streaming-0.6b
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export-nemotron.outputs.artifact_run_id }}
 
       - name: Run C++ CPU smoke test
         shell: pwsh
