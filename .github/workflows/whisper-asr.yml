@@ -36,7 +36,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
           REQUESTED_RUN_ID: ${{ inputs.build_run_id }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           run_id="$REQUESTED_RUN_ID"
