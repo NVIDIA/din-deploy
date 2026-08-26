@@ -7,54 +7,24 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
 jobs:
-  changes:
-    name: Determine EP build requirement
-    runs-on: ubuntu-24.04
-    outputs:
-      build_trt_rtx_ep: ${{ steps.ep-build.outputs.build_trt_rtx_ep }}
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine whether to build the TensorRT RTX EP
-        id: ep-build
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BASE_SHA" ]] || \
-             ! git cat-file -e "${BASE_SHA}^{commit}"; then
-            # There is no reliable comparison base for manually dispatched or initial runs.
-            build_trt_rtx_ep=ON
-          elif git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -Eq '^(cmake/|CMakePresets\.json$)'; then
-            build_trt_rtx_ep=ON
-          else
-            build_trt_rtx_ep=OFF
-          fi
-          echo "build_trt_rtx_ep=$build_trt_rtx_ep" >> "$GITHUB_OUTPUT"
-
   clang-format:
     name: clang-format
     runs-on: ubuntu-24.04
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install clang-format
         shell: bash
@@ -79,7 +49,6 @@ jobs:
   linux-x64:
     name: Ubuntu 24.04 / Clang / x64
     runs-on: ubuntu-24.04
-    needs: changes
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
     timeout-minutes: 90
 
@@ -92,10 +61,10 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Restore CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: out/build/linux-x64/_deps
           key: linux-x64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
@@ -104,7 +73,7 @@ jobs:
         shell: bash
         run: |
           cmake --preset linux-x64 \
-            -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
+            -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
         run: cmake --build --preset linux-x64-release --parallel
@@ -113,17 +82,16 @@ jobs:
         run: ctest --test-dir out/build/linux-x64 --build-config Release --show-only=human
 
       - name: Upload build output
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: success()
+        uses: actions/upload-artifact@v7
         with:
           name: linux-x64-release
-          if-no-files-found: warn
+          if-no-files-found: error
           path: out/build/linux-x64/bin/Release/
 
   linux-arm64:
     name: Ubuntu 24.04 / Clang / ARM64
     runs-on: ubuntu-24.04-arm
-    needs: changes
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
     timeout-minutes: 90
 
@@ -136,17 +104,17 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Restore CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: out/build/linux-arm64/_deps
           key: linux-arm64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
 
       - name: Configure
         shell: bash
-        run: cmake --preset linux-arm64 -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
+        run: cmake --preset linux-arm64 -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
         run: cmake --build --preset linux-arm64-release --parallel
@@ -155,22 +123,21 @@ jobs:
         run: ctest --test-dir out/build/linux-arm64 --build-config Release --show-only=human
 
       - name: Upload build output
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: success()
+        uses: actions/upload-artifact@v7
         with:
           name: linux-arm64-release
-          if-no-files-found: warn
+          if-no-files-found: error
           path: out/build/linux-arm64/bin/Release/
 
   windows-x64:
     name: Windows Server 2025 / MSVC / x64
     runs-on: windows-2025
-    needs: changes
     timeout-minutes: 90
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -178,12 +145,12 @@ jobs:
           arch: x64
 
       - name: Install CUDA
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '13.2.0'
+          cuda: '13.2.1'
 
       - name: Restore CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: out/build/windows-x64/_deps
           key: windows-x64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
@@ -192,7 +159,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --preset windows-x64 `
-            -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
+            -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
         run: cmake --build --preset windows-x64-release --parallel
@@ -201,119 +168,9 @@ jobs:
         run: ctest --test-dir out/build/windows-x64 --build-config Release --show-only=human
 
       - name: Upload build output
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: success()
+        uses: actions/upload-artifact@v7
         with:
           name: windows-x64-release
-          if-no-files-found: warn
+          if-no-files-found: error
           path: out/build/windows-x64/bin/Release/
-
-#  windows-arm64:
-#    name: Windows 11 / MSVC / ARM64
-#    runs-on: windows-11-vs2026-arm
-#    needs: changes
-#    timeout-minutes: 120
-#
-#    steps:
-#      - name: Check out source
-#        uses: actions/checkout@v4
-#
-#      - name: Install CUDA
-#        shell: pwsh
-#        run: |
-#          $ErrorActionPreference = "Stop"
-#          $installer = Join-Path $env:RUNNER_TEMP "cuda_13.4.0_windows_arm64.exe"
-#          $installerUri = "https://packages.nvidia.com/prerelease/cuda/13.4.0/local_installers/cuda_13.4.0_windows_arm64.exe"
-#          $maximumDownloadAttempts = 3
-#          for ($attempt = 1; $attempt -le $maximumDownloadAttempts; $attempt++) {
-#            try {
-#              Invoke-WebRequest -Uri $installerUri -OutFile $installer
-#              break
-#            } catch {
-#              Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
-#              if ($attempt -eq $maximumDownloadAttempts) {
-#                throw
-#              }
-#              Start-Sleep -Seconds 10
-#            }
-#          }
-#          $process = Start-Process `
-#            -FilePath $installer `
-#            -ArgumentList "-s" `
-#            -Wait `
-#            -PassThru
-#          if ($process.ExitCode -ne 0) {
-#            throw "CUDA installer exited with code $($process.ExitCode)"
-#          }
-#          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
-#          if (-not (Test-Path (Join-Path $cudaPath "bin\nvcc.exe"))) {
-#            throw "CUDA installation is missing nvcc.exe"
-#          }
-#          $ciccDirectory = Join-Path $cudaPath "nvvm\bin"
-#          if (-not (Test-Path (Join-Path $ciccDirectory "cicc.exe"))) {
-#            throw "CUDA installation is missing the NVVM cicc compiler"
-#          }
-#          "CICC_PATH=$ciccDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-#          & (Join-Path $cudaPath "bin\nvcc.exe") --version
-#
-#      - name: Set up MSVC
-#        shell: pwsh
-#        run: |
-#          $ErrorActionPreference = "Stop"
-#          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-#          $vsInstallPath = & $vswhere `
-#            -latest `
-#            -products * `
-#            -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
-#            -property installationPath
-#          if (-not $vsInstallPath) {
-#            throw "Visual Studio with the ARM64 MSVC toolchain was not found"
-#          }
-#          $devShellModule = Join-Path $vsInstallPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-#          Import-Module $devShellModule
-#          Enter-VsDevShell `
-#            -VsInstallPath $vsInstallPath `
-#            -SkipAutomaticLocation `
-#            -DevCmdArguments "-arch=arm64 -host_arch=arm64"
-#
-#      - name: Restore CMake dependencies
-#        uses: actions/cache@v4
-#        with:
-#          path: out/build/windows-arm64/_deps
-#          key: windows-arm64-deps-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**') }}
-#
-#      - name: Configure
-#        shell: pwsh
-#        run: |
-#          $ErrorActionPreference = "Stop"
-#          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
-#          $cudaCompiler = Join-Path $cudaPath "bin\nvcc.exe"
-#          if (-not (Test-Path $cudaCompiler)) {
-#            throw "CUDA installation is missing nvcc.exe"
-#          }
-#          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-#          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
-#          Import-Module (Join-Path $vsInstallPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
-#          Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -DevCmdArguments "-arch=arm64 -host_arch=arm64"
-#          cmake --preset windows-arm64 "-DCMAKE_CUDA_COMPILER=$cudaCompiler" "-DCUDAToolkit_ROOT=$cudaPath" -DDIN_BUILD_TRT_RTX_EP=${{ needs.changes.outputs.build_trt_rtx_ep }}
-#
-#      - name: Build
-#        shell: pwsh
-#        run: |
-#          $ErrorActionPreference = "Stop"
-#          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-#          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
-#          Import-Module (Join-Path $vsInstallPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
-#          Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -DevCmdArguments "-arch=arm64 -host_arch=arm64"
-#          cmake --build --preset windows-arm64-release --parallel
-#
-#      - name: List registered CTest tests
-#        run: ctest --test-dir out/build/windows-arm64 --build-config Release --show-only=human
-#
-#      - name: Upload build output
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: windows-arm64-release
-#          if-no-files-found: warn
-#          path: out/build/windows-arm64/bin/Release/

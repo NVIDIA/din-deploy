@@ -1,0 +1,252 @@
+name: SAM2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful Build workflow run ID whose artifacts should be tested
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: sam2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  requirements:
+    name: Wait for Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    outputs:
+      build_run_id: ${{ steps.build.outputs.run_id }}
+      source_ref: ${{ steps.build.outputs.source_ref }}
+
+    steps:
+      - name: Resolve successful Build run
+        id: build
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.build_run_id }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          run_id="$REQUESTED_RUN_ID"
+          while [[ -z "$run_id" ]]; do
+            run_id="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?per_page=100" \
+                --jq ".workflow_runs | map(select(.head_sha == \"$SOURCE_SHA\" and .event == \"$EVENT_NAME\")) | sort_by(.created_at) | last | .id // empty"
+            )"
+            [[ -n "$run_id" ]] || sleep 10
+          done
+          while true; do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq .status)"
+            [[ "$status" == "completed" ]] && break
+            sleep 15
+          done
+          conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq .conclusion)"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "Build run ${run_id} concluded ${conclusion}" >&2
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          source_ref="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq .head_sha)"
+          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
+
+  export:
+    name: Export ${{ matrix.label }} ONNX
+    needs: requirements
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: sam2.1-hiera-tiny
+            label: SAM2.1 Hiera Tiny
+            model_id: facebook/sam2.1-hiera-tiny
+          - slug: sam2.1-hiera-small
+            label: SAM2.1 Hiera Small
+            model_id: facebook/sam2.1-hiera-small
+          - slug: sam2.1-hiera-base-plus
+            label: SAM2.1 Hiera Base Plus
+            model_id: facebook/sam2.1-hiera-base-plus
+          - slug: sam2.1-hiera-large
+            label: SAM2.1 Hiera Large
+            model_id: facebook/sam2.1-hiera-large
+    uses: ./.github/workflows/export-sam2-model.yml
+    with:
+      model_slug: ${{ matrix.slug }}
+      model_label: ${{ matrix.label }}
+      model_id: ${{ matrix.model_id }}
+      source_ref: ${{ needs.requirements.outputs.source_ref }}
+
+  artifacts:
+    name: Resolve SAM2 artifacts
+    needs: [requirements, export]
+    runs-on: ubuntu-24.04
+    outputs:
+      models: ${{ steps.resolve.outputs.models }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.requirements.outputs.source_ref }}
+
+      - name: Resolve model artifacts
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_hash="$(
+            git ls-files -z -- 'vision/sam2/python/*.py' 'vision/sam2/python/**/*.py' \
+              | xargs -0 sha256sum \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          models='{}'
+          for slug in \
+            sam2.1-hiera-tiny \
+            sam2.1-hiera-small \
+            sam2.1-hiera-base-plus \
+            sam2.1-hiera-large; do
+            artifact_name="vision-${slug}-onnx-v1-${source_hash:0:16}"
+            artifact_run_id="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100" \
+                --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
+            )"
+            test -n "$artifact_run_id"
+            models="$(jq \
+              --arg slug "$slug" \
+              --arg name "$artifact_name" \
+              --arg run_id "$artifact_run_id" \
+              '. + {($slug): {name: $name, run_id: $run_id}}' \
+              <<< "$models")"
+          done
+          echo "models=$(jq -c . <<< "$models")" >> "$GITHUB_OUTPUT"
+
+  linux-runtime:
+    name: Linux x64 / CPU / ${{ matrix.label }}
+    needs: [requirements, artifacts]
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.2.1-runtime-ubuntu24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: sam2.1-hiera-tiny
+            label: SAM2.1 Hiera Tiny
+          - slug: sam2.1-hiera-small
+            label: SAM2.1 Hiera Small
+          - slug: sam2.1-hiera-base-plus
+            label: SAM2.1 Hiera Base Plus
+          - slug: sam2.1-hiera-large
+            label: SAM2.1 Hiera Large
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.requirements.outputs.source_ref }}
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-x64-release
+          path: runtime
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.requirements.outputs.build_run_id }}
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].name }}
+          path: models/${{ matrix.slug }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].run_id }}
+
+      - name: Run C++ CPU smoke test
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/runtime
+        run: |
+          set -euxo pipefail
+          base64 --decode assets/sam2-ci.png.base64 > assets/sam2-ci.png
+          mkdir -p "out/${{ matrix.slug }}"
+          chmod +x runtime/din_sam2_cli
+          runtime/din_sam2_cli \
+            assets/sam2-ci.png \
+            assets/sam2-ci-prompt.json \
+            "out/${{ matrix.slug }}" \
+            --model-dir "models/${{ matrix.slug }}" \
+            --provider cpu
+
+  windows-runtime:
+    name: Windows x64 / CPU / ${{ matrix.label }}
+    needs: [requirements, artifacts]
+    runs-on: windows-2025
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: sam2.1-hiera-tiny
+            label: SAM2.1 Hiera Tiny
+          - slug: sam2.1-hiera-small
+            label: SAM2.1 Hiera Small
+          - slug: sam2.1-hiera-base-plus
+            label: SAM2.1 Hiera Base Plus
+          - slug: sam2.1-hiera-large
+            label: SAM2.1 Hiera Large
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.requirements.outputs.source_ref }}
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-x64-release
+          path: runtime
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.requirements.outputs.build_run_id }}
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].name }}
+          path: models/${{ matrix.slug }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ fromJSON(needs.artifacts.outputs.models)[matrix.slug].run_id }}
+
+      - name: Run C++ CPU smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $imageBytes = [Convert]::FromBase64String(
+            (Get-Content -LiteralPath "assets/sam2-ci.png.base64" -Raw).Trim()
+          )
+          [IO.File]::WriteAllBytes("assets/sam2-ci.png", $imageBytes)
+          New-Item -ItemType Directory -Force -Path "out/${{ matrix.slug }}" | Out-Null
+          & "runtime/din_sam2_cli.exe" `
+            "assets/sam2-ci.png" `
+            "assets/sam2-ci-prompt.json" `
+            "out/${{ matrix.slug }}" `
+            --model-dir "models/${{ matrix.slug }}" `
+            --provider cpu

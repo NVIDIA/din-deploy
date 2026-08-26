@@ -1,0 +1,210 @@
+name: Export SAM2 model
+
+on:
+  workflow_call:
+    inputs:
+      model_slug:
+        required: true
+        type: string
+      model_label:
+        required: true
+        type: string
+      model_id:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+    outputs:
+      artifact_name:
+        value: ${{ jobs.export.outputs.artifact_name }}
+      artifact_run_id:
+        value: ${{ jobs.export.outputs.artifact_run_id }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export:
+    name: Export ${{ inputs.model_label }} ONNX
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    outputs:
+      artifact_name: ${{ steps.model-key.outputs.artifact_name }}
+      artifact_run_id: ${{ steps.final-artifact.outputs.run_id }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+
+      - name: Determine export requirement
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            force=false
+          elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            force=true
+          elif git diff --quiet "$BASE_SHA" "$SOURCE_REF" -- \
+            'vision/sam2/python/*.py' \
+            'vision/sam2/python/**/*.py' \
+            '.github/workflows/export-sam2-model.yml' \
+            '.github/workflows/sam2.yml'; then
+            force=false
+          else
+            force=true
+          fi
+          echo "force=$force" >> "$GITHUB_OUTPUT"
+
+      - name: Compute model artifact key
+        id: model-key
+        shell: bash
+        env:
+          MODEL_SLUG: ${{ inputs.model_slug }}
+        run: |
+          set -euo pipefail
+          source_hash="$(
+            git ls-files -z -- 'vision/sam2/python/*.py' 'vision/sam2/python/**/*.py' \
+              | xargs -0 sha256sum \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          echo "source_hash=$source_hash" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=vision-${MODEL_SLUG}-onnx-v1-${source_hash:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve reusable model artifact
+        id: existing-artifact
+        shell: bash
+        env:
+          FORCE_EXPORT: ${{ steps.changes.outputs.force }}
+          GH_TOKEN: ${{ github.token }}
+          MODEL_ARTIFACT: ${{ steps.model-key.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          artifact_run_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MODEL_ARTIFACT}&per_page=100" \
+              --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
+          )"
+          if [[ "$FORCE_EXPORT" == "true" || -z "$artifact_run_id" ]]; then
+            echo "export=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "export=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "run_id=$artifact_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim runner disk space
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/share/dotnet
+          df -h /
+
+      - name: Set up Python
+        if: steps.existing-artifact.outputs.export == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install SAM2 export dependencies
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch \
+            torchvision
+          python -m pip install \
+            huggingface_hub \
+            numpy \
+            onnx \
+            onnxscript \
+            "sam-2 @ git+https://github.com/facebookresearch/sam2.git"
+
+      - name: Export SAM2 ONNX
+        if: steps.existing-artifact.outputs.export == 'true'
+        shell: bash
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+          MODEL_OUTPUT: artifacts/ci/${{ inputs.model_slug }}
+          SOURCE_HASH: ${{ steps.model-key.outputs.source_hash }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euxo pipefail
+          python vision/sam2/python/export_sam2_onnx.py \
+            --model "$MODEL_ID" \
+            --output "$MODEL_OUTPUT" \
+            --device cpu \
+            --dtype float16 \
+            --max-points 3
+
+          required_files=(
+            image_preprocess.onnx
+            image_encoder.onnx
+            sam2_decoder.onnx
+            sam2_decoder_propagate.onnx
+            memory_attention.onnx
+            memory_encoder.onnx
+            mask_postprocess.onnx
+            metadata.json
+          )
+          for required_file in "${required_files[@]}"; do
+            test -f "$MODEL_OUTPUT/$required_file"
+          done
+
+          export MODEL_ID MODEL_OUTPUT SOURCE_HASH
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path(os.environ["MODEL_OUTPUT"])
+          manifest = {
+              "model_id": os.environ["MODEL_ID"],
+              "precision": "float16",
+              "source_hash": os.environ["SOURCE_HASH"],
+              "commit": os.environ["SOURCE_REF"],
+          }
+          (output / "ci-export-manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload SAM2 ONNX
+        if: steps.existing-artifact.outputs.export == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.model-key.outputs.artifact_name }}
+          path: artifacts/ci/${{ inputs.model_slug }}/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Select model artifact run
+        id: final-artifact
+        shell: bash
+        env:
+          EXPORTED: ${{ steps.existing-artifact.outputs.export }}
+          EXISTING_RUN_ID: ${{ steps.existing-artifact.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXPORTED" == "true" ]]; then
+            echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=$EXISTING_RUN_ID" >> "$GITHUB_OUTPUT"
+          fi

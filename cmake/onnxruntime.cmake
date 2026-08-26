@@ -178,38 +178,43 @@ if(NOT DIN_RUNTIME_DIR)
         set(DIN_RUNTIME_DIR "${CMAKE_BINARY_DIR}/bin")
     endif()
 endif()
-#set(ONNXRUNTIME_RUNTIME_DIR "${DIN_RUNTIME_DIR}")
+set(ONNXRUNTIME_RUNTIME_DIR "${DIN_RUNTIME_DIR}")
 
-#set(_onnxruntime_runtime_dependencies)
-#if(WIN32)
-#    if(ONNXRUNTIME_DLL)
-#        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_DLL}")
-#    endif()
-#    if(ONNXRUNTIME_PROVIDERS_SHARED_DLL)
-#        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_PROVIDERS_SHARED_DLL}")
-#    endif()
-#else()
-#    if(ONNXRUNTIME_LIB)
-#        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_LIB}")
-#    endif()
-#    if(ONNXRUNTIME_PROVIDERS_SHARED_LIB)
-#        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_PROVIDERS_SHARED_LIB}")
-#    endif()
-#endif()
-#if(_onnxruntime_runtime_dependencies)
-#    list(REMOVE_DUPLICATES _onnxruntime_runtime_dependencies)
-#endif()
+set(_onnxruntime_runtime_dependencies)
+if(WIN32)
+    if(ONNXRUNTIME_DLL)
+        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_DLL}")
+    endif()
+    if(ONNXRUNTIME_PROVIDERS_SHARED_DLL)
+        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_PROVIDERS_SHARED_DLL}")
+    endif()
+else()
+    if(ONNXRUNTIME_LIB)
+        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_LIB}")
+        get_filename_component(_onnxruntime_lib_dir "${ONNXRUNTIME_LIB}" DIRECTORY)
+        file(GLOB _onnxruntime_soname_files "${_onnxruntime_lib_dir}/libonnxruntime.so.*")
+        list(APPEND _onnxruntime_runtime_dependencies ${_onnxruntime_soname_files})
+        unset(_onnxruntime_lib_dir)
+        unset(_onnxruntime_soname_files)
+    endif()
+    if(ONNXRUNTIME_PROVIDERS_SHARED_LIB)
+        list(APPEND _onnxruntime_runtime_dependencies "${ONNXRUNTIME_PROVIDERS_SHARED_LIB}")
+    endif()
+endif()
+if(_onnxruntime_runtime_dependencies)
+    list(REMOVE_DUPLICATES _onnxruntime_runtime_dependencies)
+endif()
 
-#set(_onnxruntime_runtime_commands
-#    COMMAND "${CMAKE_COMMAND}" -E make_directory "${ONNXRUNTIME_RUNTIME_DIR}/$<CONFIG>"
-#)
-#foreach(_onnxruntime_runtime_dependency IN LISTS _onnxruntime_runtime_dependencies)
-#    list(APPEND _onnxruntime_runtime_commands
-#        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-#                "${_onnxruntime_runtime_dependency}"
-#                "${ONNXRUNTIME_RUNTIME_DIR}/$<CONFIG>"
-#    )
-#endforeach()
+set(_onnxruntime_runtime_commands
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${ONNXRUNTIME_RUNTIME_DIR}"
+)
+foreach(_onnxruntime_runtime_dependency IN LISTS _onnxruntime_runtime_dependencies)
+    list(APPEND _onnxruntime_runtime_commands
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${_onnxruntime_runtime_dependency}"
+                "${ONNXRUNTIME_RUNTIME_DIR}"
+    )
+endforeach()
 
 add_custom_target(onnxruntime_runtime
     ${_onnxruntime_runtime_commands}
