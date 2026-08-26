@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="300" viewBox="0 0 960 300" role="img" aria-labelledby="title description">
+  <title id="title">FLUX.2-klein-4B speedup by precision on DGX Spark</title>
+  <desc id="description">Horizontal bar chart showing BF16 at 1.00 times, FP8 at 1.33 times, and NVFP4 at 1.63 times speedup.</desc>
+  <style>
+    .subtitle { font: 15px Arial, sans-serif; fill: #4b5563; }
+    .label { font: 600 17px Arial, sans-serif; fill: #111827; }
+    .value { font: 700 18px Arial, sans-serif; fill: #111827; }
+    .axis { font: 13px Arial, sans-serif; fill: #6b7280; }
+  </style>
+  <rect width="960" height="300" rx="16" fill="#f8fafc"/>
+  <g stroke="#d1d5db" stroke-width="1">
+    <line x1="220" y1="35" x2="220" y2="220"/>
+    <line x1="420" y1="35" x2="420" y2="220" stroke-dasharray="4 5"/>
+    <line x1="620" y1="35" x2="620" y2="220" stroke-dasharray="4 5"/>
+    <line x1="820" y1="35" x2="820" y2="220" stroke-dasharray="4 5"/>
+  </g>
+  <g class="axis" text-anchor="middle">
+    <text x="220" y="242">0×</text>
+    <text x="420" y="242">0.5×</text>
+    <text x="620" y="242">1.0×</text>
+    <text x="820" y="242">1.5×</text>
+  </g>
+  <text x="40" y="278" class="subtitle">DGX Spark · fully CUDA backend-based pipeline · BF16 baseline</text>
+  <g>
+    <text x="40" y="78" class="label">BF16</text>
+    <rect x="220" y="49" width="400" height="44" rx="8" fill="#94a3b8"/>
+    <text x="636" y="78" class="value">1.00×</text>
+    <text x="40" y="139" class="label">FP8</text>
+    <rect x="220" y="110" width="532" height="44" rx="8" fill="#76b900"/>
+    <text x="768" y="139" class="value">1.33×</text>
+    <text x="40" y="200" class="label">NVFP4</text>
+    <rect x="220" y="171" width="652" height="44" rx="8" fill="#76b900"/>
+    <text x="888" y="200" class="value">1.63×</text>
+  </g>
+</svg>

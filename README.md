@@ -26,6 +26,22 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 |-----------|-----------------------------------------------------------------------------------------------------------------------------------------|-------------------------------|
 | Meta Sam2 | `facebook/sam2.1-hiera-tiny`<br>`facebook/sam2.1-hiera-small`<br>`facebook/sam2.1-hiera-base-plus`<br>`facebook/sam2.1-hiera-large`<br> | [Sam2](vision/sam2/README.md) |
 
+## Performance benchmarks
+
+Results measured on a DGX Spark using CPU EP vs TensorRT RTX EP. RTF is the audio real-time factor (higher is faster).
+
+| Model |         GPU | CPU |
+| --- |------------:| ---: |
+| `openai/whisper-large-v3-turbo` |  72.67x RTF | 6.75x RTF |
+| `nvidia/nemotron-3.5-asr-streaming-0.6b` |  39.01x RTF | 3.24x RTF |
+| `nvidia/parakeet-tdt-0.6b-v3` | 206.41x RTF | 14.44x RTF |
+| `facebook/sam2.1-hiera-base-plus` |    38.3 FPS | 0.5 FPS |
+
+### FLUX.2-klein-4B quantization
+
+For the fully CUDA backend-based pipeline we measured performance on a DGX Spark across the used quantization precisions.
+
+![FLUX.2-klein-4B speedup by precision on DGX Spark](assets/flux2-speedup-dgx-spark.svg)
 
 ## Getting Started
 
