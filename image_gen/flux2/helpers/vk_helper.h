@@ -555,9 +555,6 @@ private:
             VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
-#if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
-            VK_NV_EXTERNAL_COMPUTE_QUEUE_EXTENSION_NAME,
-#endif
         };
 
         std::vector<const char*> result;
@@ -934,9 +931,10 @@ private:
         fprintf(stdout, "Checking device extensions:\n");
         std::vector<const char*> deviceExtensions = getRequiredDeviceExtensions();
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
-        const bool enableExternalComputeQueue =
-            checkDeviceExtensionSupport(VK_NV_EXTERNAL_COMPUTE_QUEUE_EXTENSION_NAME) &&
-            externalComputeQueueProperties.maxExternalQueues > 0 && externalComputeQueueProperties.externalDataSize > 0;
+        // Flux uses its normal Vulkan queue for all submissions. Do not opt
+        // into an unused external-compute queue, which changes the device
+        // creation contract on NVIDIA drivers.
+        const bool enableExternalComputeQueue = false;
 #endif
 
         // Build feature chain based on what's supported

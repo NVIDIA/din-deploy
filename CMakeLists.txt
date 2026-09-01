@@ -205,15 +205,12 @@ if(DIN_BUILD_TESTING)
                 dx-cig
         )
     endif ()
-    if (NOT WIN32)
-        # TODO this test should be cross platform but experiences a device lost error on windows
-        add_din_flux2_cli_test(
-                din_flux2_bf16
-                "${DIN_DEPLOY_ARTIFACTS_ROOT}/FLUX.2-klein-4B-onnx"
-                trt-rtx
-                vk
-        )
-    endif ()
+    add_din_flux2_cli_test(
+            din_flux2_bf16
+            "${DIN_DEPLOY_ARTIFACTS_ROOT}/FLUX.2-klein-4B-onnx"
+            trt-rtx
+            vk
+    )
 
     unset(_din_cli_test_audio)
 endif()
