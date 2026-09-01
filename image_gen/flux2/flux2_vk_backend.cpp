@@ -46,6 +46,56 @@ void initialize_latents(unsigned int seed, size_t hidden_count, void* dest)
     initialize_latent(static_cast<float*>(dest), hidden_count, seed);
 }
 
+class OrtVulkanGraphicsInteropScope
+{
+public:
+    OrtVulkanGraphicsInteropScope(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device,
+                                  const std::vector<uint8_t>& external_compute_queue_data)
+        : interop_(interop)
+        , ep_device_(ep_device)
+    {
+        if (external_compute_queue_data.empty())
+        {
+            throw std::runtime_error("Vulkan CIG external compute queue data is empty");
+        }
+
+        Ort::KeyValuePairs options;
+        options.Add("VkExternalComputeQueueDataParamsNV_data",
+                    std::to_string(reinterpret_cast<uintptr_t>(external_compute_queue_data.data())).c_str());
+
+        OrtGraphicsInteropConfig config{};
+        config.version = ORT_API_VERSION;
+        config.graphics_api = ORT_GRAPHICS_API_VULKAN;
+        config.command_queue = nullptr;
+        config.additional_options = options.GetConst();
+        Ort::ThrowOnError(interop_.InitGraphicsInteropForEpDevice(ep_device_, &config));
+        active_ = true;
+    }
+
+    OrtVulkanGraphicsInteropScope(const OrtVulkanGraphicsInteropScope&) = delete;
+    OrtVulkanGraphicsInteropScope& operator=(const OrtVulkanGraphicsInteropScope&) = delete;
+
+    ~OrtVulkanGraphicsInteropScope()
+    {
+        if (!active_)
+        {
+            return;
+        }
+        OrtStatus* status = interop_.DeinitGraphicsInteropForEpDevice(ep_device_);
+        if (status != nullptr)
+        {
+            std::cerr << "DeinitGraphicsInteropForEpDevice failed: " << Ort::GetApi().GetErrorMessage(status)
+                      << std::endl;
+            Ort::GetApi().ReleaseStatus(status);
+        }
+    }
+
+private:
+    const OrtInteropApi& interop_;
+    Ort::ConstEpDevice ep_device_;
+    bool active_ = false;
+};
+
 class OrtVulkanTensorImporter
 {
 public:
@@ -552,6 +602,8 @@ struct VkPipelineState
         tensor_importer.reset();
         sync_semaphore.reset();
         sync_stream.reset();
+        graphics_interop.reset();
+        cig_external_compute_queue_data.clear();
 
         euler_shader.cleanup();
         postprocess_shader.cleanup();
@@ -561,9 +613,12 @@ struct VkPipelineState
     std::unique_ptr<VkHelper> vk;
     Ort::Env& env;
     bool prompt_embeds_valid = false;
+    bool use_cig = false;
     Ort::ConstEpDevice trt_device{};
     std::optional<Ort::SyncStream> sync_stream;
     const OrtInteropApi* interop_api = nullptr;
+    std::vector<uint8_t> cig_external_compute_queue_data;
+    std::unique_ptr<OrtVulkanGraphicsInteropScope> graphics_interop;
 
     std::unique_ptr<din::common::OrtRunner> text_encoder_runner;
     std::unique_ptr<din::common::OrtRunner> transformer_runner;
@@ -620,9 +675,11 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
-    const Flux2ModelCachePaths cache_paths = MakeFlux2ModelCachePaths(config.precision, "vk");
+    state.use_cig = config.processing == Flux2ProcessingBackend::VkCig;
+    const Flux2ModelCachePaths cache_paths = MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk");
 
-    std::cout << "Model dir: " << model_paths.base_dir.string() << "\n" << std::endl;
+    std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
+              << "CIG:       " << (state.use_cig ? "enabled" : "disabled") << "\n" << std::endl;
 
     // -----------------------------------------------------------------
     // Init Vulkan
@@ -630,7 +687,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     std::cout << "\n=== Initializing Vulkan ===" << std::endl;
     auto nvtx_scope_vk = nvtx3::start_range("init_vulkan");
 
-    state.vk = std::make_unique<VkHelper>(0);
+    state.vk = std::make_unique<VkHelper>(0, state.use_cig);
     std::cout << "Vulkan device initialized" << std::endl;
 
     nvtx3::end_range(nvtx_scope_vk);
@@ -640,6 +697,12 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
     state.trt_device = trt_device;
     state.interop_api = &Ort::GetInteropApi();
+    if (state.use_cig)
+    {
+        state.cig_external_compute_queue_data = state.vk->createCudaGraphicsInteropData();
+        state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(
+            *state.interop_api, state.trt_device, state.cig_external_compute_queue_data);
+    }
     state.sync_stream.emplace(din::common::CreateTensorRTRTXComputeStream(state.env));
 
     // -----------------------------------------------------------------
@@ -650,12 +713,33 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config.ep_context_dir.string();
     const std::string cache_dir = config.ep_cache_dir.string();
+    std::vector<std::pair<std::string, std::string>> graphics_ep_options;
+    if (state.use_cig)
+    {
+        const int cuda_device_ordinal = din::common::ChooseCudaDeviceOrdinal(state.trt_device);
+        const auto shared_memory_info =
+            din::common::QueryCudaGraphicsInteropSharedMemoryInfo(cuda_device_ordinal, false);
+        if (!shared_memory_info.supports_simultaneous_graphics_compute)
+        {
+            throw std::runtime_error(std::string("Vulkan CIG is not supported on CUDA device generation ") +
+                                     din::common::ToString(shared_memory_info.generation));
+        }
+        std::cout << "CUDA device ordinal " << shared_memory_info.cuda_device_ordinal
+                  << " graphics interop shared memory limit: "
+                  << (shared_memory_info.max_shared_memory_bytes / 1024) << " KiB" << std::endl;
+        graphics_ep_options.emplace_back("nv_max_shared_mem_size",
+                                         std::to_string(shared_memory_info.max_shared_memory_bytes));
+        graphics_ep_options.emplace_back("nv_length_aux_stream_array", "0");
+        graphics_ep_options.emplace_back("nv_use_sync_gpu_allocator", "1");
+    }
 
     auto make_profile = [&](std::string cache_subpath)
     {
         din::common::ModelProfile profile;
         profile.cache_subpath = std::move(cache_subpath);
         profile.embed_ep_context = false;
+        profile.enable_cuda_graph = !state.use_cig;
+        profile.extra_ep_options = graphics_ep_options;
         return profile;
     };
 

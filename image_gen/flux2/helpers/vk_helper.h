@@ -270,6 +270,7 @@ struct VkHelper
     Device device{};
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
+    bool cigEnabled = false;
 
     // Physical device properties
     VkPhysicalDeviceProperties deviceProperties{};
@@ -298,7 +299,7 @@ struct VkHelper
      *          - Errors only: ERROR
      *          - Disable: 0
      */
-    VkHelper(uint32_t deviceIndex = 0,
+    VkHelper(uint32_t deviceIndex = 0, bool enableCig = false,
 #if DIN_ENABLE_VULKAN_VALIDATION
              VkDebugUtilsMessageSeverityFlagsEXT debugMessageSeverity =
                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -308,6 +309,7 @@ struct VkHelper
 #endif
     )
     {
+        cigEnabled = enableCig;
 #if DIN_ENABLE_VULKAN_VALIDATION
         debugSeverity = debugMessageSeverity;
 #endif
@@ -555,6 +557,11 @@ private:
             VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+#if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
+            // CIG is an explicit opt-in processing mode. Normal Vulkan must
+            // not alter device creation by enabling this extension.
+            cigEnabled ? VK_NV_EXTERNAL_COMPUTE_QUEUE_EXTENSION_NAME : nullptr,
+#endif
         };
 
         std::vector<const char*> result;
@@ -577,6 +584,10 @@ private:
         // Add optional extensions if available
         for (const char* ext : optional)
         {
+            if (ext == nullptr)
+            {
+                continue;
+            }
             if (checkDeviceExtensionSupport(ext))
             {
                 result.push_back(ext);
@@ -906,6 +917,10 @@ private:
 
                 int supportsVulkanCig = 0;
                 CU_CHECK(cuDeviceGetAttribute(&supportsVulkanCig, CU_DEVICE_ATTRIBUTE_VULKAN_CIG_SUPPORTED, candidate));
+                if (cigEnabled && supportsVulkanCig == 0)
+                {
+                    throw std::runtime_error("Vulkan CIG was requested but the matched CUDA device does not support it");
+                }
 
                 cudaDevice = candidate;
                 cudaDeviceIndex = i;
@@ -930,22 +945,21 @@ private:
         // Get extensions (checks availability and prints status)
         fprintf(stdout, "Checking device extensions:\n");
         std::vector<const char*> deviceExtensions = getRequiredDeviceExtensions();
+        bool enableExternalComputeQueue = false;
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
-        // Flux uses its normal Vulkan queue for all submissions. Do not opt
-        // into an unused external-compute queue, which changes the device
-        // creation contract on NVIDIA drivers.
-        const bool enableExternalComputeQueue = false;
+        enableExternalComputeQueue = cigEnabled;
+        if (enableExternalComputeQueue &&
+            (!checkDeviceExtensionSupport(VK_NV_EXTERNAL_COMPUTE_QUEUE_EXTENSION_NAME) ||
+             externalComputeQueueProperties.maxExternalQueues == 0 || externalComputeQueueProperties.externalDataSize == 0))
+        {
+            throw std::runtime_error("Vulkan CIG was requested but VK_NV_external_compute_queue is unavailable");
+        }
 #endif
 
-        // Build feature chain based on what's supported
-        VkPhysicalDeviceFeatures2 deviceFeatures2{};
-        deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-
-        // Timeline semaphores - needed for CUDA interop synchronization
-        VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures{};
-        timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-        timelineFeatures.timelineSemaphore = VK_TRUE;
-        deviceFeatures2.pNext = &timelineFeatures;
+        VkPhysicalDeviceVulkan12Features vulkan12Features{};
+        vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        vulkan12Features.bufferDeviceAddress = enableExternalComputeQueue ? VK_TRUE : VK_FALSE;
+        vulkan12Features.timelineSemaphore = VK_TRUE;
 
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
         VkExternalComputeQueueDeviceCreateInfoNV externalComputeQueueInfo{};
@@ -953,7 +967,7 @@ private:
         if (enableExternalComputeQueue)
         {
             externalComputeQueueInfo.reservedExternalQueues = 1;
-            timelineFeatures.pNext = &externalComputeQueueInfo;
+            externalComputeQueueInfo.pNext = &vulkan12Features;
         }
 #endif
 
@@ -963,7 +977,12 @@ private:
         deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
         deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
         deviceCreateInfo.ppEnabledExtensionNames = deviceExtensions.data();
-        deviceCreateInfo.pNext = &deviceFeatures2;
+#if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
+        deviceCreateInfo.pNext = enableExternalComputeQueue ? static_cast<void*>(&externalComputeQueueInfo)
+                                                            : static_cast<void*>(&vulkan12Features);
+#else
+        deviceCreateInfo.pNext = &vulkan12Features;
+#endif
 
         VkDevice logicalDevice = VK_NULL_HANDLE;
         VK_CHECK(vkCreateDevice(physicalDevice, &deviceCreateInfo, nullptr, &logicalDevice));

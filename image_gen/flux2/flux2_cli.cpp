@@ -45,6 +45,8 @@ std::string to_string(Flux2ProcessingBackend backend)
         return "dx-cig";
     case Flux2ProcessingBackend::Vk:
         return "vk";
+    case Flux2ProcessingBackend::VkCig:
+        return "vk-cig";
     }
     return "unknown";
 }
@@ -87,7 +89,11 @@ Flux2ProcessingBackend parse_processing_backend(std::string value)
     {
         return Flux2ProcessingBackend::Vk;
     }
-    throw std::invalid_argument("Processing must be one of: cpu, cuda, dx, dx-cig, vk");
+    if (value == "vk-cig")
+    {
+        return Flux2ProcessingBackend::VkCig;
+    }
+    throw std::invalid_argument("Processing must be one of: cpu, cuda, dx, dx-cig, vk, vk-cig");
 }
 
 Flux2ExecutionProvider parse_execution_provider(std::string value)
@@ -139,7 +145,7 @@ Flux2Config parse_args(int argc, char* argv[])
     parser.add_argument("--processing")
         .default_value(to_string(config.processing))
         .nargs(1)
-        .metavar("cpu|cuda|dx|dx-cig|vk")
+        .metavar("cpu|cuda|dx|dx-cig|vk|vk-cig")
         .help("Select the processing backend.");
     parser.add_argument("--provider")
         .default_value(to_string(config.provider))

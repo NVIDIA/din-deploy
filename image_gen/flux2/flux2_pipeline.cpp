@@ -46,7 +46,7 @@ std::unique_ptr<Flux2ProcessingPipeline> CreateFlux2Pipeline(const Flux2Config& 
 #endif
     }
 
-    if (config.processing == Flux2ProcessingBackend::Vk)
+    if (config.processing == Flux2ProcessingBackend::Vk || config.processing == Flux2ProcessingBackend::VkCig)
     {
 #if defined(DIN_FLUX2_BUILD_VK)
         return CreateFlux2VkPipeline(config, runtime);

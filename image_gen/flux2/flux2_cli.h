@@ -15,6 +15,7 @@ enum class Flux2ProcessingBackend
     Dx,
     DxCig,
     Vk,
+    VkCig,
 };
 
 enum class Flux2ExecutionProvider
