@@ -478,7 +478,8 @@ Ort::ConstEpDevice find_cpu_device(Ort::Env& env)
 void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const Flux2Config& config,
                    ExecutionProviderMode provider_mode, SamplingBackend sampling_backend)
 {
-    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
+    const Flux2ModelCachePaths cache_paths = MakeFlux2ModelCachePaths(config.precision);
     const bool trt_rtx_device = is_trt_rtx_device(ep_device);
     const bool cpu_device = is_cpu_device(ep_device);
     const bool has_separate_binding = !cpu_device;
@@ -536,15 +537,19 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
 
     state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.text_encoder_model.string(), provider, cache_dir, ep_context,
-        make_profile("text_encoder"), compute_stream_ptr);
+        make_profile(cache_paths.text_encoder), compute_stream_ptr);
     std::cout << "  Text encoder loaded" << std::endl;
     state.transformer_runner =
         std::make_unique<din::common::OrtRunner>(state.env, model_paths.transformer_model.string(), provider, cache_dir,
-                                                 ep_context, make_profile("transformer"), compute_stream_ptr);
+                                                 ep_context,
+                                                 make_profile(cache_paths.transformer),
+                                                 compute_stream_ptr);
     std::cout << "  Transformer loaded" << std::endl;
     state.vae_decoder_runner =
         std::make_unique<din::common::OrtRunner>(state.env, model_paths.vae_decoder_model.string(), provider, cache_dir,
-                                                 ep_context, make_profile("vae_decoder"), compute_stream_ptr);
+                                                 ep_context,
+                                                 make_profile(cache_paths.vae_decoder),
+                                                 compute_stream_ptr);
     std::cout << "  VAE decoder loaded" << std::endl;
 
     std::vector<int64_t> token_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
@@ -753,7 +758,7 @@ public:
         }
         state_->prompt_embeds_valid = false;
 
-        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir);
+        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir, config_.precision);
         const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config_.prompt);
         FillTextEncoderInputs(text_inputs.token_ids, text_inputs.pad_token_id, state_->token->HostData(),
                               state_->attention_mask->HostData(), BATCH_SIZE, SEQUENCE_LENGTH);

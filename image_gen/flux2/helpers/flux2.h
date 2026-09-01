@@ -36,7 +36,14 @@ struct Flux2ModelPaths
     std::filesystem::path tokenizer_dir;
 };
 
-inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir)
+struct Flux2ModelCachePaths
+{
+    std::string text_encoder;
+    std::string transformer;
+    std::string vae_decoder;
+};
+
+inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir, const std::string& precision)
 {
     if (model_dir.empty())
     {
@@ -45,9 +52,19 @@ inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir)
     return {
         model_dir,
         model_dir / "text_encoder/model.onnx",
-        model_dir / "transformer/model.onnx",
+        model_dir / ("transformer_" + precision) / "model.onnx",
         model_dir / "vae_decoder/model.onnx",
         model_dir / "tokenizer",
+    };
+}
+
+inline Flux2ModelCachePaths MakeFlux2ModelCachePaths(const std::string& precision, const std::string& prefix = {})
+{
+    const std::string prefix_separator = prefix.empty() ? "" : prefix + "_";
+    return {
+        prefix_separator + "text_encoder",
+        prefix_separator + "transformer_" + precision,
+        prefix_separator + "vae_decoder",
     };
 }
 

@@ -107,6 +107,19 @@ Flux2ExecutionProvider parse_execution_provider(std::string value)
     throw std::invalid_argument("Provider must be one of: cpu, trt-rtx");
 }
 
+std::string parse_precision(std::string value)
+{
+    for (char& c : value)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (value == "bf16" || value == "fp8" || value == "nvfp4")
+    {
+        return value;
+    }
+    throw std::invalid_argument("Precision must be one of: bf16, fp8, nvfp4");
+}
+
 void validate_config(const Flux2Config& config)
 {
     if (config.provider == Flux2ExecutionProvider::Cpu && config.processing != Flux2ProcessingBackend::Cpu)
@@ -137,7 +150,12 @@ Flux2Config parse_args(int argc, char* argv[])
         .default_value(config.model_dir.string())
         .nargs(1)
         .metavar("PATH")
-        .help("Directory with exported Flux2 ONNX artifacts.");
+        .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
+    parser.add_argument("--precision")
+        .default_value(config.precision)
+        .nargs(1)
+        .metavar("bf16|fp8|nvfp4")
+        .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
         .default_value(config.ep_cache_dir.string())
         .nargs(1)
@@ -178,6 +196,7 @@ Flux2Config parse_args(int argc, char* argv[])
     config.processing = parse_processing_backend(parser.get<std::string>("--processing"));
     config.provider = parse_execution_provider(parser.get<std::string>("--provider"));
     config.model_dir = parser.get<std::string>("--model-dir");
+    config.precision = parse_precision(parser.get<std::string>("--precision"));
     config.ep_cache_dir = parser.get<std::string>("--ep-cache");
     config.ep_context_dir = parser.get<std::string>("--ep-context-dir");
     config.prompt = parser.get<std::string>("--prompt");
@@ -224,6 +243,7 @@ int main(int argc, char* argv[])
     {
         const Flux2Config config = parse_args(argc, argv);
         std::cout << "Model dir: " << config.model_dir.string() << "\n"
+                  << "Precision: " << config.precision << "\n"
                   << "Output: " << config.output_path.string() << "\n"
                   << "Prompt: " << config.prompt << "\n"
                   << "Seed:   " << config.seed << "\n"

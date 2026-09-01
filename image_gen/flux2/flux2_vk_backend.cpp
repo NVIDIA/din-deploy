@@ -619,7 +619,8 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
-    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
+    const Flux2ModelCachePaths cache_paths = MakeFlux2ModelCachePaths(config.precision, "vk");
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n" << std::endl;
 
@@ -660,17 +661,17 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
 
     state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile("vk_text_encoder"), &*state.sync_stream);
+        make_profile(cache_paths.text_encoder), &*state.sync_stream);
     std::cout << "  Text encoder loaded" << std::endl;
 
     state.transformer_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile("vk_transformer"), &*state.sync_stream);
+        make_profile(cache_paths.transformer), &*state.sync_stream);
     std::cout << "  Transformer loaded" << std::endl;
 
     state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile("vk_vae_decoder"), &*state.sync_stream);
+        make_profile(cache_paths.vae_decoder), &*state.sync_stream);
     std::cout << "  VAE decoder loaded" << std::endl;
 
     nvtx3::end_range(nvtx_scope_load);
@@ -978,7 +979,7 @@ public:
         }
         state_->prompt_embeds_valid = false;
 
-        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir);
+        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir, config_.precision);
         const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config_.prompt);
         std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
         std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
