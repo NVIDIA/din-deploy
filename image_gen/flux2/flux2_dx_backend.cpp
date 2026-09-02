@@ -355,8 +355,9 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
 
 struct DxPipelineState
 {
-    explicit DxPipelineState(Ort::Env& environment)
-        : env(environment)
+    DxPipelineState(Ort::Env& environment, uint64_t ort_luid)
+        : dx(ort_luid)
+        , env(environment)
     {
     }
 
@@ -702,7 +703,8 @@ public:
             return;
         }
         std::cout << "Initializing Flux2 DirectX pipeline" << std::endl;
-        state_ = std::make_unique<DxPipelineState>(runtime_.env);
+        const auto identity = din::common::ResolveOrtGraphicsDeviceIdentity(runtime_.trt_device);
+        state_ = std::make_unique<DxPipelineState>(runtime_.env, identity.luid);
         initialize_dx_state(*state_, config_, runtime_.trt_device);
     }
 

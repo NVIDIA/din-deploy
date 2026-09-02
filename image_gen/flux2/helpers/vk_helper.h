@@ -291,7 +291,9 @@ struct VkHelper
     /**
      * Constructs VkHelper with optional debug message severity configuration.
      *
-     * @param deviceIndex Vulkan physical device index to use (default: 0)
+     * @param vendorId ORT hardware vendor ID
+     * @param deviceId ORT hardware device ID
+     * @param luid ORT Windows adapter LUID
      * @param debugMessageSeverity Debug message severity flags
      *        Default: VERBOSE | INFO | WARNING | ERROR when validation is enabled
      *        Examples:
@@ -299,7 +301,7 @@ struct VkHelper
      *          - Errors only: ERROR
      *          - Disable: 0
      */
-    VkHelper(uint32_t deviceIndex = 0, bool enableCig = false,
+    VkHelper(uint32_t vendorId, uint32_t deviceId, uint64_t luid, bool enableCig = false,
 #if DIN_ENABLE_VULKAN_VALIDATION
              VkDebugUtilsMessageSeverityFlagsEXT debugMessageSeverity =
                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -314,7 +316,7 @@ struct VkHelper
         debugSeverity = debugMessageSeverity;
 #endif
         createInstance();
-        selectPhysicalDevice(deviceIndex);
+        selectPhysicalDevice(vendorId, deviceId, luid);
         initCudaDevice();
         createLogicalDevice();
         loadExtensionFunctions();
@@ -634,6 +636,7 @@ private:
         {
             requestedVersion = VK_API_VERSION_1_2;  // Preferred: timeline semaphores in core
         }
+        requestedVersion = VK_API_VERSION_1_4;
 
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -763,7 +766,7 @@ private:
         }
     }
 
-    void selectPhysicalDevice(uint32_t deviceIndex)
+    void selectPhysicalDevice(uint32_t vendorId, uint32_t deviceId, uint64_t luid)
     {
         uint32_t deviceCount = 0;
         VK_CHECK(vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr));
@@ -775,81 +778,49 @@ private:
         std::vector<VkPhysicalDevice> devices(deviceCount);
         VK_CHECK(vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data()));
 
-        // List all devices and find best one for CUDA interop
         fprintf(stdout, "Available Vulkan devices:\n");
-        int bestDevice = -1;
-        int bestScore = -1;
+        uint32_t matchCount = 0;
 
         for (uint32_t i = 0; i < deviceCount; ++i)
         {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(devices[i], &props);
+            VkPhysicalDeviceIDProperties idProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            props2.pNext = &idProps;
+            vkGetPhysicalDeviceProperties2(devices[i], &props2);
 
-            // Score devices: discrete GPU > integrated > virtual > CPU
-            int score = 0;
-            switch (props.deviceType)
+            uint64_t deviceLuid = 0;
+#ifdef _WIN32
+            if (idProps.deviceLUIDValid)
             {
-            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-                score = 100;
-                break;
-            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
-                score = 50;
-                break;
-            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
-                score = 25;
-                break;
-            case VK_PHYSICAL_DEVICE_TYPE_CPU:
-                score = 0;
-                break;  // Software renderer - no CUDA interop
-            default:
-                score = 10;
-                break;
+                memcpy(&deviceLuid, idProps.deviceLUID, sizeof(deviceLuid));
             }
-
-            const char* marker = "";
-            if (i == deviceIndex)
-                marker = " [requested]";
-            if (score > bestScore)
+#endif
+            const bool matches = props2.properties.vendorID == vendorId && props2.properties.deviceID == deviceId
+#ifdef _WIN32
+                                 && idProps.deviceLUIDValid && deviceLuid == luid
+#endif
+                ;
+            fprintf(stdout, "  [%u] %s (%s), vendor=0x%04X device=0x%04X",
+                    i, props2.properties.deviceName, deviceTypeToString(props2.properties.deviceType),
+                    props2.properties.vendorID, props2.properties.deviceID);
+#ifdef _WIN32
+            if (idProps.deviceLUIDValid)
             {
-                bestScore = score;
-                bestDevice = i;
+                fprintf(stdout, " LUID=0x%016llX", static_cast<unsigned long long>(deviceLuid));
             }
-
-            fprintf(stdout, "  [%d] %s (%s)%s\n", i, props.deviceName, deviceTypeToString(props.deviceType), marker);
-        }
-
-        // Use requested device if it's a real GPU, otherwise use best
-        if (deviceIndex < deviceCount)
-        {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(devices[deviceIndex], &props);
-            if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU)
+#endif
+            fprintf(stdout, "%s\n", matches ? " [ORT match]" : "");
+            if (matches)
             {
-                physicalDevice = devices[deviceIndex];
-            }
-            else
-            {
-                fprintf(stderr, "Warning: Requested device %d is a software renderer, looking for GPU...\n",
-                        deviceIndex);
-                if (bestScore > 0)
-                {
-                    physicalDevice = devices[bestDevice];
-                    fprintf(stdout, "Selected device %d instead\n", bestDevice);
-                }
-                else
-                {
-                    throw std::runtime_error(
-                        "No hardware GPU found! Only software renderer (llvmpipe/lavapipe) available.\n"
-                        "For CUDA-Vulkan interop, you need:\n"
-                        "  1. An NVIDIA GPU with Vulkan support\n"
-                        "  2. The NVIDIA Vulkan ICD properly installed\n"
-                        "  In Docker: make sure --gpus all is set and nvidia-container-toolkit is configured");
-                }
+                physicalDevice = devices[i];
+                ++matchCount;
             }
         }
-        else
+
+        if (matchCount != 1)
         {
-            physicalDevice = devices[bestDevice >= 0 ? bestDevice : 0];
+            throw std::runtime_error("Expected exactly one Vulkan physical device matching the ORT device identity; "
+                                     "found " + std::to_string(matchCount));
         }
 
         // Get basic properties
@@ -877,6 +848,10 @@ private:
         fprintf(stdout, "Selected Vulkan device: %s (Vulkan %d.%d.%d)\n", deviceProperties.deviceName,
                 VK_VERSION_MAJOR(deviceProperties.apiVersion), VK_VERSION_MINOR(deviceProperties.apiVersion),
                 VK_VERSION_PATCH(deviceProperties.apiVersion));
+#ifdef _WIN32
+        fprintf(stdout, "ORT LUID: 0x%016llX; selected Vulkan LUID: 0x%016llX\n",
+                static_cast<unsigned long long>(luid), static_cast<unsigned long long>(luid));
+#endif
 
         // Find compute queue family
         uint32_t queueFamilyCount = 0;
@@ -884,13 +859,22 @@ private:
         std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies.data());
 
+        queueFamilyIndex = UINT32_MAX;
         for (uint32_t i = 0; i < queueFamilyCount; ++i)
         {
-            if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+            const VkQueueFlags requiredFlags =
+                VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT | (cigEnabled ? VK_QUEUE_GRAPHICS_BIT : 0);
+            if ((queueFamilies[i].queueFlags & requiredFlags) == requiredFlags)
             {
                 queueFamilyIndex = i;
                 break;
             }
+        }
+        if (queueFamilyIndex == UINT32_MAX)
+        {
+            throw std::runtime_error(cigEnabled
+                                         ? "No Vulkan queue family satisfies graphics/compute/transfer CIG requirements"
+                                         : "No Vulkan queue family satisfies compute/transfer requirements");
         }
     }
 

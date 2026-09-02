@@ -96,12 +96,11 @@ private:
     bool active_ = false;
 };
 
-class OrtVulkanTensorImporter
+class OrtVulkanExternalResourceImporter
 {
 public:
-    OrtVulkanTensorImporter(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device, const VkHelper::Device& device)
+    OrtVulkanExternalResourceImporter(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device)
         : interop_(interop)
-        , device_(device)
     {
         Ort::ThrowOnError(interop_.CreateExternalResourceImporterForDevice(ep_device, &importer_));
         if (importer_ == nullptr)
@@ -110,11 +109,51 @@ public:
         }
 
         bool can_import_memory = false;
-        Ort::ThrowOnError(interop_.CanImportMemory(importer_, kOrtExternalMemoryHandleType, &can_import_memory));
-        if (!can_import_memory)
+        Ort::ThrowOnError(interop_.CanImportMemory(importer_, kMemoryType, &can_import_memory));
+        bool can_import_semaphore = false;
+        Ort::ThrowOnError(interop_.CanImportSemaphore(importer_, kSemaphoreType, &can_import_semaphore));
+        if (!can_import_memory || !can_import_semaphore)
         {
-            throw std::runtime_error("ORT external resource importer cannot import Vulkan memory");
+            throw std::runtime_error("ORT Vulkan importer does not support the required memory and semaphore types");
         }
+    }
+
+    ~OrtVulkanExternalResourceImporter()
+    {
+        if (importer_ != nullptr)
+        {
+            interop_.ReleaseExternalResourceImporter(importer_);
+        }
+    }
+
+    OrtVulkanExternalResourceImporter(const OrtVulkanExternalResourceImporter&) = delete;
+    OrtVulkanExternalResourceImporter& operator=(const OrtVulkanExternalResourceImporter&) = delete;
+
+    [[nodiscard]] OrtExternalResourceImporter* get() const { return importer_; }
+
+private:
+#ifdef _WIN32
+    static constexpr OrtExternalMemoryHandleType kMemoryType = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_WIN32;
+    static constexpr OrtExternalSemaphoreType kSemaphoreType =
+        ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_WIN32;
+#else
+    static constexpr OrtExternalMemoryHandleType kMemoryType = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_OPAQUE_FD;
+    static constexpr OrtExternalSemaphoreType kSemaphoreType =
+        ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_OPAQUE_FD;
+#endif
+    const OrtInteropApi& interop_;
+    OrtExternalResourceImporter* importer_ = nullptr;
+};
+
+class OrtVulkanTensorImporter
+{
+public:
+    OrtVulkanTensorImporter(const OrtInteropApi& interop, OrtVulkanExternalResourceImporter& importer,
+                            const VkHelper::Device& device)
+        : interop_(interop)
+        , device_(device)
+        , importer_(importer.get())
+    {
     }
 
     OrtVulkanTensorImporter(const OrtVulkanTensorImporter&) = delete;
@@ -129,10 +168,6 @@ public:
                 interop_.ReleaseExternalMemoryHandle(memory.memory);
             }
             close_native_handle(memory.native_handle);
-        }
-        if (importer_ != nullptr)
-        {
-            interop_.ReleaseExternalResourceImporter(importer_);
         }
     }
 
@@ -248,24 +283,13 @@ private:
 class OrtVulkanTimelineSemaphore
 {
 public:
-    OrtVulkanTimelineSemaphore(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device, VkHelper::Device& device)
+    OrtVulkanTimelineSemaphore(const OrtInteropApi& interop, OrtVulkanExternalResourceImporter& importer,
+                               VkHelper::Device& device)
         : interop_(interop)
         , device_(device)
         , semaphore_(device_.createTimelineSemaphore(0, true))
+        , importer_(importer.get())
     {
-        Ort::ThrowOnError(interop_.CreateExternalResourceImporterForDevice(ep_device, &importer_));
-        if (importer_ == nullptr)
-        {
-            throw std::runtime_error("CreateExternalResourceImporterForDevice returned null Vulkan semaphore importer");
-        }
-
-        bool can_import_semaphore = false;
-        Ort::ThrowOnError(interop_.CanImportSemaphore(importer_, kOrtExternalSemaphoreType, &can_import_semaphore));
-        if (!can_import_semaphore)
-        {
-            throw std::runtime_error("ORT external resource importer cannot import Vulkan timeline semaphores");
-        }
-
         native_handle_ = device_.getSemaphoreHandle(semaphore_);
         if (!is_valid_native_handle(native_handle_))
         {
@@ -291,10 +315,6 @@ public:
         if (ort_semaphore_ != nullptr)
         {
             interop_.ReleaseExternalSemaphoreHandle(ort_semaphore_);
-        }
-        if (importer_ != nullptr)
-        {
-            interop_.ReleaseExternalResourceImporter(importer_);
         }
         close_native_handle(native_handle_);
     }
@@ -575,11 +595,6 @@ struct VkPipelineState
 
     ~VkPipelineState()
     {
-        if (vk && vk->device.valid())
-        {
-            vk->device.deviceWaitIdle();
-        }
-
         text_encoder_io.reset();
         transformer_io.reset();
         vae_decoder_io.reset();
@@ -599,9 +614,19 @@ struct VkPipelineState
         transformer_runner.reset();
         vae_decoder_runner.reset();
 
-        tensor_importer.reset();
-        sync_semaphore.reset();
+        if (vk && vk->device.valid())
+        {
+            const VkResult idle_result = vkDeviceWaitIdle(vk->device.raw());
+            if (idle_result != VK_SUCCESS)
+            {
+                std::cerr << "vkDeviceWaitIdle during teardown failed: " << vkResultToString(idle_result) << std::endl;
+            }
+        }
+
         sync_stream.reset();
+        sync_semaphore.reset();
+        tensor_importer.reset();
+        external_importer.reset();
         graphics_interop.reset();
         cig_external_compute_queue_data.clear();
 
@@ -623,6 +648,7 @@ struct VkPipelineState
     std::unique_ptr<din::common::OrtRunner> text_encoder_runner;
     std::unique_ptr<din::common::OrtRunner> transformer_runner;
     std::unique_ptr<din::common::OrtRunner> vae_decoder_runner;
+    std::unique_ptr<OrtVulkanExternalResourceImporter> external_importer;
     std::unique_ptr<OrtVulkanTensorImporter> tensor_importer;
     std::unique_ptr<OrtVulkanTimelineSemaphore> sync_semaphore;
 
@@ -687,7 +713,9 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     std::cout << "\n=== Initializing Vulkan ===" << std::endl;
     auto nvtx_scope_vk = nvtx3::start_range("init_vulkan");
 
-    state.vk = std::make_unique<VkHelper>(0, state.use_cig);
+    state.trt_device = trt_device;
+    const auto identity = din::common::ResolveOrtGraphicsDeviceIdentity(state.trt_device);
+    state.vk = std::make_unique<VkHelper>(identity.vendor_id, identity.device_id, identity.luid, state.use_cig);
     std::cout << "Vulkan device initialized" << std::endl;
 
     nvtx3::end_range(nvtx_scope_vk);
@@ -695,15 +723,15 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
     // ORT environment & session options
     // -----------------------------------------------------------------
-    state.trt_device = trt_device;
     state.interop_api = &Ort::GetInteropApi();
+    state.external_importer =
+        std::make_unique<OrtVulkanExternalResourceImporter>(*state.interop_api, state.trt_device);
     if (state.use_cig)
     {
         state.cig_external_compute_queue_data = state.vk->createCudaGraphicsInteropData();
         state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(
             *state.interop_api, state.trt_device, state.cig_external_compute_queue_data);
     }
-    state.sync_stream.emplace(din::common::CreateTensorRTRTXComputeStream(state.env));
 
     // -----------------------------------------------------------------
     // Load ONNX models
@@ -730,7 +758,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         graphics_ep_options.emplace_back("nv_max_shared_mem_size",
                                          std::to_string(shared_memory_info.max_shared_memory_bytes));
         graphics_ep_options.emplace_back("nv_length_aux_stream_array", "0");
-        graphics_ep_options.emplace_back("nv_use_sync_gpu_allocator", "1");
+        // graphics_ep_options.emplace_back("nv_use_sync_gpu_allocator", "1");
     }
 
     auto make_profile = [&](std::string cache_subpath)
@@ -743,23 +771,6 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         return profile;
     };
 
-    state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.text_encoder), &*state.sync_stream);
-    std::cout << "  Text encoder loaded" << std::endl;
-
-    state.transformer_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.transformer), &*state.sync_stream);
-    std::cout << "  Transformer loaded" << std::endl;
-
-    state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.vae_decoder), &*state.sync_stream);
-    std::cout << "  VAE decoder loaded" << std::endl;
-
-    nvtx3::end_range(nvtx_scope_load);
-
     // -----------------------------------------------------------------
     // Allocate tensors from Vulkan buffers imported through ORT's external
     // resource importer.
@@ -767,7 +778,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
 
     // Text encoder inputs (GPU — uploaded once via staging)
     state.tensor_importer =
-        std::make_unique<OrtVulkanTensorImporter>(*state.interop_api, state.trt_device, state.vk->device);
+        std::make_unique<OrtVulkanTensorImporter>(*state.interop_api, *state.external_importer, state.vk->device);
 
     std::vector<int64_t> token_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
     state.token_buf = state.vk->createExternalBuffer(shape_numel(token_shape) * sizeof(int64_t));
@@ -877,7 +888,28 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     //   ORT signals N+1 -> Vulkan waits N+1, signals N+2 -> ORT waits N+2
     // -----------------------------------------------------------------
     state.sync_semaphore =
-        std::make_unique<OrtVulkanTimelineSemaphore>(*state.interop_api, state.trt_device, state.vk->device);
+        std::make_unique<OrtVulkanTimelineSemaphore>(*state.interop_api, *state.external_importer, state.vk->device);
+
+    // The CIG stream is created only after all external resources have been imported.
+    state.sync_stream.emplace(din::common::CreateTensorRTRTXComputeStream(state.env));
+
+    // Sessions are intentionally last: their CIG context sees the fully initialized importer,
+    // external queue, shared buffers, and timeline semaphore.
+    state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
+        state.env, model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
+        make_profile(cache_paths.text_encoder), &*state.sync_stream);
+    std::cout << "  Text encoder loaded" << std::endl;
+
+    state.transformer_runner = std::make_unique<din::common::OrtRunner>(
+        state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
+        make_profile(cache_paths.transformer), &*state.sync_stream);
+    std::cout << "  Transformer loaded" << std::endl;
+
+    state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
+        state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
+        make_profile(cache_paths.vae_decoder), &*state.sync_stream);
+    std::cout << "  VAE decoder loaded" << std::endl;
+    nvtx3::end_range(nvtx_scope_load);
 
     // -----------------------------------------------------------------
     // Persistent command buffers (pool already created above)
