@@ -75,6 +75,14 @@ int RunCli(int argc, char** argv, const din::asr::whisper::CliSpec& spec)
                 .implicit_value(true)
                 .help("Force greedy argmax on the CPU (disable the CUDA sampling kernel).");
         }
+        if constexpr (requires(Config value) { value.long_form = bool{}; })
+        {
+            parser.add_argument("--long-form", "--long-form-chunking")
+                  .default_value(false)
+                  .implicit_value(true)
+                  .help("Transcribe complete audio with timestamp-driven 30-second window seeking and prior-text "
+                      "conditioning. By default only the first window is transcribed.");
+        }
 
         try
         {
@@ -115,6 +123,10 @@ int RunCli(int argc, char** argv, const din::asr::whisper::CliSpec& spec)
         {
             config.disable_cuda_sampling = parser.get<bool>("--cpu-sampling");
         }
+        if constexpr (requires(Config value) { value.long_form = bool{}; })
+        {
+            config.long_form = parser.get<bool>("--long-form");
+        }
 
         const auto provider = config.provider;
         const auto load_start = std::chrono::steady_clock::now();
@@ -130,6 +142,10 @@ int RunCli(int argc, char** argv, const din::asr::whisper::CliSpec& spec)
         std::cout << "transcribe: " << result.transcribe_seconds << "s\n";
         std::cout << "encode: " << result.encode_seconds << "s\n";
         std::cout << "greedy: " << result.greedy_seconds << "s\n";
+        if (result.model_window_seconds > 0.0)
+        {
+            std::cout << "model window audio: " << result.model_window_seconds << "s\n";
+        }
         std::cout << "speed: " << (result.audio_seconds / result.transcribe_seconds) << "x\n";
         std::cout << "total: " << SecondsSince(total_start) << "s\n";
     }
@@ -147,8 +163,8 @@ int main(int argc, char** argv)
         .fallback_name = "din_asr_whisper",
         .artifact_label = "Whisper",
         .default_provider = "trt-rtx",
-        .timestamps_modes = "none",
-        .allowed_timestamps = {"none"},
+        .timestamps_modes = "none|segment",
+        .allowed_timestamps = {"none", "segment"},
     };
     return RunCli<din::asr::whisper::WhisperPipeline, din::asr::whisper::WhisperConfig>(argc, argv, spec);
 }

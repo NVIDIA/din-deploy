@@ -5,12 +5,14 @@
 """
 Export OpenAI Whisper to ONNX with raw torch.onnx (dynamo).
 
-This produces exactly the two-graph contract that asr/whisper's C++
-``WhisperPipeline`` consumes (see asr/whisper/whisper.cpp):
+This produces the graph contract used by asr/whisper's C++
+``WhisperPipeline`` (see asr/whisper/whisper.cpp), plus a prompt-prefill graph
+for long-form decoding:
 
   <output>/
     encoder.onnx (+ encoder.onnx.data)
     decoder.onnx (+ decoder.onnx.data)
+    decoder_prefill.onnx (+ decoder_prefill.onnx.data)
     vocab.json   (+ the rest of the tokenizer files)
     mel.onnx (log-mel preprocessor)
 
@@ -223,7 +225,13 @@ class EncoderExport(nn.Module):
 
 
 class DecoderExport(nn.Module):
-    """Single-token decode step over a fixed-capacity self-KV cache."""
+    """Variable-length decode over a fixed-capacity self-KV cache.
+
+    The same graph supports a multi-token prompt prefill and a one-token
+    autoregressive decode step. ``write_indices`` contains one absolute cache
+    position per input token, so callers can load this ONNX model in two TRT-RTX
+    sessions with separate optimization profiles and engine-cache subpaths.
+    """
 
     def __init__(self, model, max_length: int, use_sdpa: bool):
         super().__init__()
@@ -241,14 +249,16 @@ class DecoderExport(nn.Module):
         self.max_length = max_length
         self.use_sdpa = use_sdpa
 
-    def forward(self, input_ids, write_indices, nonpad_kv_seqlen, *cache):
+    def forward(self, input_ids, write_indices, nonpad_kv_seqlen, cache):
         dtype = self.proj_out.weight.dtype
-        # Token + learned positional embedding for absolute position = write_index.
-        pos = self.embed_positions.weight.index_select(0, write_indices)  # [1, E]
-        hidden = self.embed_tokens(input_ids.long()) + pos.view(1, 1, self.embed_dim)
+        # Token + learned positional embedding for each absolute cache position.
+        pos = self.embed_positions.weight.index_select(0, write_indices)  # [S, E]
+        hidden = self.embed_tokens(input_ids.long()) + pos.unsqueeze(0)
         hidden = hidden.to(dtype)
 
-        # Key-padding bias: slots [0, nonpad_kv_seqlen) are valid, the rest masked.
+        # Causal + key-padding bias. The single-token graph only needed the
+        # non-padding condition; a multi-token prefill must additionally prevent
+        # each query from attending to later tokens scattered by the same call.
         # Use a large *finite* negative, not -inf: the decoder attends one query
         # against a 448-slot cache where only the first few slots are valid, so
         # most keys are masked. A tiled/flash-attention kernel (TensorRT-RTX) takes
@@ -256,8 +266,10 @@ class DecoderExport(nn.Module):
         # `score - max = -inf - (-inf) = NaN`, poisoning the output. exp(-1e4)
         # underflows to 0 in both fp16 and fp32, so this masks just as hard.
         slots = torch.arange(self.max_length, device=hidden.device)
-        valid = slots.unsqueeze(0) < nonpad_kv_seqlen  # [1, max_length]
-        self_bias = torch.where(valid, 0.0, -1e4).view(1, 1, 1, self.max_length)
+        populated = slots.unsqueeze(0) < nonpad_kv_seqlen  # [1, max_length]
+        causal = slots.unsqueeze(0) <= write_indices.unsqueeze(1)  # [S, max_length]
+        valid = populated & causal
+        self_bias = torch.where(valid, 0.0, -1e4).unsqueeze(0).unsqueeze(0)
 
         present = []
         for i, layer in enumerate(self.layers):
@@ -390,7 +402,8 @@ def _sanitize_fp16_initializers(onnx_path):
     return fixed
 
 
-def _onnx_export(model, args_tuple, output_path, input_names, output_names, opset, mask_cast_dtype=None):
+def _onnx_export(model, args_tuple, output_path, input_names, output_names, opset, mask_cast_dtype=None,
+                 dynamic_shapes=None):
     """Export to ONNX (dynamo) and rewrite weights as a single external-data file."""
     import onnx
 
@@ -409,6 +422,7 @@ def _onnx_export(model, args_tuple, output_path, input_names, output_names, opse
         do_constant_folding=False,
         dynamo=True,
         opset_version=opset,
+        dynamic_shapes=dynamic_shapes,
     )
     # Consolidate weights into a single <name>.onnx.data file next to the model
     # (e.g. encoder.onnx -> encoder.onnx.data), matching the C++ runtime layout.
@@ -480,18 +494,15 @@ def export_encoder(model, out_dir, device, dtype, n_mels, mel_frames, opset):
                      mask_cast_dtype=_mask_cast_dtype(dtype))
 
 
-def export_decoder(model, out_dir, device, dtype, max_length, enc_frames, use_sdpa, opset):
-    cfg = model.config
+def _decoder_export_args(cfg, device, dtype, max_length, enc_frames, sequence_length):
     n_layers = cfg.decoder_layers
     n_heads = cfg.decoder_attention_heads
     head_dim = cfg.d_model // n_heads
-    wrapper = DecoderExport(model, max_length, use_sdpa).to(device).eval()
-
     self_shape = (1, n_heads, max_length, head_dim)
     cross_shape = (1, n_heads, enc_frames, head_dim)
-    input_ids = torch.zeros(1, 1, dtype=torch.int32, device=device)
-    write_indices = torch.zeros(1, dtype=torch.int64, device=device)
-    nonpad = torch.ones(1, dtype=torch.int64, device=device)
+    input_ids = torch.zeros(1, sequence_length, dtype=torch.int32, device=device)
+    write_indices = torch.arange(sequence_length, dtype=torch.int64, device=device)
+    nonpad = torch.tensor([sequence_length], dtype=torch.int64, device=device)
 
     cache_args, input_names = [], ["input_ids", "write_indices", "nonpad_kv_seqlen"]
     for i in range(n_layers):
@@ -507,18 +518,66 @@ def export_decoder(model, out_dir, device, dtype, max_length, enc_frames, use_sd
         ]
     output_names = (
         ["logits"]
-        + [n for i in range(n_layers) for n in (f"present_key_self_{i}", f"present_value_self_{i}")]
+        + [name for i in range(n_layers)
+           for name in (f"present_key_self_{i}", f"present_value_self_{i}")]
+    )
+    return ((input_ids, write_indices, nonpad, cache_args), input_names, output_names,
+            self_shape, cross_shape)
+
+
+def _export_decoder_graph(model, out_dir, device, dtype, max_length, enc_frames, use_sdpa, opset,
+                          filename, trace_length, dynamic_max_length=None):
+    cfg = model.config
+    n_layers = cfg.decoder_layers
+    wrapper = DecoderExport(model, max_length, use_sdpa).to(device).eval()
+    export_args, input_names, output_names, self_shape, cross_shape = _decoder_export_args(
+        cfg, device, dtype, max_length, enc_frames, trace_length
     )
 
     attention_name = "sdpa" if use_sdpa else "math"
-    print(f"[decoder] {n_layers} layers, self cache {self_shape}, cross cache {cross_shape}, "
-          f"attention={attention_name}")
+    sequence_description = "1" if dynamic_max_length is None else f"1..{dynamic_max_length}"
+    print(f"[{filename.removesuffix('.onnx')}] {n_layers} layers, self cache {self_shape}, "
+          f"cross cache {cross_shape}, sequence={sequence_description}, attention={attention_name}")
+    dynamic_shapes = None
+    if dynamic_max_length is not None:
+        sequence_length = torch.export.Dim("sequence_length", min=1, max=dynamic_max_length)
+        shapes = torch.export.ShapesCollection()
+        shapes[export_args[0]] = {1: sequence_length}
+        shapes[export_args[1]] = {0: sequence_length}
+        dynamic_shapes = shapes.dynamic_shapes(wrapper, export_args)
     with torch.inference_mode():
         _onnx_export(
-            wrapper, (input_ids, write_indices, nonpad, *cache_args),
-            out_dir / "decoder.onnx", input_names, output_names, opset,
+            wrapper, export_args,
+            out_dir / filename, input_names, output_names, opset,
             mask_cast_dtype=_mask_cast_dtype(dtype),
+            dynamic_shapes=dynamic_shapes,
         )
+
+
+def export_decoder(model, out_dir, device, dtype, max_length, enc_frames, use_sdpa, opset, prefill_max_length,
+                   prefill_use_sdpa):
+    if not 2 <= prefill_max_length <= max_length:
+        raise ValueError(f"prefill max length must be in [2, {max_length}], got {prefill_max_length}")
+
+    # Keep autoregressive decode static so TRT-RTX can use its optimized fused
+    # Attention path and CUDA-graph-friendly fixed bindings.
+    _export_decoder_graph(model, out_dir, device, dtype, max_length, enc_frames, use_sdpa, opset,
+                          "decoder.onnx", trace_length=1)
+
+    # TRT-RTX 1.7 rejects the fused ONNX Attention op with an S=1..224 profile;
+    # decomposed attention compiles for both endpoints. Keep this a separate
+    # graph/engine so decode does not pay that compatibility/performance cost.
+    _export_decoder_graph(model, out_dir, device, dtype, max_length, enc_frames, prefill_use_sdpa, opset,
+                          "decoder_prefill.onnx", trace_length=min(4, prefill_max_length),
+                          dynamic_max_length=prefill_max_length)
+
+    dynamic_min = "input_ids:1x1,write_indices:1"
+    dynamic_prefill = f"input_ids:1x{prefill_max_length},write_indices:{prefill_max_length}"
+    print("  TRT-RTX decode profile:")
+    print(f"    min/opt/max = {dynamic_min}")
+    print("  TRT-RTX prefill profile:")
+    print(f"    min = {dynamic_min}")
+    print(f"    opt/max = {dynamic_prefill}")
 
 
 def _save_tokenizer(model_id, out_dir):
@@ -556,12 +615,33 @@ def _verify(out_dir, which):
 
     path = out_dir / f"{which}.onnx"
     m = onnx.load(str(path), load_external_data=False)
-    ins = [(i.name, [d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input]
-    outs = [o.name for o in m.graph.output]
+
+    def shape(value):
+        return [dimension.dim_param or dimension.dim_value for dimension in value.type.tensor_type.shape.dim]
+
+    ins = [(value.name, shape(value)) for value in m.graph.input]
+    outs = [(value.name, shape(value)) for value in m.graph.output]
     fused = [n.op_type for n in m.graph.node if n.op_type == "Attention"]
     print(f"  [{which}] {len(ins)} inputs, {len(outs)} outputs, "
           f"opsets={[(o.domain, o.version) for o in m.opset_import]}, "
           f"fused Attention nodes={len(fused)}")
+    if which in ("decoder", "decoder_prefill"):
+        input_shapes = dict(ins)
+        output_shapes = dict(outs)
+        sequence_dimension = input_shapes["input_ids"][1]
+        if which == "decoder":
+            if sequence_dimension != 1 or input_shapes["write_indices"][0] != 1 or output_shapes["logits"][1] != 1:
+                raise RuntimeError("autoregressive decoder does not have static sequence length 1")
+        else:
+            if not isinstance(sequence_dimension, str):
+                raise RuntimeError(f"prefill input_ids sequence is not dynamic: {input_shapes['input_ids']}")
+            if input_shapes["write_indices"][0] != sequence_dimension:
+                raise RuntimeError("prefill write_indices does not share the input_ids sequence dimension")
+            if output_shapes["logits"][1] != sequence_dimension:
+                raise RuntimeError("prefill logits does not share the input_ids sequence dimension")
+            print(f"  [decoder_prefill] dynamic sequence dimension '{sequence_dimension}': "
+                  f"input_ids={input_shapes['input_ids']}, write_indices={input_shapes['write_indices']}, "
+                  f"logits={output_shapes['logits']}")
     return ins, outs
 
 
@@ -580,6 +660,10 @@ def main():
                         help="'sdpa' (default) lets the exporter emit the fused ONNX Attention op."
                              "'math' keeps attention decomposed for TensorRT-RTX; ")
     parser.add_argument("--max-length", type=int, default=448, help="Self-KV cache capacity.")
+    parser.add_argument("--prefill-max-length", type=int, default=224,
+                        help="Maximum dynamic decoder sequence length used for prompt prefill.")
+    parser.add_argument("--prefill-attention", choices=["math", "sdpa"], default="math",
+                        help="Prefill attention export (default math; TRT-RTX 1.7 rejects dynamic fused Attention).")
     parser.add_argument("--opset", type=int, default=DEFAULT_OPSET)
     parser.add_argument("--only", choices=["encoder", "decoder", "mel"], default=None,
                         help="Export only one graph (default: encoder + decoder + mel).")
@@ -603,7 +687,8 @@ def main():
         # TODO also accept opset, blocked by TRT support for attention dimensions
         export_encoder(model, out_dir, device, dtype, cfg.num_mel_bins, 3000, 22)
     if args.only in (None, "decoder"):
-        export_decoder(model, out_dir, device, dtype, args.max_length, 1500, use_sdpa, args.opset)
+        export_decoder(model, out_dir, device, dtype, args.max_length, 1500, use_sdpa, args.opset,
+                       args.prefill_max_length, args.prefill_attention == "sdpa")
     if args.only in (None, "mel"):
         export_mel(args.model, out_dir, dtype, args.opset)
     if args.only is None:
@@ -613,6 +698,7 @@ def main():
         _verify(out_dir, "encoder")
     if args.only in (None, "decoder"):
         _verify(out_dir, "decoder")
+        _verify(out_dir, "decoder_prefill")
     print(f"Done -> {out_dir}")
 
 

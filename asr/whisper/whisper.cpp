@@ -8,8 +8,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -222,6 +225,143 @@ int32_t ArgmaxLastPosition(const Ort::Value& logits, int64_t lower, int64_t uppe
     return best;
 }
 
+float LastPositionLogit(const Ort::Value& logits, int64_t id)
+{
+    const auto info = logits.GetTensorTypeAndShapeInfo();
+    const auto shape = info.GetShape();
+    const size_t offset = static_cast<size_t>((shape.at(1) - 1) * shape.at(2) + id);
+    if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+    {
+        return HalfToFloat(reinterpret_cast<const uint16_t*>(logits.GetTensorData<Ort::Float16_t>())[offset]);
+    }
+    return logits.GetTensorData<float>()[offset];
+}
+
+float LastPositionProbability(const Ort::Value& logits, int64_t token, int64_t vocab)
+{
+    float maximum = -INFINITY;
+    for (int64_t id = 0; id < vocab; ++id)
+    {
+        maximum = std::max(maximum, LastPositionLogit(logits, id));
+    }
+    double sum = 0.0;
+    for (int64_t id = 0; id < vocab; ++id)
+    {
+        sum += std::exp(static_cast<double>(LastPositionLogit(logits, id) - maximum));
+    }
+    return static_cast<float>(std::exp(static_cast<double>(LastPositionLogit(logits, token) - maximum)) / sum);
+}
+
+int32_t SelectTimestampToken(const Ort::Value& logits, const std::vector<int64_t>& generated,
+                             const SpecialTokens& special, float* selected_logprob = nullptr)
+{
+    const int64_t vocab = logits.GetTensorTypeAndShapeInfo().GetShape().at(2);
+    int64_t minimum_timestamp = special.timestamp_first;
+    bool allow_text = true;
+    bool allow_timestamps = true;
+
+    if (generated.empty())
+    {
+        allow_text = false;
+    }
+    else if (generated.back() >= special.timestamp_first)
+    {
+        const bool penultimate_was_timestamp = generated.size() < 2 ||
+            generated[generated.size() - 2] >= special.timestamp_first;
+        minimum_timestamp = generated.back() + (penultimate_was_timestamp ? 1 : 0);
+        allow_timestamps = !penultimate_was_timestamp;
+        allow_text = penultimate_was_timestamp;
+    }
+    else
+    {
+        for (auto it = generated.rbegin(); it != generated.rend(); ++it)
+        {
+            if (*it >= special.timestamp_first)
+            {
+                minimum_timestamp = *it;
+                break;
+            }
+        }
+    }
+
+    const int64_t maximum_timestamp = generated.empty() ? std::min(vocab, special.timestamp_first + 51) : vocab;
+    float best_text = -INFINITY;
+    int32_t best_text_id = static_cast<int32_t>(special.eot);
+    double text_exp_sum = 0.0;
+    const auto accumulate = [](float value, float& maximum, double& exp_sum)
+    {
+        if (value > maximum)
+        {
+            exp_sum = std::isfinite(maximum) ? exp_sum * std::exp(static_cast<double>(maximum - value)) + 1.0 : 1.0;
+            maximum = value;
+        }
+        else if (std::isfinite(value))
+        {
+            exp_sum += std::exp(static_cast<double>(value - maximum));
+        }
+    };
+    if (allow_text)
+    {
+        for (int64_t id = 0; id <= special.eot && id < vocab; ++id)
+        {
+            const float value = LastPositionLogit(logits, id);
+            if (value > best_text)
+            {
+                best_text_id = static_cast<int32_t>(id);
+            }
+            accumulate(value, best_text, text_exp_sum);
+        }
+    }
+    else if (!generated.empty())
+    {
+        best_text = LastPositionLogit(logits, special.eot);
+        text_exp_sum = 1.0;
+    }
+
+    float best_timestamp = -INFINITY;
+    int32_t best_timestamp_id = static_cast<int32_t>(special.timestamp_first);
+    double timestamp_exp_sum = 0.0;
+    if (allow_timestamps)
+    {
+        for (int64_t id = std::max(minimum_timestamp, special.timestamp_first); id < maximum_timestamp; ++id)
+        {
+            const float value = LastPositionLogit(logits, id);
+            if (value > best_timestamp)
+            {
+                best_timestamp_id = static_cast<int32_t>(id);
+            }
+            accumulate(value, best_timestamp, timestamp_exp_sum);
+        }
+    }
+    const float timestamp_logprob = timestamp_exp_sum > 0.0
+                                        ? best_timestamp + static_cast<float>(std::log(timestamp_exp_sum))
+                                        : -INFINITY;
+    const bool force_timestamp = timestamp_logprob > best_text || !allow_text;
+    const bool selected_timestamp = force_timestamp || best_timestamp > best_text;
+    if (selected_logprob != nullptr)
+    {
+        const float timestamp_lse = timestamp_exp_sum > 0.0
+                                        ? best_timestamp + static_cast<float>(std::log(timestamp_exp_sum))
+                                        : -INFINITY;
+        const float text_lse = text_exp_sum > 0.0 ? best_text + static_cast<float>(std::log(text_exp_sum)) : -INFINITY;
+        float denominator = timestamp_lse;
+        if (!force_timestamp)
+        {
+            if (!std::isfinite(timestamp_lse))
+            {
+                denominator = text_lse;
+            }
+            else if (std::isfinite(text_lse))
+            {
+                const float maximum = std::max(text_lse, timestamp_lse);
+                denominator = maximum + std::log(std::exp(text_lse - maximum) + std::exp(timestamp_lse - maximum));
+            }
+        }
+        const float selected_value = selected_timestamp ? best_timestamp : best_text;
+        *selected_logprob = selected_value - denominator;
+    }
+    return selected_timestamp ? best_timestamp_id : best_text_id;
+}
 }  // namespace
 
 WhisperPipeline::WhisperPipeline(WhisperConfig config)
@@ -246,11 +386,9 @@ WhisperPipeline::WhisperPipeline(WhisperConfig config)
     EpContextOptions ep_context;
     ep_context.output_dir = config_.ep_context_dir.string();
 
-    // All exported shapes are static, so no TRT optimization profile is needed;
-    // only the cache subpath and the (disabled) CUDA-graph flag matter. The
-    // self-KV cache is re-bound each token, which CUDA-graph capture can't replay.
-    // The cache subpath is model-specific so different sizes don't collide on a
-    // shared EP-context engine.
+    // One decoder_prefill.onnx session handles both multi-token prefill and S=1
+    // autoregressive decode. Keep separate TensorRT profiles so neither phase
+    // compromises the other's optimized shape.
     const std::string tag = config_.model_dir.filename().string();
     ModelProfile mel_profile;
     mel_profile.cache_subpath = tag + "_mel";
@@ -259,14 +397,21 @@ WhisperPipeline::WhisperPipeline(WhisperConfig config)
     encoder_profile.cache_subpath = tag + "_encoder";
     encoder_profile.enable_cuda_graph = false;
     encoder_profile.embed_ep_context = false;  // large-v3 fp32 engines exceed the 2 GB embed limit
+    const std::string decode_shapes = "input_ids:1x1,write_indices:1";
+    const std::string prefill_shapes = "input_ids:1x" + std::to_string(kMaxPrefillTokens) +
+        ",write_indices:" + std::to_string(kMaxPrefillTokens);
     ModelProfile decoder_profile;
-    decoder_profile.cache_subpath = tag + "_decoder";
+    decoder_profile.min_shapes = decode_shapes + "," + decode_shapes;
+    decoder_profile.opt_shapes = decode_shapes + "," + prefill_shapes;
+    decoder_profile.max_shapes = decode_shapes + "," + prefill_shapes;
+    decoder_profile.cache_subpath = tag + "_decoder_prefill_profiles_1_" + std::to_string(kMaxPrefillTokens);
     decoder_profile.enable_cuda_graph = false;
     decoder_profile.embed_ep_context = false;
+    decoder_profile.extra_ep_options.emplace_back("nv_multi_profile_enable", "1");
 
     mel_ = MakeRunner(model_dir / "mel.onnx", ep_context, mel_profile);
     encoder_ = MakeRunner(model_dir / "encoder.onnx", ep_context, encoder_profile);
-    decoder_ = MakeRunner(model_dir / "decoder.onnx", ep_context, decoder_profile);
+    decoder_ = MakeRunner(model_dir / "decoder_prefill.onnx", ep_context, decoder_profile);
     use_device_io_ = mel_->HasDeviceIo() && encoder_->HasDeviceIo() && decoder_->HasDeviceIo();
 
     DetectModel();
@@ -286,6 +431,9 @@ WhisperPipeline::WhisperPipeline(WhisperConfig config)
         special_.transcribe = get("<|transcribe|>", special_.transcribe);
         special_.notimestamps = get("<|notimestamps|>", special_.notimestamps);
         special_.eot = get("<|endoftext|>", special_.eot);
+        special_.start_of_prev = get("<|startofprev|>", special_.start_of_prev);
+        special_.no_speech = get("<|nospeech|>", special_.no_speech);
+        special_.timestamp_first = get("<|0.00|>", special_.timestamp_first);
         special_.lang_first = special_.sot + 1;
         special_.lang_last = special_.transcribe - 2;  // ..langs.., <|translate|>, <|transcribe|>
     }
@@ -420,7 +568,9 @@ void WhisperPipeline::SetupDecodePath()
 #ifdef DIN_WHISPER_CUDA
     device_is_cuda_ = IsNvidiaGpu(decoder_->ep_device);
 #endif
-    use_cuda_sampling_ = device_is_cuda_ && !config_.disable_cuda_sampling;
+    // Timestamp rules need the full logits row. Long-form keeps inference on the
+    // EP but selects tokens from pinned host logits until the CUDA filter exists.
+    use_cuda_sampling_ = device_is_cuda_ && !config_.disable_cuda_sampling && !config_.long_form;
 
     if (use_cuda_sampling_)
     {
@@ -493,14 +643,18 @@ void WhisperPipeline::ZeroSelfKv()
     }
 }
 
-void WhisperPipeline::ArgmaxLogits(int64_t lower, int64_t upper)
+void WhisperPipeline::ArgmaxLogits(const Ort::Value& logits, int64_t lower, int64_t upper)
 {
 #ifdef DIN_WHISPER_CUDA
     if (use_cuda_sampling_)
     {
-        // Argmax on the GPU over the on-device logits; only the token crosses back.
-        const void* logits_dev = dims_.io_fp16 ? static_cast<const void*>(dec_logits_.GetTensorData<Ort::Float16_t>())
-                                               : static_cast<const void*>(dec_logits_.GetTensorData<float>());
+        // Argmax the final sequence row on the GPU; only the token crosses back.
+        const auto shape = logits.GetTensorTypeAndShapeInfo().GetShape();
+        const size_t row = static_cast<size_t>(shape.at(1) - 1) * static_cast<size_t>(shape.at(2));
+        const void* logits_dev =
+            dims_.io_fp16
+                ? static_cast<const void*>(logits.GetTensorData<Ort::Float16_t>() + row)
+                : static_cast<const void*>(logits.GetTensorData<float>() + row);
         int32_t* out = dec_input_ids_->BindingValue().GetTensorMutableData<int32_t>();
         auto stream = reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle());
         launch_whisper_argmax(stream, logits_dev, dims_.io_fp16, lower, upper, out);
@@ -513,7 +667,7 @@ void WhisperPipeline::ArgmaxLogits(int64_t lower, int64_t upper)
         // Run. Unlike the CUDA kernel path, writing the staging buffer does not
         // update the decoder's device input, so upload the selected token before
         // the next decode step consumes it.
-        dec_input_ids_->HostData()[0] = ArgmaxLastPosition(dec_logits_, lower, upper);
+        dec_input_ids_->HostData()[0] = ArgmaxLastPosition(logits, lower, upper);
         token_ready_notification_ = std::move(dec_input_ids_->CopyAsyncToDeviceWithNotification());
         // Decode runs with its default stream in this mode; wait here rather than
         // relying on a later notification wait, which occurs after the next Run.
@@ -521,8 +675,22 @@ void WhisperPipeline::ArgmaxLogits(int64_t lower, int64_t upper)
     }
 }
 
-std::vector<int64_t> WhisperPipeline::DecodeChunkDevice(int64_t& lang_token)
+void WhisperPipeline::SelectTimestampLogits(const Ort::Value& logits, const std::vector<int64_t>& generated)
 {
+    float selected_logprob = 0.0F;
+    const int32_t selected = SelectTimestampToken(logits, generated, special_, &selected_logprob);
+    dec_input_ids_->HostData()[0] = selected;
+    decoded_sum_logprob_ += selected_logprob;
+    ++decoded_token_count_;
+    token_ready_notification_ = std::move(dec_input_ids_->CopyAsyncToDeviceWithNotification());
+    token_ready_notification_.Sync();
+}
+
+std::vector<int64_t> WhisperPipeline::DecodeChunkDevice(int64_t& lang_token, const std::vector<int64_t>& prompt,
+                                                        bool timestamps)
+{
+    decoded_sum_logprob_ = 0.0;
+    decoded_token_count_ = 0;
     ZeroSelfKv();
     int64_t pos = 0;
     const auto step = [&](int32_t token, bool update_token = true)
@@ -539,6 +707,7 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkDevice(int64_t& lang_token)
         auto upload_event = dec_nonpad_->CopyAsyncToDeviceWithNotification();
         // ^ we only need a single event here since all are enqueued on the same stream
         Ort::RunOptions run_options;
+        run_options.AddConfigEntry("nv_profile_index", "0");
 #ifdef DIN_WHISPER_CUDA
         if (use_cuda_sampling_)
         {
@@ -553,47 +722,137 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkDevice(int64_t& lang_token)
         upload_event.Sync();  // ensure that the host buffer can be rewritten on the next iteration
         ++pos;
     };
-    step(static_cast<int32_t>(special_.sot));
-    if (config_.lang_id == "auto")
+
+    // Populate several consecutive cache positions in one decoder invocation.
+    // The same dynamic decoder_prefill.onnx session is subsequently called with
+    // S=1 by step() for autoregressive generation.
+    const auto prefill = [&](const std::vector<int32_t>& tokens, int64_t lower, int64_t upper,
+                             const std::vector<int64_t>* generated = nullptr, bool capture_no_speech = false)
     {
-        ArgmaxLogits(special_.lang_first, special_.lang_last + 1);
+        if (tokens.empty() || tokens.size() > static_cast<size_t>(kMaxPrefillTokens) ||
+            pos + static_cast<int64_t>(tokens.size()) > dims_.max_positions)
+        {
+            throw std::runtime_error("invalid Whisper prefill token count");
+        }
+
+        const int64_t sequence = static_cast<int64_t>(tokens.size());
+        din::common::TensorBuffer<int32_t> input_ids(*decoder_, {1, sequence}, true, true);
+        din::common::TensorBuffer<int64_t> write_indices(*decoder_, {sequence}, true, true);
+        din::common::TensorBuffer<int64_t> nonpad(*decoder_, {1}, true, true);
+        std::copy(tokens.begin(), tokens.end(), input_ids.HostData());
+        for (int64_t i = 0; i < sequence; ++i)
+        {
+            write_indices.HostData()[i] = pos + i;
+        }
+        nonpad.HostData()[0] = pos + sequence;
+        input_ids.CopyAsyncToDevice();
+        write_indices.CopyAsyncToDevice();
+        auto upload_event = nonpad.CopyAsyncToDeviceWithNotification();
+
+        Ort::Value logits = use_cuda_sampling_
+                                ? MakeIoValue(*decoder_, {1, sequence, dims_.vocab}, dims_.io_fp16, true)
+                                : MakePinnedValue(*decoder_, {1, sequence, dims_.vocab}, dims_.io_fp16, true);
+        Ort::IoBinding binding(decoder_->session);
+        binding.BindInput("input_ids", input_ids.BindingValue());
+        binding.BindInput("write_indices", write_indices.BindingValue());
+        binding.BindInput("nonpad_kv_seqlen", nonpad.BindingValue());
+        for (int i = 0; i < dims_.num_layers; ++i)
+        {
+            binding.BindInput(dec_past_self_key_in_[i].c_str(), self_kv_[2 * i]);
+            binding.BindInput(dec_past_self_value_in_[i].c_str(), self_kv_[2 * i + 1]);
+            binding.BindInput(dec_past_cross_key_in_[i].c_str(), cross_kv_[2 * i]);
+            binding.BindInput(dec_past_cross_value_in_[i].c_str(), cross_kv_[2 * i + 1]);
+            binding.BindOutput(dec_present_self_key_out_[i].c_str(), self_kv_[2 * i]);
+            binding.BindOutput(dec_present_self_value_out_[i].c_str(), self_kv_[2 * i + 1]);
+        }
+        binding.BindOutput("logits", logits);
+
+        Ort::RunOptions run_options;
+        run_options.AddConfigEntry("nv_profile_index", "1");
+#ifdef DIN_WHISPER_CUDA
+        if (use_cuda_sampling_)
+        {
+            run_options.SetSyncStream(compute_stream_);
+            run_options.AddConfigEntry(kOrtRunOptionsConfigDisableSynchronizeExecutionProviders, "1");
+        }
+#endif
+        decoder_->session.Run(run_options, binding);
+        upload_event.Sync();
+        pos += sequence;
+        if (capture_no_speech)
+        {
+            no_speech_probability_ = LastPositionProbability(logits, special_.no_speech, dims_.vocab);
+        }
+        if (generated != nullptr)
+        {
+            SelectTimestampLogits(logits, *generated);
+        }
+        else
+        {
+            ArgmaxLogits(logits, lower, upper);
+        }
         token_ready_notification_.Sync();
-        lang_token = dec_input_ids_->HostData()[0];
-    }
-    else
+        return static_cast<int64_t>(dec_input_ids_->HostData()[0]);
+    };
+
+    std::vector<int32_t> prefix;
+    if (!prompt.empty())
     {
-        lang_token = ResolveLanguageToken(dec_logits_);
+        prefix.push_back(static_cast<int32_t>(special_.start_of_prev));
+        const size_t keep = std::min<size_t>(prompt.size(), kMaxPrefillTokens - 2);
+        for (size_t i = prompt.size() - keep; i < prompt.size(); ++i)
+        {
+            prefix.push_back(static_cast<int32_t>(prompt[i]));
+        }
     }
-    step(static_cast<int32_t>(lang_token), !use_cuda_sampling_);
-    ArgmaxLogits(0, special_.eot + 1);
-    token_ready_notification_.Sync();
-    step(static_cast<int32_t>(special_.transcribe));
-    step(static_cast<int32_t>(special_.notimestamps));
+    prefix.push_back(static_cast<int32_t>(special_.sot));
+    const int64_t detected = prefill(prefix, special_.lang_first, special_.lang_last + 1, nullptr, true);
+    if (lang_token < 0)
+    {
+        lang_token = config_.lang_id == "auto" ? detected : ResolveLanguageToken(dec_logits_);
+    }
+
+    std::vector<int32_t> task_prompt{static_cast<int32_t>(lang_token), static_cast<int32_t>(special_.transcribe)};
+    if (!timestamps)
+    {
+        task_prompt.push_back(static_cast<int32_t>(special_.notimestamps));
+    }
 
     std::vector<int64_t> generated;
-    // for GPU we call step once more than required since synchronous execution is slower
-    // than just submitting one more inference than required
-    do
+    int64_t next = prefill(task_prompt, 0, special_.eot + 1, timestamps ? &generated : nullptr);
+    while (next != special_.eot && pos < dims_.max_positions)
     {
-        ArgmaxLogits(0, special_.eot + 1);
-        step(dec_input_ids_->HostData()[0], !use_cuda_sampling_);
+        generated.push_back(next);
+        step(static_cast<int32_t>(next), !use_cuda_sampling_);
+        if (timestamps)
+        {
+            SelectTimestampLogits(dec_logits_, generated);
+        }
+        else
+        {
+            ArgmaxLogits(dec_logits_, 0, special_.eot + 1);
+        }
         token_ready_notification_.Sync();
-        generated.push_back(dec_input_ids_->HostData()[0]);
-    } while (dec_input_ids_->HostData()[0] != special_.eot && pos < dims_.max_positions);
+        next = dec_input_ids_->HostData()[0];
+    }
     return generated;
 }
 
-std::vector<int64_t> WhisperPipeline::DecodeChunk(int64_t& lang_token)
+std::vector<int64_t> WhisperPipeline::DecodeChunk(int64_t& lang_token, const std::vector<int64_t>& prompt,
+                                                  bool timestamps)
 {
     if (use_device_io_)
     {
-        return DecodeChunkDevice(lang_token);
+        return DecodeChunkDevice(lang_token, prompt, timestamps);
     }
-    return DecodeChunkHost(lang_token);
+    return DecodeChunkHost(lang_token, prompt, timestamps);
 }
 
-std::vector<int64_t> WhisperPipeline::DecodeChunkHost(int64_t& lang_token)
+std::vector<int64_t> WhisperPipeline::DecodeChunkHost(int64_t& lang_token, const std::vector<int64_t>& prompt,
+                                                      bool timestamps)
 {
+    decoded_sum_logprob_ = 0.0;
+    decoded_token_count_ = 0;
     std::vector<Ort::Value>& cross_kv = cross_kv_;
     auto cpu = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
@@ -620,16 +879,28 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkHost(int64_t& lang_token)
     // CPU path feeds present->past out-of-place, matching the reference.
     const bool alias = use_device_io_;
     int64_t pos = 0;
-    const auto step = [&](int32_t token) -> Ort::Value
+    const auto run = [&](std::vector<int32_t> tokens) -> Ort::Value
     {
-        din::common::nvtx_scoped_range range{"decode_step"};
-        const std::vector<int64_t> id_shape{1, 1};
-        Ort::Value ids = Ort::Value::CreateTensor<int32_t>(cpu, &token, 1, id_shape.data(), id_shape.size());
+        din::common::nvtx_scoped_range range{tokens.size() == 1 ? "decode_step" : "prefill"};
+        if (tokens.empty() || tokens.size() > static_cast<size_t>(kMaxPrefillTokens) ||
+            pos + static_cast<int64_t>(tokens.size()) > dims_.max_positions)
+        {
+            throw std::runtime_error("invalid Whisper prefill token count");
+        }
+        const int64_t sequence = static_cast<int64_t>(tokens.size());
+        const std::vector<int64_t> id_shape{1, sequence};
+        Ort::Value ids =
+            Ort::Value::CreateTensor<int32_t>(cpu, tokens.data(), tokens.size(), id_shape.data(), id_shape.size());
+        std::vector<int64_t> write_index(static_cast<size_t>(sequence));
+        for (int64_t i = 0; i < sequence; ++i)
+        {
+            write_index[static_cast<size_t>(i)] = pos + i;
+        }
+        int64_t nonpad_len = pos + sequence;
+        const std::vector<int64_t> write_shape{sequence};
         const std::vector<int64_t> scalar_shape{1};
-        int64_t write_index = pos;
-        int64_t nonpad_len = pos + 1;
-        Ort::Value write_indices =
-            Ort::Value::CreateTensor<int64_t>(cpu, &write_index, 1, scalar_shape.data(), scalar_shape.size());
+        Ort::Value write_indices = Ort::Value::CreateTensor<int64_t>(
+            cpu, write_index.data(), write_index.size(), write_shape.data(), write_shape.size());
         Ort::Value nonpad =
             Ort::Value::CreateTensor<int64_t>(cpu, &nonpad_len, 1, scalar_shape.data(), scalar_shape.size());
 
@@ -659,6 +930,7 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkHost(int64_t& lang_token)
             }
         }
         Ort::RunOptions run_options;
+        run_options.AddConfigEntry("nv_profile_index", tokens.size() == 1 ? "0" : "1");
         decoder_->session.Run(run_options, binding);
 
         auto out_names = binding.GetOutputNames();
@@ -676,21 +948,47 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkHost(int64_t& lang_token)
                 self_kv[2 * i + 1] = std::move(out_values[index.at(dec_present_self_value_out_[i])]);
             }
         }
-        ++pos;
+        pos += sequence;
         return std::move(out_values[index.at("logits")]);
     };
 
-    // Prefill the forced prompt token by token; the language tag is chosen from
-    // the logits that follow <|startoftranscript|>.
-    Ort::Value logits = step(static_cast<int32_t>(special_.sot));
-    lang_token = ResolveLanguageToken(logits);
-    step(static_cast<int32_t>(lang_token));
-    step(static_cast<int32_t>(special_.transcribe));
-    logits = step(static_cast<int32_t>(special_.notimestamps));
+    // Language detection depends on the logits following SOT. Once selected, the
+    // remaining prompt is populated in one multi-token prefill invocation.
+    std::vector<int32_t> prefix;
+    if (!prompt.empty())
+    {
+        prefix.push_back(static_cast<int32_t>(special_.start_of_prev));
+        const size_t keep = std::min<size_t>(prompt.size(), kMaxPrefillTokens - 2);
+        for (size_t i = prompt.size() - keep; i < prompt.size(); ++i)
+        {
+            prefix.push_back(static_cast<int32_t>(prompt[i]));
+        }
+    }
+    prefix.push_back(static_cast<int32_t>(special_.sot));
+    Ort::Value logits = run(prefix);
+    no_speech_probability_ = LastPositionProbability(logits, special_.no_speech, dims_.vocab);
+    if (lang_token < 0)
+    {
+        lang_token = ResolveLanguageToken(logits);
+    }
+    std::vector<int32_t> task_prompt{static_cast<int32_t>(lang_token), static_cast<int32_t>(special_.transcribe)};
+    if (!timestamps)
+    {
+        task_prompt.push_back(static_cast<int32_t>(special_.notimestamps));
+    }
+    logits = run(task_prompt);
 
     const bool debug = std::getenv("DIN_WHISPER_DEBUG") != nullptr;
     std::vector<int64_t> generated;
-    int64_t next = ArgmaxLastPosition(logits, 0, special_.eot + 1);
+    const auto select_timestamp = [&](const Ort::Value& values)
+    {
+        float selected_logprob = 0.0F;
+        const int64_t selected = SelectTimestampToken(values, generated, special_, &selected_logprob);
+        decoded_sum_logprob_ += selected_logprob;
+        ++decoded_token_count_;
+        return selected;
+    };
+    int64_t next = timestamps ? select_timestamp(logits) : ArgmaxLastPosition(logits, 0, special_.eot + 1);
     while (next != special_.eot && pos < dims_.max_positions)
     {
         generated.push_back(next);
@@ -698,8 +996,8 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkHost(int64_t& lang_token)
         {
             std::cerr << "[debug] pos=" << pos << " token=" << next << std::endl;
         }
-        logits = step(static_cast<int32_t>(next));
-        next = ArgmaxLastPosition(logits, 0, special_.eot + 1);
+        logits = run({static_cast<int32_t>(next)});
+        next = timestamps ? select_timestamp(logits) : ArgmaxLastPosition(logits, 0, special_.eot + 1);
     }
     return generated;
 }
@@ -729,7 +1027,6 @@ TranscriptionResult WhisperPipeline::Transcribe(const Audio& audio)
     }
 
     TranscriptionResult result;
-    result.audio_seconds = audio.Duration();
     encode_seconds_ = 0.0;
     greedy_seconds_ = 0.0;
 
@@ -737,50 +1034,171 @@ TranscriptionResult WhisperPipeline::Transcribe(const Audio& audio)
 
     const size_t total = audio.samples.size();
     const size_t num_chunks = (total + kChunkSamples - 1) / kChunkSamples;
-
-    // Optional cap (testing): DIN_WHISPER_MAX_CHUNKS limits processed windows.
-    size_t max_chunks = num_chunks;
+    size_t max_iterations = config_.long_form ? std::numeric_limits<size_t>::max() : std::min<size_t>(num_chunks, 1);
     if (const char* cap = std::getenv("DIN_WHISPER_MAX_CHUNKS"))
     {
-        max_chunks = std::min<size_t>(num_chunks, std::strtoul(cap, nullptr, 10));
+        max_iterations = std::min<size_t>(max_iterations, std::strtoul(cap, nullptr, 10));
     }
+    result.audio_seconds = static_cast<double>(config_.long_form
+                                                   ? total
+                                                   : std::min(total, static_cast<size_t>(kChunkSamples))) /
+        static_cast<double>(kSampleRate);
 
-    std::string text;
-    size_t chunk_index = 0;
-    for (size_t start = 0; start < total && chunk_index < max_chunks; start += kChunkSamples, ++chunk_index)
+    const auto trim = [](std::string value)
     {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return first == std::string::npos ? std::string{} : value.substr(first, last - first + 1);
+    };
+
+    std::vector<int64_t> prompt;
+    int64_t lang_token = -1;
+    size_t seek = 0;
+    size_t iteration = 0;
+    while (seek < total && iteration < max_iterations)
+    {
+        const size_t window_start = seek;
+        const size_t count = std::min<size_t>(kChunkSamples, total - seek);
         std::vector<float> chunk(kChunkSamples, 0.0F);
-        const size_t count = std::min<size_t>(kChunkSamples, total - start);
-        std::copy_n(audio.samples.begin() + start, count, chunk.begin());
+        std::copy_n(audio.samples.begin() + seek, count, chunk.begin());
 
         const auto encode_start = std::chrono::steady_clock::now();
-        EncodeChunk(chunk);  // mel + encoder -> persistent cross_kv_
+        EncodeChunk(chunk);
         encode_seconds_ += SecondsSince(encode_start);
 
         const auto greedy_start = std::chrono::steady_clock::now();
-        int64_t lang_token = special_.lang_first;
-        const std::vector<int64_t> tokens = DecodeChunk(lang_token);
+        const std::vector<int64_t> tokens = DecodeChunk(lang_token, prompt, config_.long_form);
         if (result.language.empty())
         {
             result.language = tokenizer_->LanguageCode(lang_token);
         }
         greedy_seconds_ += SecondsSince(greedy_start);
+        result.model_window_seconds += kChunkSeconds;
 
-        std::string chunk_text = tokenizer_->Decode(tokens);
-        const auto first = chunk_text.find_first_not_of(" \t\r\n");
-        const auto last = chunk_text.find_last_not_of(" \t\r\n");
-        chunk_text = first == std::string::npos ? std::string{} : chunk_text.substr(first, last - first + 1);
-        if (!text.empty() && !chunk_text.empty())
+        const double average_logprob = decoded_token_count_ > 0
+                                           ? decoded_sum_logprob_ / static_cast<double>(decoded_token_count_)
+                                           : -INFINITY;
+        if (config_.long_form && no_speech_probability_ > 0.6F && average_logprob < -1.0)
         {
-            text += ' ';
+            std::cerr << "[window " << (iteration + 1) << " seek=" << std::fixed << std::setprecision(2)
+                << static_cast<double>(window_start) / kSampleRate << "s " << result.language
+                << "] no speech (p=" << no_speech_probability_ << ")" << std::endl;
+            seek += count;
+            ++iteration;
+            continue;
         }
-        text += chunk_text;
 
-        std::cerr << "[chunk " << (chunk_index + 1) << "/" << num_chunks << " " << result.language << "] " << chunk_text
-                  << std::endl;
+        if (!config_.long_form)
+        {
+            WhisperSegment segment;
+            segment.start = 0.0;
+            segment.end = static_cast<double>(count) / kSampleRate;
+            segment.tokens = tokens;
+            segment.text = trim(tokenizer_->Decode(tokens));
+            result.segments.push_back(std::move(segment));
+            seek += count;
+        }
+        else
+        {
+            const auto is_timestamp = [&](int64_t token) { return token >= special_.timestamp_first; };
+            std::vector<size_t> boundaries;
+            for (size_t i = 1; i < tokens.size(); ++i)
+            {
+                if (is_timestamp(tokens[i - 1]) && is_timestamp(tokens[i]))
+                {
+                    boundaries.push_back(i);
+                }
+            }
+            const bool single_timestamp_ending = tokens.size() >= 2 && !is_timestamp(tokens[tokens.size() - 2]) &&
+                is_timestamp(tokens.back());
+            size_t committed = tokens.size();
+            size_t seek_advance = count;
+            if (!boundaries.empty())
+            {
+                const size_t segments_before = result.segments.size();
+                if (single_timestamp_ending)
+                {
+                    boundaries.push_back(tokens.size());
+                }
+                size_t slice_start = 0;
+                for (const size_t slice_end : boundaries)
+                {
+                    if (slice_end > slice_start && is_timestamp(tokens[slice_start]) &&
+                        is_timestamp(tokens[slice_end - 1]))
+                    {
+                        WhisperSegment segment;
+                        segment.start = static_cast<double>(window_start) / kSampleRate +
+                            static_cast<double>(tokens[slice_start] - special_.timestamp_first) * 0.02;
+                        segment.end = static_cast<double>(window_start) / kSampleRate +
+                            static_cast<double>(tokens[slice_end - 1] - special_.timestamp_first) * 0.02;
+                        segment.tokens.assign(tokens.begin() + slice_start, tokens.begin() + slice_end);
+                        segment.text = trim(tokenizer_->Decode(segment.tokens));
+                        if (!segment.text.empty())
+                        {
+                            result.segments.push_back(std::move(segment));
+                        }
+                    }
+                    slice_start = slice_end;
+                }
+                committed = boundaries.back();
+                if (!single_timestamp_ending)
+                {
+                    const int64_t timestamp_position = tokens[committed - 1] - special_.timestamp_first;
+                    seek_advance = static_cast<size_t>(std::max<int64_t>(timestamp_position, 1)) * 320;
+                    seek_advance = std::min(seek_advance, count);
+                }
+                if (result.segments.size() == segments_before)
+                {
+                    // Empty timestamp pairs carry no text to condition on. Move
+                    // through silence in 0.5 s increments instead of re-encoding
+                    // nearly the same 30 s window every 20 ms.
+                    seek_advance = std::max<size_t>(seek_advance, kSampleRate / 2);
+                }
+            }
+            else
+            {
+                WhisperSegment segment;
+                segment.start = static_cast<double>(window_start) / kSampleRate;
+                segment.end = segment.start + static_cast<double>(count) / kSampleRate;
+                if (!tokens.empty() && is_timestamp(tokens.front()))
+                {
+                    segment.start += static_cast<double>(tokens.front() - special_.timestamp_first) * 0.02;
+                }
+                if (!tokens.empty() && is_timestamp(tokens.back()))
+                {
+                    segment.end = static_cast<double>(window_start) / kSampleRate +
+                        static_cast<double>(tokens.back() - special_.timestamp_first) * 0.02;
+                }
+                segment.tokens = tokens;
+                segment.text = trim(tokenizer_->Decode(tokens));
+                if (!segment.text.empty())
+                {
+                    result.segments.push_back(std::move(segment));
+                }
+            }
+            prompt.insert(prompt.end(), tokens.begin(), tokens.begin() + committed);
+            seek += std::max<size_t>(seek_advance, 1);
+        }
+
+        std::string iteration_text;
+        if (!result.segments.empty())
+        {
+            iteration_text = result.segments.back().text;
+        }
+        std::cerr << "[window " << (iteration + 1) << " seek=" << std::fixed << std::setprecision(2)
+            << static_cast<double>(window_start) / kSampleRate << "s " << result.language << "] "
+            << iteration_text << std::endl;
+        ++iteration;
     }
 
-    result.text = text;
+    for (const auto& segment : result.segments)
+    {
+        if (!result.text.empty() && !segment.text.empty())
+        {
+            result.text += ' ';
+        }
+        result.text += segment.text;
+    }
     result.encode_seconds = encode_seconds_;
     result.greedy_seconds = greedy_seconds_;
     result.transcribe_seconds = SecondsSince(transcribe_start);
@@ -794,13 +1212,24 @@ TranscriptionResult WhisperPipeline::TranscribeFile(const fs::path& audio_path)
 }
 
 void WhisperPipeline::Print(std::ostream& stream, const TranscriptionResult& result,
-                            const TranscriptionOptions& /*options*/) const
+                            const TranscriptionOptions& options) const
 {
     if (!result.language.empty())
     {
         stream << "[language: " << result.language << "]\n";
     }
-    stream << result.text << '\n';
+    if (options.timestamps == "segment")
+    {
+        for (const auto& segment : result.segments)
+        {
+            stream << '[' << std::fixed << std::setprecision(2) << segment.start << " --> " << segment.end << "] "
+                << segment.text << '\n';
+        }
+    }
+    else
+    {
+        stream << result.text << '\n';
+    }
 }
 
 }  // namespace din::asr::whisper

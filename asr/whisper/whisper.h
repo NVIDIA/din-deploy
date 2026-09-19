@@ -49,6 +49,15 @@ struct CliSpec
 inline constexpr int kSampleRate = 16000;
 inline constexpr int kChunkSeconds = 30;
 inline constexpr int kChunkSamples = kSampleRate * kChunkSeconds;  // 480000, mel.onnx input length
+inline constexpr int kMaxPrefillTokens = 224;
+
+struct WhisperSegment
+{
+    double start = 0.0;
+    double end = 0.0;
+    std::string text;
+    std::vector<int64_t> tokens;
+};
 
 struct TranscriptionResult
 {
@@ -58,6 +67,8 @@ struct TranscriptionResult
     double transcribe_seconds = 0.0;
     double encode_seconds = 0.0;
     double greedy_seconds = 0.0;
+    double model_window_seconds = 0.0;
+    std::vector<WhisperSegment> segments;
 };
 
 // Model geometry + IO precision, detected from the ONNX sessions at load time so
@@ -84,6 +95,9 @@ struct SpecialTokens
     int64_t eot = 50257;           // <|endoftext|>
     int64_t lang_first = 50259;    // <|en|>
     int64_t lang_last = 50357;     // last language tag
+    int64_t start_of_prev = 50361; // <|startofprev|>
+    int64_t no_speech = 50362; // <|nospeech|>
+    int64_t timestamp_first = 50364; // <|0.00|>
 };
 
 struct WhisperConfig
@@ -96,6 +110,9 @@ struct WhisperConfig
     std::string lang_id = "auto";
     // Force greedy argmax onto the CPU even when the CUDA kernel is available.
     bool disable_cuda_sampling = false;
+    // Process the complete input as consecutive 30-second windows. When false,
+    // only the first model window is transcribed.
+    bool long_form = false;
 };
 
 class WhisperPipeline
@@ -118,16 +135,17 @@ private:
     // resolves a forced --lang-id.
     [[nodiscard]] int64_t ResolveLanguageToken(const Ort::Value& sot_logits) const;
     // Greedily decodes one 30 s window (using cross_kv_); sets `lang_token`.
-    std::vector<int64_t> DecodeChunk(int64_t& lang_token);
+    std::vector<int64_t> DecodeChunk(int64_t& lang_token, const std::vector<int64_t>& prompt, bool timestamps);
     // TRT-RTX path: persistent pinned bindings, self-KV aliased in place.
-    std::vector<int64_t> DecodeChunkDevice(int64_t& lang_token);
+    std::vector<int64_t> DecodeChunkDevice(int64_t& lang_token, const std::vector<int64_t>& prompt, bool timestamps);
     // CPU path: out-of-place present->past, fresh bindings per step.
-    std::vector<int64_t> DecodeChunkHost(int64_t& lang_token);
+    std::vector<int64_t> DecodeChunkHost(int64_t& lang_token, const std::vector<int64_t>& prompt, bool timestamps);
     void SetupDecodePath();  // allocates the persistent device decode buffers/binding
     void ZeroSelfKv();       // clears the persistent self-KV cache before a chunk
-    // Greedy argmax over dec_logits_[lower, upper).
+    // Greedy argmax over the last sequence position of logits[lower, upper).
     // output is store inside token_out_
-    void ArgmaxLogits(int64_t lower, int64_t upper);
+    void ArgmaxLogits(const Ort::Value& logits, int64_t lower, int64_t upper);
+    void SelectTimestampLogits(const Ort::Value& logits, const std::vector<int64_t>& generated);
 
     std::unique_ptr<OrtRunner> MakeRunner(const std::filesystem::path& path, const EpContextOptions& ep_context,
                                           const ModelProfile& profile);
@@ -149,6 +167,9 @@ private:
     // Runtime choice: run greedy argmax as a CUDA kernel. device_is_cuda_ and not
     // disabled on the CLI.
     bool use_cuda_sampling_ = false;
+    float no_speech_probability_ = 0.0F;
+    double decoded_sum_logprob_ = 0.0;
+    size_t decoded_token_count_ = 0;
 
     // Persistent mel+encoder IO (fixed shapes; allocated once in SetupEncodePath).
     // samples staged through pinned host memory; everything else stays on-device.
