@@ -8,6 +8,7 @@
 #include <iosfwd>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -36,20 +37,11 @@ struct TranscriptionOptions
     std::string timestamps = "none";
 };
 
-struct CliSpec
-{
-    std::string fallback_name;                    // executable name when argv[0] is unavailable
-    std::string artifact_label;                   // e.g. "Nemotron" / "Parakeet"
-    std::string default_provider;                 // shown in --provider help line
-    std::string timestamps_modes;                 // e.g. "none|token"
-    std::vector<std::string> allowed_timestamps;  // empty disables validation
-    std::vector<std::string> allowed_lang_ids;    // empty disables lang-id validation
-};
-
 inline constexpr int kSampleRate = 16000;
 inline constexpr int kChunkSeconds = 30;
 inline constexpr int kChunkSamples = kSampleRate * kChunkSeconds;  // 480000, mel.onnx input length
 inline constexpr int kMaxPrefillTokens = 224;
+inline constexpr int kHistoryTokens = 220;
 
 struct WhisperSegment
 {
@@ -68,6 +60,8 @@ struct TranscriptionResult
     double encode_seconds = 0.0;
     double greedy_seconds = 0.0;
     double model_window_seconds = 0.0;
+    size_t windows = 0;
+    size_t decoded_tokens = 0;
     std::vector<WhisperSegment> segments;
 };
 
@@ -106,13 +100,12 @@ struct WhisperConfig
     std::string provider = "trt-rtx";
     std::filesystem::path ep_cache_dir = "artifacts/whisper/trt_rtx_cache";
     std::filesystem::path ep_context_dir = "artifacts/whisper/ep_context";
-    // Language code (e.g. "en") or "auto" to detect per chunk.
+    // Language code (e.g. "en") or "auto" to detect once per recording.
     std::string lang_id = "auto";
     // Force greedy argmax onto the CPU even when the CUDA kernel is available.
     bool disable_cuda_sampling = false;
-    // Process the complete input as consecutive 30-second windows. When false,
-    // only the first model window is transcribed.
-    bool long_form = false;
+    bool condition_on_previous_text = true;
+    int prefill_block_size = 128;  // 0 disables buckets; legacy static graphs use sequential prefill.
 };
 
 class WhisperPipeline
@@ -135,16 +128,19 @@ private:
     // resolves a forced --lang-id.
     [[nodiscard]] int64_t ResolveLanguageToken(const Ort::Value& sot_logits) const;
     // Greedily decodes one 30 s window (using cross_kv_); sets `lang_token`.
-    std::vector<int64_t> DecodeChunk(int64_t& lang_token, const std::vector<int64_t>& prompt, bool timestamps);
+    std::vector<int64_t> DecodeChunk(int64_t& lang_token, const std::vector<int64_t>& prompt);
     // TRT-RTX path: persistent pinned bindings, self-KV aliased in place.
-    std::vector<int64_t> DecodeChunkDevice(int64_t& lang_token, const std::vector<int64_t>& prompt, bool timestamps);
+    std::vector<int64_t> DecodeChunkDevice(int64_t& lang_token, const std::vector<int64_t>& prompt);
     // CPU path: out-of-place present->past, fresh bindings per step.
-    std::vector<int64_t> DecodeChunkHost(int64_t& lang_token, const std::vector<int64_t>& prompt, bool timestamps);
+    std::vector<int64_t> DecodeChunkHost(int64_t& lang_token, const std::vector<int64_t>& prompt);
     void SetupDecodePath();  // allocates the persistent device decode buffers/binding
-    void ZeroSelfKv();       // clears the persistent self-KV cache before a chunk
+    void WarmupDecoder();
+    void PrefillHistoryBlock(std::span<const int32_t> tokens, int64_t position);
+    void ZeroSelfKv();  // clears the persistent self-KV cache before a chunk
     // Greedy argmax over the last sequence position of logits[lower, upper).
     // output is store inside token_out_
     void ArgmaxLogits(const Ort::Value& logits, int64_t lower, int64_t upper);
+    int32_t SelectTimestampHost(const Ort::Value& logits, const std::vector<int64_t>& generated);
     void SelectTimestampLogits(const Ort::Value& logits, const std::vector<int64_t>& generated);
 
     std::unique_ptr<OrtRunner> MakeRunner(const std::filesystem::path& path, const EpContextOptions& ep_context,
@@ -160,6 +156,8 @@ private:
     std::unique_ptr<din::io::Tokenizer> tokenizer_;
     ModelDims dims_;
     SpecialTokens special_;
+    std::vector<int64_t> suppressed_tokens_;
+    int max_timestamp_ = 1500;
     bool use_device_io_ = false;
     // CUDA compiled in AND the EP device is an NVIDIA GPU, so its device memory is
     // CUDA-addressable (usable for cudaMemset etc.), independent of --cpu-sampling.
@@ -182,14 +180,20 @@ private:
 
     // Persistent decode IO for the TRT-RTX path: fixed shapes, allocated once.
     // Self-KV is aliased (past==present) in place; the three scalar inputs are
-    // staged through pinned memory; logits land in pinned host memory.
+    // staged through pinned memory; logits stay on-device for CUDA selection.
     std::vector<Ort::Value> self_kv_;
     std::optional<din::common::TensorBuffer<int32_t>> dec_input_ids_;
     std::optional<din::common::TensorBuffer<int64_t>> dec_write_idx_;
     std::optional<din::common::TensorBuffer<int64_t>> dec_nonpad_;
     Ort::Value dec_logits_{nullptr};  // device buffer (CUDA) or pinned host (fallback)
+    std::optional<din::common::TensorBuffer<uint8_t>> timestamp_suppressed_;
+    std::optional<din::common::TensorBuffer<double>> timestamp_workspace_;
+    std::optional<din::common::TensorBuffer<double>> timestamp_stats_;
     din::common::NotificationPtr token_ready_notification_{nullptr};
     std::optional<Ort::IoBinding> decoder_binding_;
+    std::optional<din::common::TensorBuffer<int32_t>> history_ids_, history_prompt_;
+    std::optional<din::common::TensorBuffer<int64_t>> history_indices_;
+    std::optional<Ort::IoBinding> history_binding_;
 
     // Precomputed, stably-stored ONNX IO names (referenced by IoBinding).
     std::vector<std::string> enc_cross_key_out_;

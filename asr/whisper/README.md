@@ -75,3 +75,14 @@ cmake --build out\build\windows-x64 --target din_asr_whisper_cli
 out\build\windows-x64\bin\din_asr_whisper_cli.exe audio.mp3 --model-dir D:\models\whisper-small-onnx-fp16 --provider trt-rtx
 out\build\windows-x64\bin\din_asr_whisper_cli.exe audio.mp3 --model-dir D:\models\whisper-medium-onnx-fp32 --provider trt-rtx --lang-id en
 ```
+
+### Long recordings
+
+```powershell
+out/build/windows-x64/bin/din_asr_whisper_cli.exe audio.mp3 --model-dir D:/models/whisper-large-v3-turbo-onnx-fp16 --timestamps json
+```
+
+The complete recording is transcribed automatically. Audio longer than 30 seconds
+uses timestamp-driven long-form windows, following upstream Whisper.
+`--no-context` disables previous-text conditioning.
+`--prefill-block-size` defaults to 128; 0 disables bucketing.
