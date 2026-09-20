@@ -32,7 +32,7 @@ Results measured on a DGX Spark using CPU EP vs TensorRT RTX EP. Audio throughpu
 
 | Model |         GPU | CPU |
 | --- |------------:| ---: |
-| `openai/whisper-large-v3-turbo` | [58.51×](asr/whisper/README.md#dgx-spark-performance) | [3.75×](asr/whisper/README.md#dgx-spark-performance) |
+| `openai/whisper-large-v3-turbo` | [58.5×](asr/whisper/README.md#dgx-spark-performance) | [3.8×](asr/whisper/README.md#dgx-spark-performance) |
 | `nvidia/nemotron-3.5-asr-streaming-0.6b` |  39.01× | 3.24× |
 | `nvidia/parakeet-tdt-0.6b-v3` | 206.41× | 14.44× |
 | `facebook/sam2.1-hiera-base-plus` |    38.3 FPS | 0.5 FPS |
