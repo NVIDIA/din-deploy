@@ -191,7 +191,7 @@ Audio LoadWavMono(const std::string& path)
         }
     }
 
-    if (channels == 0 || sample_rate == 0 || data.empty())
+    if (channels == 0 || sample_rate == 0 || bits_per_sample < 8 || data.empty())
     {
         throw std::runtime_error("incomplete wav file");
     }

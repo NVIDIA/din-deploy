@@ -16,6 +16,8 @@ Example:
 """
 
 import argparse
+import json
+import subprocess
 import os
 import sys
 from pathlib import Path
@@ -70,6 +72,10 @@ def make_sessions(onnx_dir: Path, provider: str, args):
         options.add_provider_for_devices(devices, {})
         providers = None
     encoder = ort.InferenceSession(str(onnx_dir / "encoder.onnx"), sess_options=options, providers=providers)
+    if provider == "trt-rtx":
+        options = ort.SessionOptions()
+        shape = "input_ids:1x1,write_indices:1"
+        options.add_provider_for_devices(devices, {f"nv_profile_{kind}_shapes": shape for kind in ("min", "opt", "max")})
     decoder = ort.InferenceSession(str(onnx_dir / "decoder.onnx"), sess_options=options, providers=providers)
     print(f"  encoder providers: {encoder.get_providers()}")
     print(f"  decoder providers: {decoder.get_providers()}")
@@ -211,9 +217,46 @@ def normalize(text: str) -> str:
     return " ".join("".join(c.lower() if (c.isalnum() or c.isspace()) else " " for c in text).split())
 
 
+def validate_native(args):
+    """Check the native long-form path using decoded duration and optional truth."""
+    command = [str(args.native_cli.resolve()), str(Path(args.audio).resolve()),
+               "--model-dir", str(args.onnx_dir.resolve()), "--timestamps", "json",
+               "--provider", args.provider, "--lang-id", args.language]
+    command += ["--prefill-block-size", str(args.prefill_block_size)]
+    if args.cpu_sampling:
+        command.append("--cpu-sampling")
+    run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.with_suffix(".log").write_text(run.stdout + "\n" + run.stderr, encoding="utf-8")
+    run.check_returncode()
+    result = next(json.loads(line) for line in run.stdout.splitlines() if line.startswith('{"'))
+    audio, rate = sf.read(args.audio, dtype="float32")
+    duration = len(audio) / rate  # Container metadata can overestimate MP3 duration.
+    assert abs(result["audio_seconds"] - duration) < 1e-3
+    assert duration <= 30 or result["windows"] >= 2
+    previous_end = 0.0
+    for segment in result["segments"]:
+        assert 0 <= segment["start"] < segment["end"] <= duration + 1e-3, segment
+        assert segment["start"] >= previous_end - 1e-3 and segment["text"].strip(), segment
+        previous_end = segment["end"]
+    if args.expect_silence:
+        assert not result["text"] and not result["segments"]
+    elif duration:
+        assert result["text"], "No speech returned"
+    if args.truth:
+        import jiwer
+        truth = Path(args.truth).read_text(encoding="utf-8-sig")
+        result["wer"] = jiwer.wer(normalize(truth), normalize(result["text"]))
+        if args.max_wer is not None:
+            assert result["wer"] <= args.max_wer, result["wer"]
+    result["validated"] = True
+    args.report.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({k: v for k, v in result.items() if k not in {"text", "segments"}}, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", help="Hugging Face checkpoint (required unless --native-cli is used).")
     parser.add_argument("--onnx-dir", type=Path, required=True)
     parser.add_argument("--audio", required=True)
     parser.add_argument("--truth", default=None)
@@ -228,8 +271,19 @@ def main() -> None:
                         help="TensorRT-RTX bin directory used to resolve --ep-lib dependencies.")
     parser.add_argument("--seconds", type=float, default=30.0, help="Audio window to transcribe.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--native-cli", type=Path, help="Validate full audio with the native CLI instead of HF/ONNX wrappers.")
+    parser.add_argument("--report", type=Path, default=Path("artifacts/whisper/validation.json"))
+    parser.add_argument("--cpu-sampling", action="store_true")
+    parser.add_argument("--prefill-block-size", type=int, default=128)
+    parser.add_argument("--expect-silence", action="store_true")
+    parser.add_argument("--max-wer", type=float)
     args = parser.parse_args()
     ew._configure_stdio()
+    if args.native_cli:
+        validate_native(args)
+        return
+    if not args.model:
+        parser.error("--model is required without --native-cli")
 
     np_dtype = NP_DT[args.dtype]
     torch_dtype = torch.float16 if args.dtype == "fp16" else torch.float32

@@ -721,6 +721,9 @@ std::string Tokenizer::Decode(const std::vector<int64_t>& ids, bool skip_special
 
 std::string Tokenizer::LanguageCode(int64_t lang_token) const
 {
+    const auto& token = Token(lang_token);
+    if ((token.size() == 6 || token.size() == 7) && token.starts_with("<|") && token.ends_with("|>"))
+        return token.substr(2, token.size() - 4);
     const int64_t index = lang_token - kWhisperLangFirst;
     if (index < 0 || index >= static_cast<int64_t>(lang_codes_.size()))
     {

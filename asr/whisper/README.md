@@ -25,12 +25,10 @@ unusable; — was not tested.
 Note that this was testted using TensorRT-RTX releases 1.6 and there are known accuracy issue with this fused attention operator. For older releases, use `--attention math` to export decomposed attention instead of fused SDPA.
 
 ## Export
-
-
 ```bash
-python export_whisper.py --model openai/whisper-small --output D:/models/whisper-small-onnx-fp16
-python export_whisper.py --model openai/whisper-medium --dtype fp32 --output D:/models/whisper-medium-onnx-fp32
-python export_whisper.py --model openai/whisper-large-v3-turbo --output D:/models/whisper-large-v3-turbo-onnx-fp16
+python export_whisper.py --model openai/whisper-small --output models/whisper-small-onnx-fp16
+python export_whisper.py --model openai/whisper-medium --dtype fp32 --output models/whisper-medium-onnx-fp32
+python export_whisper.py --model openai/whisper-large-v3-turbo --output models/whisper-large-v3-turbo-onnx-fp16
 ```
 
 ### Precision and attention guidance
@@ -44,7 +42,7 @@ currently reliable in FP16.
 For FP16, try decomposed (unfused) attention has shown accuracy improvements:
 
 ```bash
-python export_whisper.py --model openai/whisper-small --dtype fp16 --attention math --output D:/models/whisper-small-onnx-fp16-math
+python export_whisper.py --model openai/whisper-small --dtype fp16 --attention math --output models/whisper-small-onnx-fp16-math
 ```
 
 `--attention math` avoids fused SDPA which has shown to improve accuracy on `small` and `base` substantially.
@@ -54,7 +52,7 @@ precision, attention mode, and TensorRT-RTX version you will ship.
 ## Verify
 
 ```bash
-python validate_whisper.py --model openai/whisper-small --onnx-dir D:/models/whisper-small-onnx-fp16 --audio audio.mp3 --truth transcript.txt --provider trt-rtx --dtype fp16
+python validate_whisper.py --model openai/whisper-small --onnx-dir models/whisper-small-onnx-fp16 --audio audio.mp3 --truth transcript.txt --provider trt-rtx --dtype fp16
 ```
 
 `validate_whisper.py` compares the ONNX
@@ -65,13 +63,47 @@ when its dependent DLLs are not on the loader path. Otherwise the installed pyth
 
 ## Build
 
-```powershell
-cmake --build out\build\windows-x64 --target din_asr_whisper_cli
+Replace `<build>` and `<build/bin>` with your build and executable directories.
+On Windows, append `.exe` to the CLI name.
+
+```text
+cmake --build <build> --config Release --target din_asr_whisper_cli
 ```
 
 ## Run
 
-```powershell
-out\build\windows-x64\bin\din_asr_whisper_cli.exe audio.mp3 --model-dir D:\models\whisper-small-onnx-fp16 --provider trt-rtx
-out\build\windows-x64\bin\din_asr_whisper_cli.exe audio.mp3 --model-dir D:\models\whisper-medium-onnx-fp32 --provider trt-rtx --lang-id en
+```text
+<build/bin>/din_asr_whisper_cli audio.mp3 --model-dir models/whisper-small-onnx-fp16 --provider trt-rtx
+<build/bin>/din_asr_whisper_cli audio.mp3 --model-dir models/whisper-medium-onnx-fp32 --provider trt-rtx --lang-id en
 ```
+
+### Long recordings
+
+```text
+<build/bin>/din_asr_whisper_cli audio.mp3 --model-dir models/whisper-large-v3-turbo-onnx-fp16 --timestamps json
+```
+
+The complete recording is transcribed automatically. Audio longer than 30 seconds
+uses timestamp-driven long-form windows, following upstream Whisper.
+`--no-context` disables previous-text conditioning.
+`--prefill-block-size` defaults to 128; 0 disables bucketing.
+
+Use `--repeat N` to benchmark repeated transcriptions in the same pipeline.
+
+## DGX Spark performance
+
+Measured on an NVIDIA DGX Spark (GB10) with `openai/whisper-large-v3-turbo` FP16,
+ONNX Runtime 1.27.0 and TensorRT RTX 1.6.1.120. Full recordings from the
+[ASR Leaderboard Longform dataset](https://huggingface.co/datasets/hf-audio/asr-leaderboard-longform),
+`earnings21` test split: SiTime (`4385072.wav`), Hershey (`4385939.wav`), and
+Yeti (`4385388.wav`). Throughput is × real time; higher is faster.
+
+| Recording | Audio | CPU EP | TRT RTX |
+| --- | ---: | ---: | ---: |
+| SiTime | 43 min | 3.9× | 60.0× |
+| Hershey | 51 min | 3.5× | 55.5× |
+| Yeti | 72 min | 3.9× | 60.0× |
+| **Overall** | **166 min** | **3.8×** | **58.5×** |
+
+TRT RTX averages warm runs 2–3; CPU uses one pass with default threading.
+Loading is excluded. Overall throughput is total audio / total inference time.

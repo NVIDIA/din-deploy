@@ -28,13 +28,13 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 
 ## Performance benchmarks
 
-Results measured on a DGX Spark using CPU EP vs TensorRT RTX EP. RTF is the audio real-time factor (higher is faster).
+Results measured on a DGX Spark using CPU EP vs TensorRT RTX EP. Audio throughput is shown as multiples of real time (higher is faster).
 
 | Model |         GPU | CPU |
 | --- |------------:| ---: |
-| `openai/whisper-large-v3-turbo` |  72.67x RTF | 6.75x RTF |
-| `nvidia/nemotron-3.5-asr-streaming-0.6b` |  39.01x RTF | 3.24x RTF |
-| `nvidia/parakeet-tdt-0.6b-v3` | 206.41x RTF | 14.44x RTF |
+| `openai/whisper-large-v3-turbo` | [58.5×](asr/whisper/README.md#dgx-spark-performance) | [3.8×](asr/whisper/README.md#dgx-spark-performance) |
+| `nvidia/nemotron-3.5-asr-streaming-0.6b` |  39.01× | 3.24× |
+| `nvidia/parakeet-tdt-0.6b-v3` | 206.41× | 14.44× |
 | `facebook/sam2.1-hiera-base-plus` |    38.3 FPS | 0.5 FPS |
 
 ### FLUX.2-klein-4B quantization
