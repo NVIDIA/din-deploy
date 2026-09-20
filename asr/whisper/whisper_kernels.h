@@ -38,9 +38,9 @@ void launch_whisper_inputs(cudaStream_t stream, int32_t token, bool update_token
 // Select a timestamp-filtered token and accumulate log probability in stats[0].
 // With probability_index >= 0, write its raw probability to stats[1] instead;
 // suppression/filter are ignored and token may be null.
-void launch_whisper_sample(cudaStream_t stream, const void* logits, bool fp16, int vocab,
-                           const uint8_t* suppressed, TimestampFilter filter, double* workspace,
-                           int32_t* token, double* stats, int probability_index = -1);
+void launch_whisper_sample(cudaStream_t stream, const void* logits, bool fp16, int vocab, const uint8_t* suppressed,
+                           TimestampFilter filter, double* workspace, int32_t* token, double* stats,
+                           int probability_index = -1);
 
 #endif
 

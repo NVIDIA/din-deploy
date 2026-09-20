@@ -83,15 +83,15 @@ struct ModelDims
 // present.
 struct SpecialTokens
 {
-    int64_t sot = 50258;           // <|startoftranscript|>
-    int64_t transcribe = 50359;    // <|transcribe|>
-    int64_t notimestamps = 50363;  // <|notimestamps|>
-    int64_t eot = 50257;           // <|endoftext|>
-    int64_t lang_first = 50259;    // <|en|>
-    int64_t lang_last = 50357;     // last language tag
-    int64_t start_of_prev = 50361; // <|startofprev|>
-    int64_t no_speech = 50362; // <|nospeech|>
-    int64_t timestamp_first = 50364; // <|0.00|>
+    int64_t sot = 50258;              // <|startoftranscript|>
+    int64_t transcribe = 50359;       // <|transcribe|>
+    int64_t notimestamps = 50363;     // <|notimestamps|>
+    int64_t eot = 50257;              // <|endoftext|>
+    int64_t lang_first = 50259;       // <|en|>
+    int64_t lang_last = 50357;        // last language tag
+    int64_t start_of_prev = 50361;    // <|startofprev|>
+    int64_t no_speech = 50362;        // <|nospeech|>
+    int64_t timestamp_first = 50364;  // <|0.00|>
 };
 
 struct WhisperConfig
@@ -134,7 +134,6 @@ private:
     // CPU path: out-of-place present->past, fresh bindings per step.
     std::vector<int64_t> DecodeChunkHost(int64_t& lang_token, const std::vector<int64_t>& prompt);
     void SetupDecodePath();  // allocates the persistent device decode buffers/binding
-    void WarmupDecoder();
     void PrefillHistoryBlock(std::span<const int32_t> tokens, int64_t position);
     void ZeroSelfKv();  // clears the persistent self-KV cache before a chunk
     // Greedy argmax over the last sequence position of logits[lower, upper).

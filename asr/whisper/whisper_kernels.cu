@@ -130,9 +130,9 @@ __global__ void FilterReduce(const T* logits, int vocab, const uint8_t* suppress
     if (i < vocab)
     {
         const bool ts = i >= f.timestamp_first;
-        const bool allowed = raw || (!(suppressed && suppressed[i]) &&
-                                     ((i < f.eot && f.text) || (i == f.eot && f.end) ||
-                                      (ts && i >= f.timestamp_min && i <= f.timestamp_max)));
+        const bool allowed =
+            raw || (!(suppressed && suppressed[i]) && ((i < f.eot && f.text) || (i == f.eot && f.end) ||
+                                                       (ts && i >= f.timestamp_min && i <= f.timestamp_max)));
         if (allowed)
         {
             const float score = ToFloat(logits[i]);
@@ -230,9 +230,9 @@ void launch_whisper_inputs(cudaStream_t stream, int32_t token, bool update_token
     SetInputs<<<1, 1, 0, stream>>>(token, update_token, position, input, index, nonpad);
 }
 
-void launch_whisper_sample(cudaStream_t stream, const void* logits, bool fp16, int vocab,
-                           const uint8_t* suppressed, TimestampFilter filter, double* workspace,
-                           int32_t* token, double* stats, int probability_index)
+void launch_whisper_sample(cudaStream_t stream, const void* logits, bool fp16, int vocab, const uint8_t* suppressed,
+                           TimestampFilter filter, double* workspace, int32_t* token, double* stats,
+                           int probability_index)
 {
     if (fp16)
         LaunchSelection(stream, static_cast<const __half*>(logits), vocab, suppressed, filter, probability_index,

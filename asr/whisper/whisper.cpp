@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "whisper.h"
-#include "whisper_kernels.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -22,6 +21,7 @@
 #include <vector>
 
 #include "nvtx_helper.h"
+#include "whisper_kernels.h"
 #include <nlohmann/json.hpp>
 
 #ifdef DIN_WHISPER_CUDA
@@ -84,8 +84,7 @@ struct TokenSelection
 // Match Whisper's ApplyTimestampRules: timestamps alternate with text, ending
 // times strictly increase, and aggregate timestamp probability competes with
 // the best text/EOT candidate. generated never includes the previous prompt.
-TokenSelection SelectTimestamp(std::vector<float> scores, TimestampFilter filter,
-                               std::span<const int64_t> suppressed)
+TokenSelection SelectTimestamp(std::vector<float> scores, TimestampFilter filter, std::span<const int64_t> suppressed)
 {
     const int eot = filter.eot, timestamp_first = filter.timestamp_first;
     if (eot < 0 || timestamp_first <= eot || timestamp_first >= static_cast<int64_t>(scores.size()))
@@ -440,7 +439,8 @@ WhisperPipeline::WhisperPipeline(WhisperConfig config)
 {
     DIN_NVTX_FUNC_RANGE();
     const fs::path model_dir = config_.model_dir;
-    if (config_.prefill_block_size != 0 && (config_.prefill_block_size < 2 || config_.prefill_block_size > kHistoryTokens))
+    if (config_.prefill_block_size != 0 &&
+        (config_.prefill_block_size < 2 || config_.prefill_block_size > kHistoryTokens))
         throw std::invalid_argument("prefill_block_size must be 0 or in [2, 220]");
     const auto vocab_path = model_dir / "vocab.json";
     if (!std::filesystem::exists(vocab_path))
@@ -556,10 +556,7 @@ WhisperPipeline::WhisperPipeline(WhisperConfig config)
 
     SetupEncodePath();
     if (use_device_io_)
-    {
         SetupDecodePath();
-        WarmupDecoder();
-    }
 }
 
 void WhisperPipeline::DetectModel()
@@ -733,48 +730,6 @@ void WhisperPipeline::SetupDecodePath()
     }
 }
 
-void WhisperPipeline::WarmupDecoder()
-{
-#ifdef DIN_WHISPER_CUDA
-    if (!device_is_cuda_)
-        return;
-    din::common::nvtx_scoped_range range{"decoder_warmup"};
-    auto stream = reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle());
-    ZeroSelfKv();
-    for (auto& kv : cross_kv_)
-    {
-        const size_t bytes = kv.GetTensorTypeAndShapeInfo().GetElementCount() * (dims_.io_fp16 ? 2 : 4);
-        CheckCudaStatus(cudaMemsetAsync(kv.GetTensorMutableRawData(), 0, bytes, stream));
-    }
-    Ort::RunOptions options;
-    options.SetSyncStream(compute_stream_);
-    // Exercise both shapes and the return to single-token generation before
-    // the first recording. Synchronous runs keep staging buffers safe to reuse.
-    const auto run = [&](bool history)
-    {
-        auto& ids = history ? *history_ids_ : *dec_input_ids_;
-        auto& indices = history ? *history_indices_ : *dec_write_idx_;
-        const int count = history ? config_.prefill_block_size : 1;
-        std::fill_n(ids.HostData(), count, static_cast<int32_t>(special_.sot));
-        for (int i = 0; i < count; ++i)
-            indices.HostData()[i] = i;
-        dec_nonpad_->HostData()[0] = count;
-        ids.CopyAsyncToDevice();
-        indices.CopyAsyncToDevice();
-        dec_nonpad_->CopyAsyncToDevice();
-        decoder_->session.Run(options, history ? *history_binding_ : *decoder_binding_);
-    };
-    run(false);
-    if (history_binding_)
-    {
-        run(true);
-        run(false);
-    }
-    ZeroSelfKv();
-    CheckCudaStatus(cudaStreamSynchronize(stream));
-#endif
-}
-
 void WhisperPipeline::ZeroSelfKv()
 {
     // Uninitialized FLOAT16 slots can be NaN, which would poison the masked
@@ -840,7 +795,7 @@ int32_t WhisperPipeline::SelectTimestampHost(const Ort::Value& logits, const std
 {
     din::common::nvtx_scoped_range range{"timestamp_selection"};
     const auto selected = SelectTimestamp(LastPositionLogits(logits),
-                                         MakeTimestampFilter(generated, special_, max_timestamp_), suppressed_tokens_);
+                                          MakeTimestampFilter(generated, special_, max_timestamp_), suppressed_tokens_);
     decoded_sum_logprob_ += static_cast<float>(selected.logprob);
     ++decoded_token_count_;
     return static_cast<int32_t>(selected.token);
@@ -853,12 +808,12 @@ void WhisperPipeline::SelectTimestampLogits(const Ort::Value& logits, const std:
     {
         const auto filter = MakeTimestampFilter(generated, special_, max_timestamp_);
         const void* ptr = dims_.io_fp16 ? static_cast<const void*>(logits.GetTensorData<Ort::Float16_t>())
-                                      : static_cast<const void*>(logits.GetTensorData<float>());
+                                        : static_cast<const void*>(logits.GetTensorData<float>());
         launch_whisper_sample(reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle()), ptr, dims_.io_fp16,
-                                 dims_.vocab, timestamp_suppressed_->BindingValue().GetTensorData<uint8_t>(), filter,
-                                 timestamp_workspace_->BindingValue().GetTensorMutableData<double>(),
-                                 dec_input_ids_->BindingValue().GetTensorMutableData<int32_t>(),
-                                 timestamp_stats_->BindingValue().GetTensorMutableData<double>());
+                              dims_.vocab, timestamp_suppressed_->BindingValue().GetTensorData<uint8_t>(), filter,
+                              timestamp_workspace_->BindingValue().GetTensorMutableData<double>(),
+                              dec_input_ids_->BindingValue().GetTensorMutableData<int32_t>(),
+                              timestamp_stats_->BindingValue().GetTensorMutableData<double>());
         CheckCudaStatus(cudaGetLastError());
         ++decoded_token_count_;
         token_ready_notification_ = dec_input_ids_->CopyAsyncToHostWithNotification();
@@ -988,10 +943,10 @@ std::vector<int64_t> WhisperPipeline::DecodeChunkDevice(int64_t& lang_token, con
             {
                 const void* ptr = dims_.io_fp16 ? static_cast<const void*>(dec_logits_.GetTensorData<Ort::Float16_t>())
                                                 : static_cast<const void*>(dec_logits_.GetTensorData<float>());
-                launch_whisper_sample(reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle()), ptr,
-                                      dims_.io_fp16, dims_.vocab, nullptr, {},
-                                      timestamp_workspace_->BindingValue().GetTensorMutableData<double>(), nullptr,
-                                      timestamp_stats_->BindingValue().GetTensorMutableData<double>(), special_.no_speech);
+                launch_whisper_sample(
+                    reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle()), ptr, dims_.io_fp16, dims_.vocab,
+                    nullptr, {}, timestamp_workspace_->BindingValue().GetTensorMutableData<double>(), nullptr,
+                    timestamp_stats_->BindingValue().GetTensorMutableData<double>(), special_.no_speech);
             }
             else
 #endif

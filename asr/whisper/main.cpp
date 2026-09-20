@@ -25,6 +25,10 @@ int main(int argc, char** argv)
             .default_value(128)
             .scan<'i', int>()
             .help("History bucket size for the shared decoder (default 128; 0 disables buckets).");
+        parser.add_argument("--repeat")
+            .default_value(1)
+            .scan<'i', int>()
+            .help("Transcribe the audio N times using the same pipeline; report each run separately.");
         parser.add_argument("audiofile").help("Audio file to transcribe.");
         parser.add_argument("--model-dir")
             .default_value(config.model_dir.string())
@@ -80,25 +84,34 @@ int main(int argc, char** argv)
         config.condition_on_previous_text = !parser.get<bool>("--no-context");
         config.prefill_block_size = parser.get<int>("--prefill-block-size");
 
+        const int repeat = parser.get<int>("--repeat");
+        if (repeat < 1)
+            throw std::runtime_error("--repeat must be at least 1");
+
         const auto provider = config.provider;
         const auto load_start = std::chrono::steady_clock::now();
         WhisperPipeline pipeline(std::move(config));
         const auto load_seconds = SecondsSince(load_start);
 
-        const auto result = pipeline.TranscribeFile(audio_file);
-        pipeline.Print(std::cout, result, options);
-
-        std::cout << "\nprovider: " << provider << '\n';
-        std::cout << "audio: " << result.audio_seconds << "s\n";
         std::cout << "load: " << load_seconds << "s\n";
-        std::cout << "transcribe: " << result.transcribe_seconds << "s\n";
-        std::cout << "encode: " << result.encode_seconds << "s\n";
-        std::cout << "greedy: " << result.greedy_seconds << "s\n";
-        if (result.model_window_seconds > 0.0)
+        for (int run = 0; run < repeat; ++run)
         {
-            std::cout << "model window audio: " << result.model_window_seconds << "s\n";
+            if (repeat > 1)
+                std::cout << "\nrun: " << run + 1 << '/' << repeat << '\n';
+            const auto result = pipeline.TranscribeFile(audio_file);
+            pipeline.Print(std::cout, result, options);
+
+            std::cout << "\nprovider: " << provider << '\n';
+            std::cout << "audio: " << result.audio_seconds << "s\n";
+            std::cout << "transcribe: " << result.transcribe_seconds << "s\n";
+            std::cout << "encode: " << result.encode_seconds << "s\n";
+            std::cout << "greedy: " << result.greedy_seconds << "s\n";
+            if (result.model_window_seconds > 0.0)
+            {
+                std::cout << "model window audio: " << result.model_window_seconds << "s\n";
+            }
+            std::cout << "speed: " << (result.audio_seconds / result.transcribe_seconds) << "x\n";
         }
-        std::cout << "speed: " << (result.audio_seconds / result.transcribe_seconds) << "x\n";
         std::cout << "total: " << SecondsSince(total_start) << "s\n";
     }
     catch (const std::exception& exception)

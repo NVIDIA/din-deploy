@@ -86,3 +86,7 @@ The complete recording is transcribed automatically. Audio longer than 30 second
 uses timestamp-driven long-form windows, following upstream Whisper.
 `--no-context` disables previous-text conditioning.
 `--prefill-block-size` defaults to 128; 0 disables bucketing.
+
+Use `--repeat N` to benchmark repeated transcriptions in the same pipeline.
+Each run is reported separately; the first includes first-use initialization costs.
+There is no automatic warm-up. Model load time is reported once.
