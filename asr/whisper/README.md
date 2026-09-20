@@ -90,3 +90,27 @@ uses timestamp-driven long-form windows, following upstream Whisper.
 Use `--repeat N` to benchmark repeated transcriptions in the same pipeline.
 Each run is reported separately; the first includes first-use initialization costs.
 There is no automatic warm-up. Model load time is reported once.
+
+## DGX Spark performance
+
+Measured on an NVIDIA DGX Spark (GB10) with `openai/whisper-large-v3-turbo` FP16,
+ONNX Runtime 1.27.0 and TensorRT RTX 1.6.1.120. Full recordings from the
+[ASR Leaderboard Longform dataset](https://huggingface.co/datasets/hf-audio/asr-leaderboard-longform),
+`earnings21` test split: SiTime (`4385072.wav`), Hershey (`4385939.wav`), and
+Yeti (`4385388.wav`).
+
+TRT RTX uses the mean of warm runs 2–3 from `--repeat 3`, with existing engine
+caches and prefill bucket size 128. CPU EP uses one pass (`--repeat 1`) with default
+threading; no warm CPU measurement was taken. Times exclude model loading and
+audio file I/O. RTF is inference time / audio duration (lower is faster);
+throughput is its reciprocal (higher is faster).
+
+| Recording | Audio (min) | CPU (s) | CPU RTF | CPU throughput | TRT RTX warm (s) | TRT RTX RTF | TRT RTX throughput |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SiTime | 42.67 | 662.90 | 0.25895 | 3.86× | 42.69 | 0.01667 | 59.97× |
+| Hershey | 50.83 | 871.98 | 0.28591 | 3.50× | 54.98 | 0.01803 | 55.47× |
+| Yeti | 72.43 | 1118.47 | 0.25735 | 3.89× | 72.49 | 0.01668 | 59.95× |
+
+Across all three clips: **CPU 3.75×**, **TRT RTX 58.51×** real time,
+computed as total audio duration divided by total inference time. CPU and GPU
+can produce different transcripts and token counts; these are end-to-end results.
