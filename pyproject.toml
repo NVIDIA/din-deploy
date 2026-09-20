@@ -31,7 +31,7 @@ dev = [
     "ruff",
 ]
 parakeet = [
-    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/Speech.git@v3.0.0",
     "jiwer",
     "librosa>=0.10.2",
     "numba>=0.59",
@@ -39,7 +39,7 @@ parakeet = [
     "soundfile",
 ]
 nemotron = [
-    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/Speech.git@v3.0.0",
     "librosa>=0.10.2",
     "numba>=0.59",
     "PyYAML",
@@ -47,11 +47,11 @@ nemotron = [
     "soundfile",
 ]
 nemotron-reference = [
-    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main",
+    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/Speech.git@v3.0.0",
 ]
 sam2 = [
     "av",
-    "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+    "sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
 ]
 quantization = [
     "nvidia-modelopt",
