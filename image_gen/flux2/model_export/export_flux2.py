@@ -33,13 +33,14 @@ import sys
 from pathlib import Path
 
 import torch
-from diffusers import Flux2KleinPipeline as FluxPipeline
 from huggingface_hub import snapshot_download
+from translator import add_translator_arguments, load_translator_encoder
 
 EXTERNAL_DATA_NAME = "model.onnx_data"
 DEFAULT_MODEL_NAME = "black-forest-labs/FLUX.2-klein-4b"
 DEFAULT_MODEL_OPSETS = {
     "text_encoder": 25,
+    "text_encoder_translator": 25,
     "transformer": 25,
     "vae_encoder": 22,
     "vae_decoder": 22,
@@ -315,6 +316,8 @@ def copy_scheduler_and_tokenizer(model_snapshot: Path, output_path: Path):
     for name in ("scheduler", "tokenizer"):
         src = model_snapshot / name
         dst = output_path / name
+        if src.resolve() == dst.resolve():
+            continue
         if src.exists():
             if dst.exists():
                 shutil.rmtree(dst)
@@ -428,7 +431,7 @@ def main():
         nargs="+",
         default=None,
         metavar="NAME",
-        help="Model(s) to export: one or more of all, text_encoder, transformer, vae_encoder, vae_decoder (default: all)",
+        help="Models to export: all, text_encoder, text_encoder_translator, transformer, vae_encoder, vae_decoder. Translator is opt-in.",
     )
     ap.add_argument(
         "--opset",
@@ -486,6 +489,7 @@ def main():
         default=[],
         help="Additional argument to pass to tensorrt_rtx. May be specified more than once.",
     )
+    add_translator_arguments(ap)
     args = ap.parse_args()
 
     model_snapshot = resolve_model_snapshot(args.model_name, args.local_files_only)
@@ -495,7 +499,7 @@ def main():
     seq_len    = 512  # static text sequence length for FLUX.2-klein
 
     # Parse --model: default all; otherwise one or more of all, text_encoder, transformer, …
-    model_choices = ["all"] + list(MODELS)
+    model_choices = ["all", "text_encoder_translator"] + list(MODELS)
     raw = args.model if args.model is not None else ["all"]
     to_export: list[str] = []
     for m in raw:
@@ -518,12 +522,26 @@ def main():
         f"Loading pipeline from {args.model_name} ({model_snapshot}) "
         f"(dtype={dtype}, image_size={image_size}, io_precision={args.io_precision})..."
     )
-    pipe = FluxPipeline.from_pretrained(str(model_snapshot), torch_dtype=dtype).to(device)
+    pipe = None
+    if any(name != "text_encoder_translator" for name in to_export):
+        from diffusers import Flux2KleinPipeline as FluxPipeline
+        pipe = FluxPipeline.from_pretrained(str(model_snapshot), torch_dtype=dtype).to(device)
 
     exported_model_paths: list[Path] = []
     for name in to_export:
         model_opset = args.opset if args.opset is not None else DEFAULT_MODEL_OPSETS[name]
         print(f"Exporting {name}...")
+        if name == "text_encoder_translator":
+            encoder = load_translator_encoder(args, device)
+            ids = torch.zeros((1, seq_len), dtype=torch.int64, device=device)
+            mask = torch.ones_like(ids)
+            path = model_output_path(output_path, name, args.transformer_precision)
+            _onnx_export(encoder, (ids, mask), path,
+                         ["input_ids", "attention_mask"], ["prompt_embeds"], model_opset)
+            exported_model_paths.append(path)
+            del encoder
+            torch.cuda.empty_cache()
+            continue
         fn = EXPORTERS[name]
         if name == "text_encoder":
             fn(pipe, output_path, device, model_opset,
@@ -539,7 +557,7 @@ def main():
             fn(pipe, output_path, device, model_opset, io_dtype=io_dtype)
         exported_model_paths.append(model_output_path(output_path, name, args.transformer_precision))
 
-    if export_all:
+    if export_all or "text_encoder_translator" in to_export:
         copy_scheduler_and_tokenizer(model_snapshot, output_path)
         write_model_index(output_path)
 
