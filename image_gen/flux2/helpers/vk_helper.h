@@ -812,15 +812,24 @@ private:
             fprintf(stdout, "%s\n", matches ? " [ORT match]" : "");
             if (matches)
             {
-                physicalDevice = devices[i];
+                if (matchCount == 0)
+                {
+                    physicalDevice = devices[i];
+                }
                 ++matchCount;
             }
         }
 
-        if (matchCount != 1)
+        if (matchCount == 0)
         {
-            throw std::runtime_error("Expected exactly one Vulkan physical device matching the ORT device identity; "
-                                     "found " + std::to_string(matchCount));
+            throw std::runtime_error("No Vulkan physical device matches the ORT device identity");
+        }
+        if (matchCount > 1)
+        {
+            fprintf(stderr,
+                    "Warning: Found %u Vulkan physical devices matching the ORT device identity; using the first "
+                    "match\n",
+                    matchCount);
         }
 
         // Get basic properties
