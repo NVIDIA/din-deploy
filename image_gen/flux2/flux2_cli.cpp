@@ -152,10 +152,10 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("cpu|trt-rtx")
         .help("Select the ONNX Runtime execution provider.");
     parser.add_argument("--model-dir")
-          .default_value(config.model_dir.string())
-          .nargs(1)
-          .metavar("PATH")
-          .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
+        .default_value(config.model_dir.string())
+        .nargs(1)
+        .metavar("PATH")
+        .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
     parser.add_argument("--precision")
           .default_value(config.precision)
           .nargs(1)
@@ -265,7 +265,7 @@ int main(int argc, char* argv[])
         {
             const unsigned int current_seed = config.seed + image_index;
             std::cout << "\n========== Image " << (image_index + 1) << "/" << config.num_images
-                << " (seed=" << current_seed << ") ==========" << std::endl;
+                      << " (seed=" << current_seed << ") ==========" << std::endl;
             const auto image_start = std::chrono::steady_clock::now();
             Flux2Image image = pipeline->GenerateImage(current_seed);
             const auto image_end = std::chrono::steady_clock::now();
