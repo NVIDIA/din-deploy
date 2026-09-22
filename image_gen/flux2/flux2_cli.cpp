@@ -147,10 +147,10 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("cpu|cuda|dx|dx-cig|vk|vk-cig")
         .help("Select the processing backend.");
     parser.add_argument("--provider")
-          .default_value(to_string(config.provider))
-          .nargs(1)
-          .metavar("cpu|trt-rtx")
-          .help("Select the ONNX Runtime execution provider.");
+        .default_value(to_string(config.provider))
+        .nargs(1)
+        .metavar("cpu|trt-rtx")
+        .help("Select the ONNX Runtime execution provider.");
     parser.add_argument("--model-dir")
           .default_value(config.model_dir.string())
           .nargs(1)
@@ -272,7 +272,7 @@ int main(int argc, char* argv[])
             save_image(make_output_path(config, image_index), image);
             const std::chrono::duration<double> image_duration = image_end - image_start;
             std::cout << "Image " << (image_index + 1) << " completed in " << image_duration.count() << " seconds"
-                << std::endl;
+                      << std::endl;
         }
 
         return EXIT_SUCCESS;
