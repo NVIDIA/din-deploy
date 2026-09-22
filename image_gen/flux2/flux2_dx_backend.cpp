@@ -29,7 +29,7 @@ public:
     OrtGraphicsInteropScope(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device,
                             ID3D12CommandQueue* command_queue)
         : interop_(interop)
-          , ep_device_(ep_device)
+        , ep_device_(ep_device)
     {
         OrtGraphicsInteropConfig config{};
         config.version = ORT_API_VERSION;
@@ -164,7 +164,7 @@ class OrtD3D12TensorImporter
 public:
     OrtD3D12TensorImporter(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device, ID3D12Device* device)
         : interop_(interop)
-          , device_(device)
+        , device_(device)
     {
         if (device_ == nullptr)
         {
@@ -342,7 +342,7 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
     constants.pi = static_cast<uint32_t>(PATCH_SIZE);
     constants.pj = static_cast<uint32_t>(PATCH_SIZE);
     constants.total_elements = static_cast<uint32_t>((LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-        (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
+                                                     (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
 
     postprocess_pipeline.dispatch(dx, hidden_states, decoder_latent, bn_mean, bn_std, constants);
     const uint64_t postprocess_done = sync_fence.signal_d3d12(dx.queue.Get());

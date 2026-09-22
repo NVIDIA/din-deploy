@@ -950,8 +950,8 @@ private:
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
         enableExternalComputeQueue = cigEnabled;
         if (enableExternalComputeQueue && (!checkDeviceExtensionSupport(VK_NV_EXTERNAL_COMPUTE_QUEUE_EXTENSION_NAME) ||
-            externalComputeQueueProperties.maxExternalQueues == 0 ||
-            externalComputeQueueProperties.externalDataSize == 0))
+                                           externalComputeQueueProperties.maxExternalQueues == 0 ||
+                                           externalComputeQueueProperties.externalDataSize == 0))
         {
             throw std::runtime_error("Vulkan CIG was requested but VK_NV_external_compute_queue is unavailable");
         }
@@ -980,7 +980,7 @@ private:
         deviceCreateInfo.ppEnabledExtensionNames = deviceExtensions.data();
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
         deviceCreateInfo.pNext = enableExternalComputeQueue ? static_cast<void*>(&externalComputeQueueInfo)
-                                     : static_cast<void*>(&vulkan12Features);
+                                                            : static_cast<void*>(&vulkan12Features);
 #else
         deviceCreateInfo.pNext = &vulkan12Features;
 #endif

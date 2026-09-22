@@ -142,10 +142,10 @@ Flux2Config parse_args(int argc, char* argv[])
     argparse::ArgumentParser parser("din_flux2");
     parser.add_description("Run Flux2 image generation with a selectable processing backend.");
     parser.add_argument("--processing")
-          .default_value(to_string(config.processing))
-          .nargs(1)
-          .metavar("cpu|cuda|dx|dx-cig|vk|vk-cig")
-          .help("Select the processing backend.");
+        .default_value(to_string(config.processing))
+        .nargs(1)
+        .metavar("cpu|cuda|dx|dx-cig|vk|vk-cig")
+        .help("Select the processing backend.");
     parser.add_argument("--provider")
           .default_value(to_string(config.provider))
           .nargs(1)

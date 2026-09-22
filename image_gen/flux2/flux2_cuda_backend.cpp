@@ -119,7 +119,7 @@ bool should_run_stage_on_cuda(SamplingBackend backend, bool cuda_available, std:
     if (backend == SamplingBackend::Cuda && !cuda_available)
     {
         throw std::runtime_error(std::string(stage_name) +
-            " CUDA sampling requested but bindings are not device-backed");
+                                 " CUDA sampling requested but bindings are not device-backed");
     }
     return cuda_available;
 }
@@ -295,8 +295,8 @@ public:
                 throw std::runtime_error("PostprocessStage CUDA path requires an ORT sync stream");
             }
             const size_t postprocess_count = static_cast<size_t>(LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-                static_cast<size_t>(LATENT_HEIGHT * PATCH_SIZE) *
-                static_cast<size_t>(LATENT_WIDTH * PATCH_SIZE);
+                                             static_cast<size_t>(LATENT_HEIGHT * PATCH_SIZE) *
+                                             static_cast<size_t>(LATENT_WIDTH * PATCH_SIZE);
             launch_flux_postprocess_kernel(
                 reinterpret_cast<cudaStream_t>(stream->GetHandle()),
                 hidden_states_->BindingValue().GetTensorMutableData<float>(),
@@ -503,7 +503,7 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
         cudaDeviceProp cuda_device_prop{};
         CUDA_CHECK(cudaGetDeviceProperties(&cuda_device_prop, cuda_device_ordinal));
         std::cout << "Using CUDA device ordinal " << cuda_device_ordinal << " (" << cuda_device_prop.name
-            << ") for ORT hardware device_id=" << ort_hardware_device_id << std::endl;
+                  << ") for ORT hardware device_id=" << ort_hardware_device_id << std::endl;
 
         state.compute_stream.emplace(din::common::CreateTensorRTRTXComputeStream(state.env));
     }
@@ -553,11 +553,11 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
 
     std::vector<int64_t> attn_mask_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
     state.attention_mask = std::make_unique<din::common::TensorBuffer<int64_t>>(*state.text_encoder_runner,
-        attn_mask_shape, has_separate_binding);
+                                                                                attn_mask_shape, has_separate_binding);
 
     std::vector<int64_t> te_out_shape = {BATCH_SIZE, SEQUENCE_LENGTH, TEXT_ENCODER_EMBED_DIM};
     state.text_encoder_embeds = std::make_unique<din::common::TensorBuffer<float>>(*state.text_encoder_runner,
-        te_out_shape, has_separate_binding);
+                                                                                   te_out_shape, has_separate_binding);
 
     std::vector<int64_t> timestep_shape = {BATCH_SIZE};
     state.timestep = std::make_unique<din::common::TensorBuffer<float>>(*state.transformer_runner, timestep_shape,
@@ -576,7 +576,7 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
                                                                          has_separate_binding);
 
     state.transformer_output = std::make_unique<din::common::TensorBuffer<float>>(*state.transformer_runner,
-        hidden_shape, has_separate_binding);
+                                                                                  hidden_shape, has_separate_binding);
 
     std::vector<int64_t> dec_latent_shape = {
         BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
@@ -704,7 +704,7 @@ class CudaFlux2ProcessingPipeline final : public Flux2ProcessingPipeline
 public:
     CudaFlux2ProcessingPipeline(Flux2Config config, Flux2RuntimeContext& runtime)
         : config_(std::move(config))
-          , runtime_(runtime)
+        , runtime_(runtime)
     {
     }
 
@@ -726,9 +726,9 @@ public:
         }
 
         std::cout << "Model dir: " << config_.model_dir.string() << "\n"
-            << "Execution provider: " << to_string(provider) << "\n"
-            << "Sampling backend: " << to_string(sampling_backend) << "\n"
-            << std::endl;
+                  << "Execution provider: " << to_string(provider) << "\n"
+                  << "Sampling backend: " << to_string(sampling_backend) << "\n"
+                  << std::endl;
 
         state_ = std::make_unique<CudaPipelineState>(runtime_.env);
         if (provider == ExecutionProviderMode::Cpu)

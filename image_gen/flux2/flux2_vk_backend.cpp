@@ -52,7 +52,7 @@ public:
     OrtVulkanGraphicsInteropScope(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device,
                                   const std::vector<uint8_t>& external_compute_queue_data)
         : interop_(interop)
-          , ep_device_(ep_device)
+        , ep_device_(ep_device)
     {
         if (external_compute_queue_data.empty())
         {
@@ -736,7 +736,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         state.cig_external_compute_queue_data = state.vk->createCudaGraphicsInteropData();
         state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(*state.interop_api, state.trt_device,
-            state.cig_external_compute_queue_data);
+                                                                                 state.cig_external_compute_queue_data);
     }
 
     // -----------------------------------------------------------------
