@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "flux2_cli.h"
 #include "tokenizer.h"
 
 // ============================================================================
@@ -43,7 +44,8 @@ struct Flux2ModelCachePaths
     std::string vae_decoder;
 };
 
-inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir, const std::string& precision)
+inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir, const std::string& precision,
+                                           Flux2TextEncoder encoder = Flux2TextEncoder::Qwen3_4B)
 {
     if (model_dir.empty())
     {
@@ -51,19 +53,21 @@ inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir, cons
     }
     return {
         model_dir,
-        model_dir / "text_encoder/model.onnx",
+        model_dir / (encoder == Flux2TextEncoder::Qwen3_4B ? "text_encoder" : "text_encoder_translator") / "model.onnx",
         model_dir / ("transformer_" + precision) / "model.onnx",
         model_dir / "vae_decoder/model.onnx",
         model_dir / "tokenizer",
     };
 }
 
-inline Flux2ModelCachePaths MakeFlux2ModelCachePaths(const std::string& precision, const std::string& prefix = {})
+inline Flux2ModelCachePaths MakeFlux2ModelCachePaths(const std::string& precision, const std::string& prefix = {},
+                                                     Flux2TextEncoder encoder = Flux2TextEncoder::Qwen3_4B,
+                                                     bool weight_streaming = false)
 {
     const std::string prefix_separator = prefix.empty() ? "" : prefix + "_";
     return {
-        prefix_separator + "text_encoder",
-        prefix_separator + "transformer_" + precision,
+        prefix_separator + (encoder == Flux2TextEncoder::Qwen3_4B ? "text_encoder" : "text_encoder_translator"),
+        prefix_separator + "transformer_" + precision + (weight_streaming ? "_ws" : ""),
         prefix_separator + "vae_decoder",
     };
 }
@@ -114,12 +118,36 @@ struct Flux2TextEncoderInputs
     int64_t pad_token_id = 0;
 };
 
+inline std::string FormatFlux2Prompt(const std::string& prompt)
+{
+    return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+}
+
+inline std::vector<float> MakeFlux2Schedule(int steps)
+{
+    if (steps < 1 || steps > 50)
+        throw std::invalid_argument("Denoise steps must be in [1, 50]");
+    constexpr double m200 = 0.00016927 * IMAGE_SEQUENCE + 0.45666666;
+    constexpr double m10 = 8.73809524e-05 * IMAGE_SEQUENCE + 1.89833333;
+    constexpr double a = (m200 - m10) / 190.0;
+    const double mu = a * steps + m200 - 200.0 * a;
+    const double e = std::exp(mu);
+    std::vector<float> schedule(steps + 1);
+    for (int i = 0; i < steps; ++i)
+    {
+        const double t = 1.0 - static_cast<double>(i) / steps;
+        schedule[i] = static_cast<float>(e / (e + 1.0 / t - 1.0));
+    }
+    schedule.back() = 0.0f;
+    return schedule;
+}
+
 inline Flux2TextEncoderInputs TokenizeFlux2Prompt(const Flux2ModelPaths& model_paths, const std::string& prompt)
 {
     din::io::Tokenizer tokenizer((model_paths.tokenizer_dir / "tokenizer.json").string(),
                                  din::io::TokenizerFormat::Json);
 
-    const std::string chat_text = "<|im_start|>user\n" + prompt + "<|im_end|>";
+    const std::string chat_text = FormatFlux2Prompt(prompt);
     Flux2TextEncoderInputs inputs;
     inputs.token_ids = tokenizer.Encode(chat_text, false);
     inputs.pad_token_id = tokenizer.TokenId("<|endoftext|>");

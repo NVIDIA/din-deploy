@@ -27,6 +27,7 @@
 
 #include "flux2.h"
 #include "flux2_runtime_context.h"
+#include "flux2_telemetry.h"
 #include "ort_session.h"
 #include "utils.h"
 #include "vk_helper.h"
@@ -438,17 +439,23 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
                       VkCommandBuffer cmd_postprocess, ComputePipelineResources& euler_shader,
                       ComputePipelineResources& postprocess_shader, VulkanBuffer& hidden_states_buf,
                       VulkanBuffer& transformer_output_buf, VulkanBuffer& decoder_latent_buf, StagingBuffer& staging,
-                      bool encode_prompt)
+                      bool encode_prompt, Flux2Telemetry& telemetry)
 {
     nvtx3::scoped_range nvtx_pipeline("run_pipeline");
+
+    Ort::RunOptions transformer_options;
+    transformer_options.SetSyncStream(ort_stream);
+    transformer_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
 
     Ort::RunOptions run_options;
     run_options.SetSyncStream(ort_stream);
     run_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
 
     // --- Text Encoder ---
+    const int steps = static_cast<int>(time_schedule.size()) - 1;
     if (encode_prompt)
     {
+        telemetry.Begin("encode", &Flux2Timings::encode_ms);
         nvtx3::scoped_range nvtx("text_encoder");
         text_encoder_session.Run(run_options, text_encoder_io);
     }
@@ -482,7 +489,8 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
         sync_semaphore.wait_ort(ort_stream, timestep_done);
     }
 
-    for (int step = 0; step < FLOW_STEPS; ++step)
+    telemetry.Begin("denoise", &Flux2Timings::denoise_ms);
+    for (int step = 0; step < steps; ++step)
     {
         nvtx3::scoped_range nvtx_step("diffusion_step_" + std::to_string(step));
 
@@ -491,7 +499,7 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
 
         {
             nvtx3::scoped_range nvtx_transformer("transformer");
-            transformer_session.Run(run_options, transformer_io);
+            transformer_session.Run(transformer_options, transformer_io);
         }
 
         {
@@ -527,7 +535,7 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
-            if (step + 1 < FLOW_STEPS)
+            if (step + 1 < steps)
             {
                 vkCmdUpdateBuffer(cmd_euler[step], timestep_buf.buffer, 0, sizeof(float), &t_next);
             }
@@ -538,8 +546,10 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
             const uint64_t euler_done = sync_semaphore.submit_vulkan(vk, cmd_euler[step], transformer_done);
             sync_semaphore.wait_ort(ort_stream, euler_done);
         }
+        telemetry.Step(step + 1);
     }
 
+    telemetry.Begin("decode", &Flux2Timings::decode_ms);
     // --- Post-process Latents (Vulkan compute) ---
     {
         nvtx3::scoped_range nvtx_post("postprocess");
@@ -685,8 +695,8 @@ struct VkPipelineState
     Ort::Value decoded_image_tensor{nullptr};
 
     VkCommandPool command_pool = VK_NULL_HANDLE;
-    std::array<VkCommandBuffer, FLOW_STEPS> cmd_bufs_euler{};
-    std::array<VkCommandBuffer, FLOW_STEPS> cmd_bufs_time{};
+    std::vector<VkCommandBuffer> cmd_bufs_euler{};
+    std::vector<VkCommandBuffer> cmd_bufs_time{};
     VkCommandBuffer cmd_upload_lat = VK_NULL_HANDLE;
     VkCommandBuffer cmd_download = VK_NULL_HANDLE;
     VkCommandBuffer cmd_postprocess = VK_NULL_HANDLE;
@@ -705,10 +715,11 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
-    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
     state.use_cig = config.processing == Flux2ProcessingBackend::VkCig;
     const Flux2ModelCachePaths cache_paths =
-        MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk");
+        MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk", config.text_encoder,
+                                 !config.weight_streaming_budget.empty());
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
               << "CIG:       " << (state.use_cig ? "enabled" : "disabled") << "\n"
@@ -736,7 +747,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         state.cig_external_compute_queue_data = state.vk->createCudaGraphicsInteropData();
         state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(*state.interop_api, state.trt_device,
-                                                                                 state.cig_external_compute_queue_data);
+            state.cig_external_compute_queue_data);
     }
 
     // -----------------------------------------------------------------
@@ -746,6 +757,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     auto nvtx_scope_load = nvtx3::start_range("load_onnx_models");
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config.ep_context_dir.string();
+    ep_context.enable_cache = true;
     const std::string cache_dir = config.ep_cache_dir.string();
     std::vector<std::pair<std::string, std::string>> graphics_ep_options;
     if (state.use_cig)
@@ -767,13 +779,15 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         // graphics_ep_options.emplace_back("nv_use_sync_gpu_allocator", "1");
     }
 
-    auto make_profile = [&](std::string cache_subpath)
+    auto make_profile = [&](std::string cache_subpath, bool transformer = false)
     {
         din::common::ModelProfile profile;
         profile.cache_subpath = std::move(cache_subpath);
         profile.embed_ep_context = false;
         profile.enable_cuda_graph = !state.use_cig;
         profile.extra_ep_options = graphics_ep_options;
+        if (transformer && !config.weight_streaming_budget.empty())
+            profile.extra_ep_options.emplace_back("nv_weight_streaming_budget", config.weight_streaming_budget);
         return profile;
     };
 
@@ -908,7 +922,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
 
     state.transformer_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.transformer), &*state.sync_stream);
+        make_profile(cache_paths.transformer, true), &*state.sync_stream);
     std::cout << "  Transformer loaded" << std::endl;
 
     state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
@@ -922,10 +936,12 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
 
     // Euler sampler
-    state.vk->device.allocateCommandBuffers(state.command_pool, FLOW_STEPS, state.cmd_bufs_euler.data());
+    state.cmd_bufs_euler.resize(config.steps);
+    state.cmd_bufs_time.resize(config.steps);
+    state.vk->device.allocateCommandBuffers(state.command_pool, config.steps, state.cmd_bufs_euler.data());
 
     // Time scheduler
-    state.vk->device.allocateCommandBuffers(state.command_pool, FLOW_STEPS, state.cmd_bufs_time.data());
+    state.vk->device.allocateCommandBuffers(state.command_pool, config.steps, state.cmd_bufs_time.data());
 
     VkCommandBuffer cmd_bufs[3];
     state.vk->device.allocateCommandBuffers(state.command_pool, 3, cmd_bufs);
@@ -1003,14 +1019,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
     // Time schedule (computed once, constant across images)
     // -----------------------------------------------------------------
-    constexpr double MU = 2.291179894115571;
-    state.time_schedule.resize(FLOW_STEPS + 1);
-    for (int i = 0; i <= FLOW_STEPS; ++i)
-    {
-        double t = T_START - (T_START - T_END) * static_cast<double>(i) / FLOW_STEPS;
-        state.time_schedule[i] = static_cast<float>(std::exp(MU) / (std::exp(MU) + std::pow(1.0 / t - 1.0, 1.0)));
-        std::cout << "  sigma[" << i << "] = " << state.time_schedule[i] << std::endl;
-    }
+    state.time_schedule = MakeFlux2Schedule(config.steps);
 
     // -----------------------------------------------------------------
     // Load prompt tokens & upload to GPU (once for all images)
@@ -1040,8 +1049,14 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     }
 }
 
-static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed)
+static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed, const Flux2Progress& progress)
 {
+    Flux2Telemetry telemetry(static_cast<int>(state.time_schedule.size()) - 1, progress,
+                             [&]
+                             {
+                                 signal_and_wait_on_host(*state.sync_stream);
+                                 VK_CHECK(vkQueueWaitIdle(state.vk->queue));
+                             });
     initialize_latent(static_cast<float*>(state.staging.mapped), state.hidden_count, seed);
 
     const uint64_t vae_done = run_pipeline(
@@ -1049,7 +1064,8 @@ static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed)
         *state.text_encoder_io, *state.transformer_io, *state.vae_decoder_io, state.time_schedule, state.timestep_buf,
         *state.vk, *state.sync_semaphore, *state.sync_stream, state.cmd_upload_lat, state.cmd_bufs_time.data(),
         state.cmd_bufs_euler.data(), state.cmd_postprocess, state.euler_shader, state.postprocess_shader,
-        state.hidden_states, state.transformer_output, state.decoder_latent, state.staging, !state.prompt_embeds_valid);
+        state.hidden_states, state.transformer_output, state.decoder_latent, state.staging, !state.prompt_embeds_valid,
+        telemetry);
     state.prompt_embeds_valid = true;
 
     vkResetCommandBuffer(state.cmd_download, 0);
@@ -1069,6 +1085,7 @@ static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed)
     image.width = static_cast<int>(IMAGE_WIDTH);
     image.data.resize(state.decoded_image_bytes / sizeof(float));
     std::copy_n(static_cast<const float*>(state.staging.mapped), image.data.size(), image.data.data());
+    image.timings = telemetry.Finish();
     return image;
 }
 
@@ -1094,6 +1111,8 @@ public:
 
     void SetPrompt(std::string prompt) override
     {
+        if (state_ && state_->prompt_embeds_valid && config_.prompt == prompt)
+            return;
         config_.prompt = std::move(prompt);
         if (!state_)
         {
@@ -1101,7 +1120,8 @@ public:
         }
         state_->prompt_embeds_valid = false;
 
-        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir, config_.precision);
+        const Flux2ModelPaths model_paths =
+            MakeFlux2ModelPaths(config_.model_dir, config_.precision, config_.text_encoder);
         const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config_.prompt);
         std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
         std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
@@ -1121,17 +1141,33 @@ public:
         state_->vk->endAndSubmitCommandBuffer(cmd, state_->command_pool);
     }
 
-    Flux2Image GenerateImage(unsigned int seed) override
+    const void* TransformerSessionIdentity() const override
+    {
+        return state_ ? static_cast<OrtSession*>(state_->transformer_runner->session) : nullptr;
+    }
+
+    Flux2Image GenerateImage(unsigned int seed, const Flux2Progress& progress,
+                             const Flux2GenerationOptions& options) override
     {
         if (!state_)
         {
             throw std::runtime_error("Flux2 Vulkan pipeline was not initialized");
         }
-        return run_vk_image(*state_, seed);
+        const std::string budget = options.weight_streaming_budget.value_or(config_.weight_streaming_budget);
+        const std::string& previous = applied_budget_ ? *applied_budget_ : config_.weight_streaming_budget;
+        if (budget != previous)
+        {
+            const char* keys[] = {"nv_weight_streaming_budget"};
+            const char* values[] = {budget.c_str()};
+            state_->transformer_runner->session.SetEpDynamicOptions(keys, values, 1);
+            applied_budget_ = budget;
+        }
+        return run_vk_image(*state_, seed, progress);
     }
 
 private:
     Flux2Config config_;
+    std::optional<std::string> applied_budget_;
     Flux2RuntimeContext& runtime_;
     std::unique_ptr<VkPipelineState> state_;
 };

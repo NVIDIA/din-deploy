@@ -487,7 +487,10 @@ void AppendTensorRTRTXEP(Ort::Env& env, Ort::SessionOptions& options, const std:
     const auto stem = fs::path(model_path).stem().string();
     const auto cache_path =
         (fs::path(cache_dir) / (profile.cache_subpath.empty() ? stem : profile.cache_subpath)).string();
-    ep_options.Add("nv_runtime_cache_path", cache_path.c_str());
+    if (ep_context.enable_cache)
+    {
+        ep_options.Add("nv_runtime_cache_path", cache_path.c_str());
+    }
     if (!profile.min_shapes.empty())
     {
         ep_options.Add("nv_profile_min_shapes", profile.min_shapes.c_str());
@@ -833,7 +836,7 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
             compute_stream = &owned_compute_stream_;
         }
 
-        if (!profile.skip_compile)
+        if (!profile.skip_compile && ep_context.enable_cache)
         {
             [[maybe_unused]] din::common::nvtx_scoped_range range{"load_or_compile_ep_context"};
             session_model_path = CompileEpContextModel(env, model_path, cache_dir, ep_context, profile);
