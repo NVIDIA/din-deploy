@@ -28,8 +28,7 @@ class OrtGraphicsInteropScope
 public:
     OrtGraphicsInteropScope(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device,
                             ID3D12CommandQueue* command_queue)
-        : interop_(interop)
-        , ep_device_(ep_device)
+        : interop_(interop), ep_device_(ep_device)
     {
         OrtGraphicsInteropConfig config{};
         config.version = ORT_API_VERSION;
@@ -163,8 +162,7 @@ class OrtD3D12TensorImporter
 {
 public:
     OrtD3D12TensorImporter(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device, ID3D12Device* device)
-        : interop_(interop)
-        , device_(device)
+        : interop_(interop), device_(device)
     {
         if (device_ == nullptr)
         {
@@ -342,7 +340,7 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
     constants.pi = static_cast<uint32_t>(PATCH_SIZE);
     constants.pj = static_cast<uint32_t>(PATCH_SIZE);
     constants.total_elements = static_cast<uint32_t>((LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-                                                     (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
+        (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
 
     postprocess_pipeline.dispatch(dx, hidden_states, decoder_latent, bn_mean, bn_std, constants);
     const uint64_t postprocess_done = sync_fence.signal_d3d12(dx.queue.Get());
@@ -357,7 +355,7 @@ struct DxPipelineState
 {
     DxPipelineState(Ort::Env& environment, uint64_t ort_luid)
         : dx(ort_luid)
-        , env(environment)
+          , env(environment)
     {
     }
 
@@ -454,8 +452,8 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx");
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
-              << "CIG:    " << (state.use_cig ? "enabled" : "disabled") << "\n"
-              << std::endl;
+        << "CIG:    " << (state.use_cig ? "enabled" : "disabled") << "\n"
+        << std::endl;
 
     std::cout << "\n=== Initializing D3D12 ===" << std::endl;
     state.trt_device = trt_device;
@@ -476,13 +474,13 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         if (!shared_memory_info.supports_simultaneous_graphics_compute)
         {
             throw std::runtime_error(std::string("DirectX CIG is not supported on CUDA device generation ") +
-                                     din::common::ToString(shared_memory_info.generation));
+                din::common::ToString(shared_memory_info.generation));
         }
         std::cout << "CUDA device ordinal " << shared_memory_info.cuda_device_ordinal << " compute capability "
-                  << shared_memory_info.compute_capability_major << "." << shared_memory_info.compute_capability_minor
-                  << " (" << din::common::ToString(shared_memory_info.generation) << ")"
-                  << " graphics interop shared memory limit: " << (shared_memory_info.max_shared_memory_bytes / 1024)
-                  << " KiB" << std::endl;
+            << shared_memory_info.compute_capability_major << "." << shared_memory_info.compute_capability_minor
+            << " (" << din::common::ToString(shared_memory_info.generation) << ")"
+            << " graphics interop shared memory limit: " << (shared_memory_info.max_shared_memory_bytes / 1024)
+            << " KiB" << std::endl;
         graphics_ep_options.emplace_back("nv_max_shared_mem_size",
                                          std::to_string(shared_memory_info.max_shared_memory_bytes));
         graphics_ep_options.emplace_back("nv_length_aux_stream_array", "0");
@@ -522,8 +520,10 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     std::vector<int64_t> hidden_shape = {BATCH_SIZE, TRANSFORMER_HIDDEN_DIM, LATENT_CHANNELS};
     std::vector<int64_t> img_ids_shape = {BATCH_SIZE, IMAGE_SEQUENCE, 4};
     std::vector<int64_t> txt_ids_shape = {BATCH_SIZE, SEQUENCE_LENGTH, 4};
-    std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
+    std::vector<int64_t> dec_latent_shape = {
+        BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
+        LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE
+    };
     std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH};
 
     state.token_buf = state.dx.create_shared_default_buffer(shape_numel(token_shape) * sizeof(int64_t));
@@ -692,7 +692,7 @@ class DxFlux2ProcessingPipeline final : public Flux2ProcessingPipeline
 public:
     DxFlux2ProcessingPipeline(Flux2Config config, Flux2RuntimeContext& runtime)
         : config_(std::move(config))
-        , runtime_(runtime)
+          , runtime_(runtime)
     {
     }
 

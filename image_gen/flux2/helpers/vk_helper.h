@@ -170,6 +170,7 @@ struct VkHelper
 #endif
 
         Device() = default;
+
         ~Device()
         {
             shutdown();
@@ -193,10 +194,12 @@ struct VkHelper
         {
             return handle_;
         }
+
         operator VkDevice() const
         {
             return handle_;
         }
+
         bool valid() const
         {
             return handle_ != VK_NULL_HANDLE;
@@ -277,7 +280,8 @@ struct VkHelper
     VkPhysicalDeviceMemoryProperties memoryProperties{};
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
     VkPhysicalDeviceExternalComputeQueuePropertiesNV externalComputeQueueProperties{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_COMPUTE_QUEUE_PROPERTIES_NV};
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_COMPUTE_QUEUE_PROPERTIES_NV
+    };
 #endif
     uint8_t deviceUUID[VK_UUID_SIZE]{};
     CUdevice cudaDevice = -1;
@@ -502,7 +506,7 @@ private:
         }
 
         fprintf(stderr, "Vulkan %s %s: %s\n", severity, type, pCallbackData->pMessage);
-        return VK_FALSE;  // Don't abort on validation errors
+        return VK_FALSE; // Don't abort on validation errors
     }
 #endif
 
@@ -631,10 +635,10 @@ private:
                 VK_VERSION_MINOR(supportedVersion), VK_VERSION_PATCH(supportedVersion));
 
         // Use the highest version supported, but at least 1.1 for external memory
-        uint32_t requestedVersion = VK_API_VERSION_1_1;  // Minimum for CUDA interop
+        uint32_t requestedVersion = VK_API_VERSION_1_1; // Minimum for CUDA interop
         if (supportedVersion >= VK_API_VERSION_1_2)
         {
-            requestedVersion = VK_API_VERSION_1_2;  // Preferred: timeline semaphores in core
+            requestedVersion = VK_API_VERSION_1_2; // Preferred: timeline semaphores in core
         }
         requestedVersion = VK_API_VERSION_1_4;
 
@@ -672,11 +676,16 @@ private:
             {layer_name, "validate_sync", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_validate_sync},
             {layer_name, "thread_safety", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_thread_safety},
             {layer_name, "debug_action", VK_LAYER_SETTING_TYPE_STRING_EXT, 1, setting_debug_action},
-            {layer_name, "report_flags", VK_LAYER_SETTING_TYPE_STRING_EXT,
-             static_cast<uint32_t>(std::size(setting_report_flags)), setting_report_flags},
+            {
+                layer_name, "report_flags", VK_LAYER_SETTING_TYPE_STRING_EXT,
+                static_cast<uint32_t>(std::size(setting_report_flags)), setting_report_flags
+            },
             {layer_name, "enable_message_limit", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_enable_message_limit},
-            {layer_name, "duplicate_message_limit", VK_LAYER_SETTING_TYPE_INT32_EXT, 1,
-             &setting_duplicate_message_limit}};
+            {
+                layer_name, "duplicate_message_limit", VK_LAYER_SETTING_TYPE_INT32_EXT, 1,
+                &setting_duplicate_message_limit
+            }
+        };
 
         VkLayerSettingsCreateInfoEXT layer_settings_create_info = {};
         layer_settings_create_info.sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
@@ -710,7 +719,7 @@ private:
 
         VkInstanceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        createInfo.pNext = instancePNext;  // Safely links settings or remains nullptr
+        createInfo.pNext = instancePNext; // Safely links settings or remains nullptr
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
         createInfo.ppEnabledExtensionNames = instanceExtensions.data();
@@ -728,8 +737,8 @@ private:
             debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
             debugCreateInfo.messageSeverity = debugSeverity;
             debugCreateInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                                          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                                          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+                VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
             debugCreateInfo.pfnUserCallback = debugCallback;
             debugCreateInfo.pUserData = nullptr;
 
@@ -797,7 +806,7 @@ private:
 #endif
             const bool matches = props2.properties.vendorID == vendorId && props2.properties.deviceID == deviceId
 #ifdef _WIN32
-                                 && idProps.deviceLUIDValid && deviceLuid == luid
+                    && idProps.deviceLUIDValid && deviceLuid == luid
 #endif
                 ;
             fprintf(stdout, "  [%u] %s (%s), vendor=0x%04X device=0x%04X",
@@ -912,7 +921,8 @@ private:
                 CU_CHECK(cuDeviceGetAttribute(&supportsVulkanCig, CU_DEVICE_ATTRIBUTE_VULKAN_CIG_SUPPORTED, candidate));
                 if (cigEnabled && supportsVulkanCig == 0)
                 {
-                    throw std::runtime_error("Vulkan CIG was requested but the matched CUDA device does not support it");
+                    throw std::runtime_error(
+                        "Vulkan CIG was requested but the matched CUDA device does not support it");
                 }
 
                 cudaDevice = candidate;
@@ -943,7 +953,8 @@ private:
         enableExternalComputeQueue = cigEnabled;
         if (enableExternalComputeQueue &&
             (!checkDeviceExtensionSupport(VK_NV_EXTERNAL_COMPUTE_QUEUE_EXTENSION_NAME) ||
-             externalComputeQueueProperties.maxExternalQueues == 0 || externalComputeQueueProperties.externalDataSize == 0))
+                externalComputeQueueProperties.maxExternalQueues == 0 || externalComputeQueueProperties.externalDataSize
+                == 0))
         {
             throw std::runtime_error("Vulkan CIG was requested but VK_NV_external_compute_queue is unavailable");
         }
@@ -971,8 +982,9 @@ private:
         deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
         deviceCreateInfo.ppEnabledExtensionNames = deviceExtensions.data();
 #if DIN_HAS_VK_NV_EXTERNAL_COMPUTE_QUEUE
-        deviceCreateInfo.pNext = enableExternalComputeQueue ? static_cast<void*>(&externalComputeQueueInfo)
-                                                            : static_cast<void*>(&vulkan12Features);
+        deviceCreateInfo.pNext = enableExternalComputeQueue
+                                     ? static_cast<void*>(&externalComputeQueueInfo)
+                                     : static_cast<void*>(&vulkan12Features);
 #else
         deviceCreateInfo.pNext = &vulkan12Features;
 #endif
@@ -1109,7 +1121,7 @@ inline ImportedExternalVKMemory importExternalVKMemory(const VkHelper::Device& d
     void* cudaPtr = nullptr;
     CUDA_CHECK(cudaExternalMemoryGetMappedBuffer(&cudaPtr, externalMem, &bufferDesc));
     std::cout << "Imported Vulkan buffer into CUDA (size=" << bufferSize << " bytes, CUDA ptr=" << cudaPtr << ")"
-              << std::endl;
+        << std::endl;
     return {externalMem, cudaPtr, bufferSize};
 }
 
@@ -1804,7 +1816,8 @@ inline ComputePipelineResources loadEulerShader(const std::string& shader_path, 
 
     VkDescriptorSetLayoutBinding bindings_euler[2] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
 
     VkDescriptorSetLayoutCreateInfo layout_euler_info = {};
     layout_euler_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -1845,7 +1858,7 @@ inline ComputePipelineResources loadEulerShader(const std::string& shader_path, 
     compute_pipeline_euler_info.layout = resources.pipelineLayout;
 
     VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_euler_info, nullptr,
-                                      &resources.pipeline));
+        &resources.pipeline));
     std::cout << "Euler compute pipeline created" << std::endl;
 
     vkDestroyShaderModule(vk.device, euler_shader_module, nullptr);
@@ -1876,8 +1889,10 @@ inline ComputePipelineResources loadEulerShader(const std::string& shader_path, 
     // ============================================================================
     // UPDATE DESCRIPTOR SETS WITH ACTUAL BUFFERS
     // ============================================================================
-    VkDescriptorBufferInfo buffer_infos[2] = {{hidden_states.buffer, 0, hidden_states.size},
-                                              {transformer_output.buffer, 0, transformer_output.size}};
+    VkDescriptorBufferInfo buffer_infos[2] = {
+        {hidden_states.buffer, 0, hidden_states.size},
+        {transformer_output.buffer, 0, transformer_output.size}
+    };
 
     VkWriteDescriptorSet write_desc_euler[2];
     for (int i = 0; i < 2; i++)
