@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -23,7 +24,8 @@ unsigned int parse_uint(const std::string& value, const char* flag_name)
 {
     size_t parsed_chars = 0;
     const unsigned long parsed = std::stoul(value, &parsed_chars, 10);
-    if (parsed_chars != value.size())
+    if (value.empty() || value.front() == '-' || parsed_chars != value.size() ||
+        parsed > std::numeric_limits<unsigned int>::max())
     {
         throw std::invalid_argument(std::string(flag_name) + " must be an unsigned integer");
     }
@@ -118,11 +120,11 @@ std::string parse_precision(std::string value)
     {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    if (value == "bf16" || value == "fp8" || value == "nvfp4")
+    if (value == "bf16" || value == "fp16" || value == "fp8" || value == "nvfp4")
     {
         return value;
     }
-    throw std::invalid_argument("Precision must be one of: bf16, fp8, nvfp4");
+    throw std::invalid_argument("Precision must be one of: bf16, fp16, fp8, nvfp4");
 }
 
 void validate_config(const Flux2Config& config)
@@ -159,7 +161,7 @@ Flux2Config parse_args(int argc, char* argv[])
     parser.add_argument("--precision")
         .default_value(config.precision)
         .nargs(1)
-        .metavar("bf16|fp8|nvfp4")
+        .metavar("bf16|fp16|fp8|nvfp4")
         .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
         .default_value(config.ep_cache_dir.string())
@@ -182,6 +184,11 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("TEXT")
         .help("Prompt text to encode with the Flux2 tokenizer.");
     parser.add_argument("--seed").default_value(std::to_string(config.seed)).nargs(1).metavar("N").help("Random seed.");
+    parser.add_argument("--encoder").default_value(std::string("4b")).help("4b or translator.");
+    parser.add_argument("--steps").default_value(std::string("4")).help("Denoise steps, 1 through 50.");
+    parser.add_argument("--ws")
+          .default_value(std::string("off"))
+          .help("Transformer resident budget: off or 0% through 100%.");
     parser.add_argument("--num-images")
         .default_value(std::to_string(config.num_images))
         .nargs(1)
@@ -206,12 +213,24 @@ Flux2Config parse_args(int argc, char* argv[])
     config.ep_context_dir = parser.get<std::string>("--ep-context-dir");
     config.prompt = parser.get<std::string>("--prompt");
     config.seed = parse_uint(parser.get<std::string>("--seed"), "--seed");
+    const auto encoder = parser.get<std::string>("--encoder");
+    if (encoder != "4b" && encoder != "translator")
+        throw std::invalid_argument("--encoder must be 4b or translator");
+    config.text_encoder = encoder == "4b" ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+    const auto steps = parse_uint(parser.get<std::string>("--steps"), "--steps");
+    if (steps < 1 || steps > 50)
+        throw std::invalid_argument("--steps must be 1 through 50");
+    config.steps = static_cast<int>(steps);
+    config.weight_streaming_budget = parser.get<std::string>("--ws");
+    if (config.weight_streaming_budget == "off")
+        config.weight_streaming_budget.clear();
     config.num_images = parse_uint(parser.get<std::string>("--num-images"), "--num-images");
 
     const std::filesystem::path output_dir = parser.get<std::string>("--output");
     std::filesystem::create_directories(output_dir);
     config.output_path = output_dir / "flux2.png";
     validate_config(config);
+    ValidateFlux2Config(config);
 
     return config;
 }
@@ -268,6 +287,10 @@ int main(int argc, char* argv[])
                       << " (seed=" << current_seed << ") ==========" << std::endl;
             const auto image_start = std::chrono::steady_clock::now();
             Flux2Image image = pipeline->GenerateImage(current_seed);
+            const auto& times = image.timings;
+            std::cout << "Timings (ms): encode=" << times.encode_ms << " rng=" << times.rng_ms
+                << " denoise=" << times.denoise_ms << " decode=" << times.decode_ms << " total=" << times.total_ms
+                << std::endl;
             const auto image_end = std::chrono::steady_clock::now();
             save_image(make_output_path(config, image_index), image);
             const std::chrono::duration<double> image_duration = image_end - image_start;

@@ -19,6 +19,7 @@
 #include "dx_helper.h"
 #include "flux2.h"
 #include "flux2_runtime_context.h"
+#include "flux2_telemetry.h"
 #include "ort_session.h"
 #include "utils.h"
 #include <onnxruntime_cxx_api.h>
@@ -289,13 +290,18 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
                             DxPostprocessPipeline& postprocess_pipeline, OrtD3D12Fence& sync_fence,
                             Ort::SyncStream& ort_stream, DxBuffer& timestep_buf, DxBuffer& hidden_states,
                             DxBuffer& transformer_output, DxBuffer& decoder_latent, DxBuffer& bn_mean, DxBuffer& bn_std,
-                            bool encode_prompt)
+                            bool encode_prompt, Flux2Telemetry& telemetry)
 {
+    Ort::RunOptions transformer_options;
+    transformer_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
+
     Ort::RunOptions run_options;
     run_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
 
+    const int steps = static_cast<int>(time_schedule.size()) - 1;
     if (encode_prompt)
     {
+        telemetry.Begin("encode", &Flux2Timings::encode_ms);
         text_encoder_session.Run(run_options, text_encoder_io);
     }
 
@@ -305,12 +311,13 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
     const uint64_t initial_timestep_uploaded = sync_fence.signal_d3d12(dx.queue.Get());
     sync_fence.wait_ort(ort_stream, initial_timestep_uploaded);
 
-    for (int step = 0; step < FLOW_STEPS; ++step)
+    telemetry.Begin("denoise", &Flux2Timings::denoise_ms);
+    for (int step = 0; step < steps; ++step)
     {
         const float t_curr = time_schedule[step];
         const float t_next = time_schedule[step + 1];
 
-        transformer_session.Run(run_options, transformer_io);
+        transformer_session.Run(transformer_options, transformer_io);
 
         const uint64_t transformer_done = sync_fence.signal_ort(ort_stream);
         sync_fence.wait_d3d12(dx.queue.Get(), transformer_done);
@@ -322,19 +329,21 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
 
         dx.begin();
         euler_pipeline.record(dx, hidden_states, transformer_output, euler);
-        if (step + 1 < FLOW_STEPS)
+        if (step + 1 < steps)
         {
             dx.record_upload(timestep_buf, &t_next, sizeof(float));
         }
         dx.execute();
 
         const uint64_t d3d_done = sync_fence.signal_d3d12(dx.queue.Get());
-        if (step + 1 < FLOW_STEPS)
+        if (step + 1 < steps)
         {
             sync_fence.wait_ort(ort_stream, d3d_done);
         }
+        telemetry.Step(step + 1);
     }
 
+    telemetry.Begin("decode", &Flux2Timings::decode_ms);
     DxPostprocessConstants constants{};
     constants.C = static_cast<uint32_t>(LATENT_CHANNELS);
     constants.I = static_cast<uint32_t>(LATENT_HEIGHT);
@@ -449,9 +458,10 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     {
         throw std::runtime_error("DirectX processing requires --provider trt-rtx");
     }
-    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
     const Flux2ModelCachePaths cache_paths =
-        MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx");
+        MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx", config.text_encoder,
+                                 !config.weight_streaming_budget.empty());
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
               << "CIG:    " << (state.use_cig ? "enabled" : "disabled") << "\n"
@@ -491,14 +501,17 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     std::cout << "=== Loading ONNX Models ===" << std::endl;
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config.ep_context_dir.string();
+    ep_context.enable_cache = true;
     const std::string cache_dir = config.ep_cache_dir.string();
-    auto make_profile = [&](std::string cache_subpath)
+    auto make_profile = [&](std::string cache_subpath, bool transformer = false)
     {
         din::common::ModelProfile profile;
         profile.cache_subpath = std::move(cache_subpath);
         profile.enable_cuda_graph = state.use_cig ? false : true;
         profile.embed_ep_context = false;
         profile.extra_ep_options = graphics_ep_options;
+        if (transformer && !config.weight_streaming_budget.empty())
+            profile.extra_ep_options.emplace_back("nv_weight_streaming_budget", config.weight_streaming_budget);
         return profile;
     };
 
@@ -507,7 +520,7 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         make_profile(cache_paths.text_encoder), &*state.sync_stream);
     state.transformer_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.transformer), &*state.sync_stream);
+        make_profile(cache_paths.transformer, true), &*state.sync_stream);
     state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
         make_profile(cache_paths.vae_decoder), &*state.sync_stream);
@@ -627,14 +640,7 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         state.dx.record_upload(state.txt_ids_buf, txt_ids_cpu.data(), state.txt_ids_buf.size);
     }
 
-    constexpr double MU = 2.291179894115571;
-    state.time_schedule.resize(FLOW_STEPS + 1);
-    for (int i = 0; i <= FLOW_STEPS; ++i)
-    {
-        double t = T_START - (T_START - T_END) * static_cast<double>(i) / FLOW_STEPS;
-        state.time_schedule[i] = static_cast<float>(std::exp(MU) / (std::exp(MU) + std::pow(1.0 / t - 1.0, 1.0)));
-        std::cout << "  sigma[" << i << "] = " << state.time_schedule[i] << std::endl;
-    }
+    state.time_schedule = MakeFlux2Schedule(config.steps);
 
     std::cout << "\n=== Tokenizing Prompt ===" << std::endl;
     {
@@ -653,8 +659,15 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     state.sync_fence->wait_ort(*state.sync_stream, static_uploads_done);
 }
 
-static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed)
+static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed, const Flux2Progress& progress)
 {
+    Flux2Telemetry telemetry(static_cast<int>(state.time_schedule.size()) - 1, progress,
+                             [&]
+                             {
+                                 const auto completed = state.sync_fence->signal_d3d12(state.dx.queue.Get());
+                                 state.sync_fence->wait_ort(*state.sync_stream, completed);
+                                 signal_and_wait_on_host(*state.sync_stream);
+                             });
     std::vector<float> latent_cpu(state.hidden_count);
     initialize_latent(latent_cpu.data(), latent_cpu.size(), seed);
     state.dx.begin();
@@ -668,7 +681,7 @@ static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed)
                     *state.vae_decoder_io, state.time_schedule, state.dx, *state.euler_pipeline,
                     *state.postprocess_pipeline, *state.sync_fence, *state.sync_stream, state.timestep_buf,
                     state.hidden_states, state.transformer_output, state.decoder_latent, state.bn_mean_buf,
-                    state.bn_std_buf, !state.prompt_embeds_valid);
+                    state.bn_std_buf, !state.prompt_embeds_valid, telemetry);
     state.prompt_embeds_valid = true;
 
     state.dx.readback(state.decoded_image_buf, state.readback_buffer, state.decoded_image_bytes);
@@ -681,6 +694,7 @@ static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed)
     std::copy_n(image_data, image.data.size(), image.data.data());
     state.dx.unmap(state.readback_buffer);
 
+    image.timings = telemetry.Finish();
     return image;
 }
 
@@ -707,6 +721,8 @@ public:
 
     void SetPrompt(std::string prompt) override
     {
+        if (state_ && state_->prompt_embeds_valid && config_.prompt == prompt)
+            return;
         config_.prompt = std::move(prompt);
         if (!state_)
         {
@@ -714,7 +730,8 @@ public:
         }
         state_->prompt_embeds_valid = false;
 
-        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir, config_.precision);
+        const Flux2ModelPaths model_paths =
+            MakeFlux2ModelPaths(config_.model_dir, config_.precision, config_.text_encoder);
         const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config_.prompt);
         std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
         std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
@@ -729,17 +746,33 @@ public:
         state_->sync_fence->wait_ort(*state_->sync_stream, prompt_uploaded);
     }
 
-    Flux2Image GenerateImage(unsigned int seed) override
+    const void* TransformerSessionIdentity() const override
+    {
+        return state_ ? static_cast<OrtSession*>(state_->transformer_runner->session) : nullptr;
+    }
+
+    Flux2Image GenerateImage(unsigned int seed, const Flux2Progress& progress,
+                             const Flux2GenerationOptions& options) override
     {
         if (!state_)
         {
             throw std::runtime_error("Flux2 DirectX pipeline was not initialized");
         }
-        return run_dx_image(*state_, seed);
+        const std::string budget = options.weight_streaming_budget.value_or(config_.weight_streaming_budget);
+        const std::string& previous = applied_budget_ ? *applied_budget_ : config_.weight_streaming_budget;
+        if (budget != previous)
+        {
+            const char* keys[] = {"nv_weight_streaming_budget"};
+            const char* values[] = {budget.c_str()};
+            state_->transformer_runner->session.SetEpDynamicOptions(keys, values, 1);
+            applied_budget_ = budget;
+        }
+        return run_dx_image(*state_, seed, progress);
     }
 
 private:
     Flux2Config config_;
+    std::optional<std::string> applied_budget_;
     Flux2RuntimeContext& runtime_;
     std::unique_ptr<DxPipelineState> state_;
 };
