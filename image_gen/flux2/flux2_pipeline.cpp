@@ -8,22 +8,22 @@
 
 namespace
 {
-    Flux2RuntimeContext& GetProcessRuntime(Flux2ExecutionProvider provider)
-    {
-        static Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "Flux2"};
-        static Flux2RuntimeContext runtime{env};
-        static std::once_flag register_trt_once;
+Flux2RuntimeContext& GetProcessRuntime(Flux2ExecutionProvider provider)
+{
+    static Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "Flux2"};
+    static Flux2RuntimeContext runtime{env};
+    static std::once_flag register_trt_once;
 
-        if (provider == Flux2ExecutionProvider::TrtRtx)
-        {
-            std::call_once(register_trt_once,
-                           []
-                           {
-                               runtime.trt_device = din::common::RegisterTensorRTRTXProvider(runtime.env);
-                           });
-        }
-        return runtime;
+    if (provider == Flux2ExecutionProvider::TrtRtx)
+    {
+        std::call_once(register_trt_once,
+                       []
+                       {
+                           runtime.trt_device = din::common::RegisterTensorRTRTXProvider(runtime.env);
+                       });
     }
+    return runtime;
+}
 } // namespace
 
 std::unique_ptr<Flux2ProcessingPipeline> CreateFlux2Pipeline(const Flux2Config& config)

@@ -66,8 +66,7 @@ public:
 
         using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
         using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
-        auto create_factory =
-            reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+        auto create_factory = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
         if (create_factory == nullptr)
         {
             throw std::runtime_error("CreateDXGIFactory1 is not available");
@@ -115,8 +114,8 @@ public:
                      static_cast<unsigned long long>(ort_luid), matching_adapters);
             throw std::runtime_error(msg);
         }
-        printf("ORT LUID: 0x%016llX; selected DXGI LUID: 0x%016llX\n",
-               static_cast<unsigned long long>(ort_luid), static_cast<unsigned long long>(ort_luid));
+        printf("ORT LUID: 0x%016llX; selected DXGI LUID: 0x%016llX\n", static_cast<unsigned long long>(ort_luid),
+               static_cast<unsigned long long>(ort_luid));
 
         dx_check(create_device(selected_adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
                  "D3D12CreateDevice");

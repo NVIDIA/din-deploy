@@ -28,7 +28,8 @@ class OrtGraphicsInteropScope
 public:
     OrtGraphicsInteropScope(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device,
                             ID3D12CommandQueue* command_queue)
-        : interop_(interop), ep_device_(ep_device)
+        : interop_(interop)
+          , ep_device_(ep_device)
     {
         OrtGraphicsInteropConfig config{};
         config.version = ORT_API_VERSION;
@@ -162,7 +163,8 @@ class OrtD3D12TensorImporter
 {
 public:
     OrtD3D12TensorImporter(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device, ID3D12Device* device)
-        : interop_(interop), device_(device)
+        : interop_(interop)
+          , device_(device)
     {
         if (device_ == nullptr)
         {
@@ -355,7 +357,7 @@ struct DxPipelineState
 {
     DxPipelineState(Ort::Env& environment, uint64_t ort_luid)
         : dx(ort_luid)
-          , env(environment)
+        , env(environment)
     {
     }
 
@@ -452,8 +454,8 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx");
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
-        << "CIG:    " << (state.use_cig ? "enabled" : "disabled") << "\n"
-        << std::endl;
+              << "CIG:    " << (state.use_cig ? "enabled" : "disabled") << "\n"
+              << std::endl;
 
     std::cout << "\n=== Initializing D3D12 ===" << std::endl;
     state.trt_device = trt_device;
@@ -474,13 +476,13 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         if (!shared_memory_info.supports_simultaneous_graphics_compute)
         {
             throw std::runtime_error(std::string("DirectX CIG is not supported on CUDA device generation ") +
-                din::common::ToString(shared_memory_info.generation));
+                                     din::common::ToString(shared_memory_info.generation));
         }
         std::cout << "CUDA device ordinal " << shared_memory_info.cuda_device_ordinal << " compute capability "
-            << shared_memory_info.compute_capability_major << "." << shared_memory_info.compute_capability_minor
-            << " (" << din::common::ToString(shared_memory_info.generation) << ")"
-            << " graphics interop shared memory limit: " << (shared_memory_info.max_shared_memory_bytes / 1024)
-            << " KiB" << std::endl;
+                  << shared_memory_info.compute_capability_major << "." << shared_memory_info.compute_capability_minor
+                  << " (" << din::common::ToString(shared_memory_info.generation) << ")"
+                  << " graphics interop shared memory limit: " << (shared_memory_info.max_shared_memory_bytes / 1024)
+                  << " KiB" << std::endl;
         graphics_ep_options.emplace_back("nv_max_shared_mem_size",
                                          std::to_string(shared_memory_info.max_shared_memory_bytes));
         graphics_ep_options.emplace_back("nv_length_aux_stream_array", "0");
@@ -502,16 +504,13 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
 
     state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.text_encoder),
-        &*state.sync_stream);
+        make_profile(cache_paths.text_encoder), &*state.sync_stream);
     state.transformer_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.transformer),
-        &*state.sync_stream);
+        make_profile(cache_paths.transformer), &*state.sync_stream);
     state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.vae_decoder),
-        &*state.sync_stream);
+        make_profile(cache_paths.vae_decoder), &*state.sync_stream);
 
     std::vector<int64_t> token_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
     std::vector<int64_t> attn_mask_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
@@ -692,7 +691,7 @@ class DxFlux2ProcessingPipeline final : public Flux2ProcessingPipeline
 public:
     DxFlux2ProcessingPipeline(Flux2Config config, Flux2RuntimeContext& runtime)
         : config_(std::move(config))
-          , runtime_(runtime)
+        , runtime_(runtime)
     {
     }
 

@@ -51,7 +51,8 @@ class OrtVulkanGraphicsInteropScope
 public:
     OrtVulkanGraphicsInteropScope(const OrtInteropApi& interop, Ort::ConstEpDevice ep_device,
                                   const std::vector<uint8_t>& external_compute_queue_data)
-        : interop_(interop), ep_device_(ep_device)
+        : interop_(interop)
+          , ep_device_(ep_device)
     {
         if (external_compute_queue_data.empty())
         {
@@ -84,7 +85,7 @@ public:
         if (status != nullptr)
         {
             std::cerr << "DeinitGraphicsInteropForEpDevice failed: " << Ort::GetApi().GetErrorMessage(status)
-                << std::endl;
+                      << std::endl;
             Ort::GetApi().ReleaseStatus(status);
         }
     }
@@ -128,17 +129,18 @@ public:
     OrtVulkanExternalResourceImporter(const OrtVulkanExternalResourceImporter&) = delete;
     OrtVulkanExternalResourceImporter& operator=(const OrtVulkanExternalResourceImporter&) = delete;
 
-    [[nodiscard]] OrtExternalResourceImporter* get() const { return importer_; }
+    [[nodiscard]] OrtExternalResourceImporter* get() const
+    {
+        return importer_;
+    }
 
 private:
 #ifdef _WIN32
     static constexpr OrtExternalMemoryHandleType kMemoryType = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_WIN32;
-    static constexpr OrtExternalSemaphoreType kSemaphoreType =
-        ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_WIN32;
+    static constexpr OrtExternalSemaphoreType kSemaphoreType = ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_WIN32;
 #else
     static constexpr OrtExternalMemoryHandleType kMemoryType = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_OPAQUE_FD;
-    static constexpr OrtExternalSemaphoreType kSemaphoreType =
-        ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_OPAQUE_FD;
+    static constexpr OrtExternalSemaphoreType kSemaphoreType = ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_OPAQUE_FD;
 #endif
     const OrtInteropApi& interop_;
     OrtExternalResourceImporter* importer_ = nullptr;
@@ -150,8 +152,8 @@ public:
     OrtVulkanTensorImporter(const OrtInteropApi& interop, OrtVulkanExternalResourceImporter& importer,
                             const VkHelper::Device& device)
         : interop_(interop)
-          , device_(device)
-          , importer_(importer.get())
+        , device_(device)
+        , importer_(importer.get())
     {
     }
 
@@ -287,9 +289,9 @@ public:
     OrtVulkanTimelineSemaphore(const OrtInteropApi& interop, OrtVulkanExternalResourceImporter& importer,
                                VkHelper::Device& device)
         : interop_(interop)
-          , device_(device)
-          , semaphore_(device_.createTimelineSemaphore(0, true))
-          , importer_(importer.get())
+        , device_(device)
+        , semaphore_(device_.createTimelineSemaphore(0, true))
+        , importer_(importer.get())
     {
         native_handle_ = device_.getSemaphoreHandle(semaphore_);
         if (!is_valid_native_handle(native_handle_))
@@ -563,7 +565,7 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
         pp_pc.pi = static_cast<uint32_t>(PATCH_SIZE);
         pp_pc.pj = static_cast<uint32_t>(PATCH_SIZE);
         pp_pc.total_elements = static_cast<uint32_t>((LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-            (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
+                                                     (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
         vkCmdPushConstants(cmd_postprocess, postprocess_shader.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            sizeof(pp_pc), &pp_pc);
         vkCmdDispatch(cmd_postprocess, (pp_pc.total_elements + 255) / 256, 1, 1);
@@ -709,7 +711,8 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk");
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
-        << "CIG:       " << (state.use_cig ? "enabled" : "disabled") << "\n" << std::endl;
+              << "CIG:       " << (state.use_cig ? "enabled" : "disabled") << "\n"
+              << std::endl;
 
     // -----------------------------------------------------------------
     // Init Vulkan
@@ -728,13 +731,12 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // ORT environment & session options
     // -----------------------------------------------------------------
     state.interop_api = &Ort::GetInteropApi();
-    state.external_importer =
-        std::make_unique<OrtVulkanExternalResourceImporter>(*state.interop_api, state.trt_device);
+    state.external_importer = std::make_unique<OrtVulkanExternalResourceImporter>(*state.interop_api, state.trt_device);
     if (state.use_cig)
     {
         state.cig_external_compute_queue_data = state.vk->createCudaGraphicsInteropData();
-        state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(
-            *state.interop_api, state.trt_device, state.cig_external_compute_queue_data);
+        state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(*state.interop_api, state.trt_device,
+            state.cig_external_compute_queue_data);
     }
 
     // -----------------------------------------------------------------
@@ -754,11 +756,11 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         if (!shared_memory_info.supports_simultaneous_graphics_compute)
         {
             throw std::runtime_error(std::string("Vulkan CIG is not supported on CUDA device generation ") +
-                din::common::ToString(shared_memory_info.generation));
+                                     din::common::ToString(shared_memory_info.generation));
         }
         std::cout << "CUDA device ordinal " << shared_memory_info.cuda_device_ordinal
-            << " graphics interop shared memory limit: "
-            << (shared_memory_info.max_shared_memory_bytes / 1024) << " KiB" << std::endl;
+                  << " graphics interop shared memory limit: " << (shared_memory_info.max_shared_memory_bytes / 1024)
+                  << " KiB" << std::endl;
         graphics_ep_options.emplace_back("nv_max_shared_mem_size",
                                          std::to_string(shared_memory_info.max_shared_memory_bytes));
         graphics_ep_options.emplace_back("nv_length_aux_stream_array", "0");
@@ -1077,7 +1079,7 @@ class VkFlux2ProcessingPipeline final : public Flux2ProcessingPipeline
 public:
     VkFlux2ProcessingPipeline(Flux2Config config, Flux2RuntimeContext& runtime)
         : config_(std::move(config))
-          , runtime_(runtime)
+        , runtime_(runtime)
     {
     }
 
