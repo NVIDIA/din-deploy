@@ -2,14 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared Whisper/Qwen log-mel ONNX frontend; FP32 computation, configurable output frames."""
 
-import math
-
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 MEL_N_FFT = 400
 MEL_HOP = 160
+
+
+def dft_basis(n_fft):
+    # FP32 FFT constants avoid large-angle trig rounding in quiet frequency bins.
+    basis = torch.fft.rfft(torch.eye(n_fft, dtype=torch.float32)).T
+    return basis.real.contiguous(), basis.imag.contiguous()
 
 
 class LogMel(nn.Module):
@@ -28,12 +32,9 @@ class LogMel(nn.Module):
         self.out_dtype = out_dtype
         self.frames = frames
         self.register_buffer("window", torch.hann_window(MEL_N_FFT))
-        n_freq = MEL_N_FFT // 2 + 1
-        k = torch.arange(n_freq, dtype=torch.float32).unsqueeze(1)
-        n = torch.arange(MEL_N_FFT, dtype=torch.float32).unsqueeze(0)
-        angle = 2.0 * math.pi * k * n / MEL_N_FFT
-        self.register_buffer("dft_real", torch.cos(angle))  # [n_freq, n_fft]
-        self.register_buffer("dft_imag", -torch.sin(angle))
+        real, imag = dft_basis(MEL_N_FFT)
+        self.register_buffer("dft_real", real)  # [n_freq, n_fft]
+        self.register_buffer("dft_imag", imag)
         self.register_buffer("mel_fb", torch.as_tensor(mel_fb, dtype=torch.float32))  # [n_mels, n_freq]
 
     def forward(self, samples):
