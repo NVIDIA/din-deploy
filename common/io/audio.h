@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <string>
+#include <filesystem>
 #include <vector>
 
 namespace din::io
@@ -20,7 +20,7 @@ struct Audio
     }
 };
 
-Audio LoadAudio(const std::string& path, int target_rate);
-Audio LoadWavMono(const std::string& path);
+// Decode to mono floats at the requested sample rate.
+Audio LoadAudio(const std::filesystem::path& path, int target_rate);
 
 }  // namespace din::io
