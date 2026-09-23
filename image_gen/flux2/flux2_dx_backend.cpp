@@ -459,6 +459,8 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         throw std::runtime_error("DirectX processing requires --provider trt-rtx");
     }
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
+    const auto latent_stats = LoadFlux2LatentStats(
+        model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
     const Flux2ModelCachePaths cache_paths =
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx", config.text_encoder,
                                  !config.weight_streaming_budget.empty());
@@ -501,7 +503,6 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     std::cout << "=== Loading ONNX Models ===" << std::endl;
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config.ep_context_dir.string();
-    ep_context.enable_cache = true;
     const std::string cache_dir = config.ep_cache_dir.string();
     auto make_profile = [&](std::string cache_subpath, bool transformer = false)
     {
@@ -601,8 +602,8 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
 
     std::cout << "\n=== Uploading Static Inputs (D3D12) ===" << std::endl;
     state.dx.begin();
-    state.dx.record_upload(state.bn_mean_buf, BN_MEAN, state.bn_mean_buf.size);
-    state.dx.record_upload(state.bn_std_buf, BN_STD, state.bn_std_buf.size);
+    state.dx.record_upload(state.bn_mean_buf, latent_stats.mean.data(), state.bn_mean_buf.size);
+    state.dx.record_upload(state.bn_std_buf, latent_stats.std.data(), state.bn_std_buf.size);
 
     {
         std::vector<int64_t> img_ids_cpu(shape_numel(img_ids_shape));

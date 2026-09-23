@@ -19,6 +19,8 @@ target_include_directories(din_flux2_common
 target_link_libraries(din_flux2_common
     PUBLIC
         din_common_ort
+        PRIVATE
+        nlohmann_json::nlohmann_json
 )
 
 set_target_properties(din_flux2_common PROPERTIES

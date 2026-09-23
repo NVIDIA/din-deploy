@@ -716,6 +716,8 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
+    const auto latent_stats = LoadFlux2LatentStats(
+        model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
     state.use_cig = config.processing == Flux2ProcessingBackend::VkCig;
     const Flux2ModelCachePaths cache_paths =
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk", config.text_encoder,
@@ -757,7 +759,6 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     auto nvtx_scope_load = nvtx3::start_range("load_onnx_models");
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config.ep_context_dir.string();
-    ep_context.enable_cache = true;
     const std::string cache_dir = config.ep_cache_dir.string();
     std::vector<std::pair<std::string, std::string>> graphics_ep_options;
     if (state.use_cig)
@@ -884,14 +885,14 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
 
     {
         VkCommandBuffer cmd = state.vk->beginCommandBuffer(state.command_pool);
-        memcpy(state.staging.mapped, BN_MEAN, LATENT_CHANNELS * sizeof(float));
+        memcpy(state.staging.mapped, latent_stats.mean.data(), LATENT_CHANNELS * sizeof(float));
         VkBufferCopy region = {0, 0, state.bn_mean_buf.size};
         vkCmdCopyBuffer(cmd, state.staging.buffer, state.bn_mean_buf.buffer, 1, &region);
         state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
     }
     {
         VkCommandBuffer cmd = state.vk->beginCommandBuffer(state.command_pool);
-        memcpy(state.staging.mapped, BN_STD, LATENT_CHANNELS * sizeof(float));
+        memcpy(state.staging.mapped, latent_stats.std.data(), LATENT_CHANNELS * sizeof(float));
         VkBufferCopy region = {0, 0, state.bn_std_buf.size};
         vkCmdCopyBuffer(cmd, state.staging.buffer, state.bn_std_buf.buffer, 1, &region);
         state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);

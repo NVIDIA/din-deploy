@@ -19,6 +19,45 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <fstream>
+#include <nlohmann/json.hpp>
+
+Flux2LatentStats LoadFlux2LatentStats(const std::filesystem::path& path, size_t channels)
+{
+    std::ifstream file(path);
+    if (!file)
+        throw std::runtime_error("Missing VAE latent statistics: " + path.string() +
+            ". Re-export the VAE decoder.");
+    try
+    {
+        const auto document = nlohmann::json::parse(file);
+        const auto read = [&](const char* key, bool positive)
+        {
+            const auto& values = document.at(key);
+            if (!values.is_array() || values.size() != channels)
+                throw std::runtime_error(std::string(key) + " must contain " +
+                    std::to_string(channels) + " values");
+            std::vector<float> result;
+            result.reserve(channels);
+            for (const auto& value : values)
+            {
+                if (!value.is_number())
+                    throw std::runtime_error(std::string(key) + " must contain only numbers");
+                const float number = value.get<float>();
+                if (!std::isfinite(number) || (positive && number <= 0.0f))
+                    throw std::runtime_error(std::string(key) + " contains an invalid value");
+                result.push_back(number);
+            }
+            return result;
+        };
+        return {read("bn_mean", false), read("bn_std", true)};
+    }
+    catch (const std::exception& error)
+    {
+        throw std::runtime_error("Invalid VAE latent statistics in " + path.string() + ": " + error.what());
+    }
+}
 
 #ifdef _WIN32
 #include <windows.h>
