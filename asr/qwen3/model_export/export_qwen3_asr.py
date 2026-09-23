@@ -326,7 +326,7 @@ def main():
     parser.add_argument("--output", type=Path, help="Defaults to the ONNX artifact directory for --task")
     parser.add_argument("--task", choices=["asr", "aligner"], default="asr")
     parser.add_argument("--dtype", choices=["original", "fp16", "fp32"], default="original")
-    parser.add_argument("--only", choices=["mel", "encoder", "decoder", "aligner", "japanese"])
+    parser.add_argument("--only", choices=["mel", "encoder", "decoder", "aligner"])
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--cache-capacity", type=int, choices=range(512, 16385, 512), default=8192, metavar="TOKENS")
     args = parser.parse_args()
@@ -337,14 +337,6 @@ def main():
     precision = "bf16" if args.dtype == "original" else args.dtype
     size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in args.model.lower() else ""
     args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}{size_suffix}")
-    if args.only == "japanese" and args.task != "aligner":
-        parser.error("--only japanese requires --task aligner")
-    if args.task == "aligner" and args.only in (None, "japanese"):
-        from asr.qwen3.model_export.detail.japanese import export_japanese
-
-        export_japanese(args.output)
-        if args.only == "japanese":
-            return
     if args.only in ("decoder", "aligner") and args.only != ("decoder" if args.task == "asr" else "aligner"):
         parser.error("--only must match --task")
     metadata_path = args.output / "metadata.json"

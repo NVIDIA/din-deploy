@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "forced_aligner.h"
 
-#include "detail/japanese.h"
-#include "detail/runtime.h"
-#include "detail/text.h"
+#include "runtime.h"
 #include "unicode_regex.h"
 
 namespace din::asr::qwen3::detail
 {
 std::vector<std::string> AlignmentUnits(const std::string& text, const std::string& language,
-                                        AlignmentGranularity granularity, JapaneseTokenizer* japanese_tokenizer)
+                                        AlignmentGranularity granularity)
 {
     static constexpr std::pair<std::string_view, std::string_view> languages[] = {
         {"zh", "chinese"}, {"yue", "cantonese"}, {"en", "english"}, {"de", "german"},
@@ -24,7 +22,7 @@ std::vector<std::string> AlignmentUnits(const std::string& text, const std::stri
     if (found == std::end(languages))
         throw std::invalid_argument("Forced alignment supports zh, yue, en, de, es, fr, it, pt, ru, ko and ja");
 
-    if (!ValidUtf8(text))
+    if (!din::io::ValidUtf8(text))
         throw std::invalid_argument("Alignment requires valid UTF-8 text");
     if (granularity == AlignmentGranularity::Characters)
     {
@@ -36,7 +34,8 @@ std::vector<std::string> AlignmentUnits(const std::string& text, const std::stri
         return result;
     }
     if (found->first == "ja")
-        return japanese_tokenizer->Words(text);
+        throw std::invalid_argument(
+            "Japanese word alignment requires supplied units; use AlignUnits/--units or --granularity characters");
 
     // HF keeps Unicode letters/numbers and ASCII apostrophes, dropping punctuation and marks.
     static const din::io::UnicodeRegex kept(R"([\p{L}\p{N}'\s\x{1c}-\x{1f}]+)");
@@ -199,7 +198,6 @@ struct Qwen3ForcedAligner::Impl
     ForcedAlignerConfig config;
     Runtime runtime;
     AlignmentEngine engine;
-    std::unique_ptr<JapaneseTokenizer> japanese;
     explicit Impl(ForcedAlignerConfig cfg)
         : config(std::move(cfg))
         , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir)
@@ -209,15 +207,12 @@ struct Qwen3ForcedAligner::Impl
     }
     std::vector<std::string> Units(const std::string& text, const std::string& language)
     {
-        const auto lang = LowerLanguage(language);
-        if ((lang == "ja" || lang == "japanese") && config.granularity == AlignmentGranularity::Words && !japanese)
-            japanese = std::make_unique<JapaneseTokenizer>(runtime.env, config.model_dir);
-        return AlignmentUnits(text, language, config.granularity, japanese.get());
+        return AlignmentUnits(text, language, config.granularity);
     }
     std::vector<WordTimestamp> AlignAudio(const din::io::Audio& audio, const std::vector<std::string>& words)
     {
         for (const auto& word : words)
-            if (word.empty() || !ValidUtf8(word))
+            if (word.empty() || !din::io::ValidUtf8(word))
                 throw std::invalid_argument("Alignment units must be nonempty UTF-8 text");
         if (words.empty())
             return {};

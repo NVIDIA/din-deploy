@@ -6,9 +6,24 @@
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
+#include <utf8proc.h>
 
 namespace din::io
 {
+bool ValidUtf8(std::string_view text)
+{
+    for (size_t i = 0; i < text.size();)
+    {
+        utf8proc_int32_t code;
+        const auto n =
+            utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data() + i), text.size() - i, &code);
+        if (n < 0)
+            return false;
+        i += n;
+    }
+    return true;
+}
+
 UnicodeRegex::UnicodeRegex(std::string_view pattern)
 {
     int error;

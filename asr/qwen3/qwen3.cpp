@@ -8,8 +8,8 @@
 #include <optional>
 #include <sstream>
 
-#include "detail/runtime.h"
-#include "detail/text.h"
+#include "runtime.h"
+#include "unicode_regex.h"
 
 namespace din::asr::qwen3::detail
 {
@@ -345,7 +345,7 @@ struct Qwen3Pipeline::Impl
             while (!ids.empty())
             {
                 prefix = asr.tokenizer->Decode(ids, false);
-                if (ValidUtf8(prefix) && prefix.find("\xef\xbf\xbd") == std::string::npos)
+                if (din::io::ValidUtf8(prefix) && prefix.find("\xef\xbf\xbd") == std::string::npos)
                     break;
                 ids.pop_back();
                 prefix.clear();

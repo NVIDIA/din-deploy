@@ -1,14 +1,17 @@
 # Qwen3 ASR and forced alignment
 
-C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; TensorRT RTX supports BF16 (default), FP16 and FP32.
+ONNX Runtime inference on CPU or TensorRT RTX, with independent ASR and alignment APIs.
 
 ## Supported models
 
-| Model | Hugging Face ID | Checkpoint | BF16 export | FP16 export | FP32 export | Recommended export |
-| --- | --- | --- | --- | --- | --- | --- |
-| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
-| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
-| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
+| Model | Hugging Face ID |
+|---|---|
+| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` |
+| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` |
+| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` |
+
+All models support BF16 (original precision, default), FP16 and FP32 exports.
+Use FP32 for CPU inference.
 
 ## Supported capabilities
 
@@ -17,151 +20,71 @@ C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; TensorRT RTX s
 | Offline, single stream | ✓ |
 | Online / streaming, single utterance | ✓ |
 | Batched inference | — |
-| Long-form audio | ✓ |
-| ASR with / without forced alignment | ✓ |
-| Standalone alignment of supplied text | ✓ |
+| Long-form ASR | ✓ |
+| Automatic language detection / language hint | ✓ |
+| ASR: 30 languages and 22 Chinese dialects | ✓ |
+| Standalone alignment / alignment of any ASR output | ✓ |
 | Long-form alignment with timed transcript segments (C++ API) | ✓ |
 | Long-form alignment of unsegmented text | — |
-| Automatic language identification / language hint | ✓ |
-| Multilingual ASR: 30 languages and 22 Chinese dialects | ✓ |
 | Word timestamps: en, de, es, fr, it, pt, ru, ko | ✓ |
 | Chinese / Cantonese character timestamps | ✓ |
-| Japanese word timestamps (Nagisa) | ✓ |
-| Character alignment units: all 11 languages (sample extension) | ✓ |
+| Automatic Japanese word timestamps | — |
+| Character timestamps: all 11 alignment languages (sample extension) | ✓ |
 | Caller-supplied alignment units | ✓ |
-| All 11 upstream alignment languages | ✓ |
 
-ASR uses the [upstream model's language support](https://github.com/QwenLM/Qwen3-ASR).
-ASR accepts all 30 upstream language codes/names and `auto`; dialects use automatic
-recognition or the corresponding language hint, not separate dialect switches.
-Alignment supports Chinese, Cantonese, English, German, Spanish, French, Italian,
-Portuguese, Russian, Korean and Japanese. Japanese word boundaries use upstream
-Nagisa; Chinese/Cantonese default to characters, keeping Latin words together.
-Language names/codes are case-insensitive. ASR's other languages require alignment
-to be disabled. Language coverage is not an accuracy guarantee for every dialect.
+See [upstream language support](https://github.com/QwenLM/Qwen3-ASR).
+Japanese alignment requires character mode or supplied units.
 
-## Export
+## Export and validate
 
-Run Python commands from `asr/qwen3/model_export`, with the dependencies in
-`../requirements.txt` and a CUDA-enabled PyTorch installation.
+Run commands from the repository root; install the export dependencies first.
 
 ```bash
-python -X utf8 export_qwen3_asr.py --size 0.6B --output D:/models/qwen3-asr-0.6b-onnx-bf16
-python -X utf8 export_qwen3_asr.py --size 1.7B --output D:/models/qwen3-asr-1.7b-onnx-bf16
-python -X utf8 export_qwen3_asr.py --task aligner --output D:/models/qwen3-aligner-onnx-bf16
+pip install -r asr/qwen3/requirements.txt
+python asr/qwen3/model_export/export_qwen3_asr.py --output models/qwen3-asr
+python asr/qwen3/model_export/export_qwen3_asr.py --task aligner --output models/qwen3-aligner
 ```
 
-Use `--dtype fp16` or `--dtype fp32` for converted exports; `--dtype original`
-keeps BF16. This applies to both ASR sizes and the aligner.
+HF downloads checkpoints automatically. Use `--size 1.7B` for the larger ASR model,
+or `--dtype fp16` / `--dtype fp32` to change precision; use a separate output directory.
+Each ASR export contains one encoder, one decoder and the shared log-mel graph.
 
 ```bash
-python -X utf8 export_qwen3_asr.py --dtype fp16 --output D:/models/qwen3-asr-0.6b-onnx-fp16
-python -X utf8 export_qwen3_asr.py --dtype fp32 --output D:/models/qwen3-asr-0.6b-onnx-fp32
+python asr/qwen3/model_export/validate_qwen3_asr.py --onnx-dir models/qwen3-asr --audio audio.wav
+python asr/qwen3/model_export/validate_qwen3_asr.py --task aligner --onnx-dir models/qwen3-aligner --audio audio.wav --transcript transcript.txt --language English
 ```
 
-The C++ pipeline reads precision from each export; ASR and aligner can use different
-precisions. FP32 uses decomposed attention for TensorRT RTX compatibility; BF16/FP16
-use fused attention. Log-mel stays FP32. Use separate output directories per precision.
+## Build and run
 
-HF downloads checkpoints automatically. Use `--model` for a local checkpoint or
-`--revision` to pin the source. Keep each export directory intact. Log-mel
-processing reuses the shared Whisper frontend.
+Follow the [repository build setup](../../README.md). Replace `<build>` and
+`<build/bin>` with your build and executable directories; append `.exe` on Windows.
 
-Aligner exports also include Nagisa's small FP32 word segmenter and vocabulary.
-It runs on CPU without Python. Add it to an existing aligner export with
-`--task aligner --only japanese --output <aligner-directory>`; no ASR/aligner
-weights or GPU engines need rebuilding.
-
-ASR exports contain one encoder and one decoder, each with one weight file, plus the
-shared log-mel graph. Prefill and token generation update one KV bank in place.
-The decoder uses two fixed TensorRT profiles (512-token prefill and one-token
-steps), compiled once and cached; audio length does not create more encoder/decoder
-profiles. The two engines may each retain weights in GPU memory. Changed exports
-get new cache keys; clear compiled caches when changing the GPU or runtime.
-
-`--cache-capacity` sets the token ceiling (default 8192; multiples of 512 up to
-16384). Long audio uses upstream quiet-boundary splitting with enough room reserved
-for `--max-new-tokens`. Reaching that generation limit returns `reached_eos=false`.
-Attention still scans the allocated cache. BF16/FP16 KV uses 896 MiB at 8192 slots.
-Re-export older ASR artifacts for format 3.
-
-## Verify
-
-```bash
-python -X utf8 validate_qwen3_asr.py --onnx-dir D:/models/qwen3-asr-0.6b-onnx-bf16 --audio audio.mp3
-python -X utf8 validate_qwen3_asr.py --onnx-dir D:/models/qwen3-asr-1.7b-onnx-bf16 --audio audio.mp3
-python -X utf8 validate_qwen3_asr.py --task aligner --onnx-dir D:/models/qwen3-aligner-onnx-bf16 --audio audio.mp3 --transcript transcript.txt --language Chinese
+```text
+cmake --build <build> --config Release --target din_asr_qwen3_cli din_asr_qwen3_aligner_cli
+<build/bin>/din_asr_qwen3_cli audio.wav --model-dir models/qwen3-asr
+<build/bin>/din_asr_qwen3_aligner_cli audio.wav --model-dir models/qwen3-aligner --transcript transcript.txt --lang-id en
 ```
 
-The validator compares encoder, prefill and cached-token outputs against HF,
-then uses HF `generate()` for a short end-to-end token/EOS check. Alignment uses
-HF transcript preparation and span decoding. Strict BF16 numerical comparisons
-can fail despite matching tokens/spans. Long-form specialized decoding can change
-words; long-form alignment has small endpoint differences from HF.
+Both CLIs accept `--provider cpu|trt-rtx` (default: trt-rtx).
+Use `--granularity characters` for character alignment or `--units` for one supplied
+alignment unit per transcript line. Character timestamps have 80 ms resolution.
+Japanese word segmentation can be an optional external preprocessing pass supplied through `AlignUnits` / `--units`.
 
-## Build
+## Long-form and streaming
 
-Build from the repository root with the same TensorRT RTX setup as Whisper.
-An NVIDIA GPU supporting the selected TensorRT RTX precision is required.
+Long recordings are split automatically. `--max-new-tokens` defaults to 1024 per
+chunk; `reached_eos=false` means the transcript is incomplete. Increase the budget
+or reduce `--max-chunk-seconds`. Export-time `--cache-capacity` defaults to 8192 tokens.
 
-```powershell
-cmake --build out\build\windows-x64 --target din_asr_qwen3_cli din_asr_qwen3_aligner_cli
-```
+Add `--stream` for streaming transcription; `- --stream` reads mono 16 kHz float32
+PCM from stdin. Outputs are replacement hypotheses, not incremental text.
+Streaming reprocesses the current utterance, so latency grows with its length;
+start a new stream before exceeding the exported context capacity.
 
-## Run
+## C++ integration
 
-```powershell
-out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --model-dir D:\models\qwen3-asr-1.7b-onnx-bf16
-out\build\windows-x64\bin\din_asr_qwen3_aligner_cli.exe audio.mp3 --model-dir D:\models\qwen3-aligner-onnx-bf16 --transcript transcript.txt --lang-id zh
-out\build\windows-x64\bin\din_asr_qwen3_aligner_cli.exe audio.mp3 --model-dir D:\models\qwen3-aligner-onnx-bf16 --transcript transcript.txt --lang-id ja --granularity characters
-out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --model-dir D:\models\qwen3-asr-0.6b-onnx-bf16 --stream
-```
-
-Multi-configuration builds add the configuration (for example, `Release`) under `bin`.
-ASR and alignment are independent APIs in the same library:
-
-| API / CLI | Input | Output |
-|---|---|---|
-| `Qwen3Pipeline` / `din_asr_qwen3_cli` | Audio | Text, tokens, language and audio chunk boundaries |
-| `Qwen3ForcedAligner` / `din_asr_qwen3_aligner_cli` | Audio, supplied text and language | Word/character timestamps |
-
-Include `qwen3.h` for ASR or `forced_aligner.h` for alignment. The aligner loads
-no ASR model; use text from Whisper, Parakeet, Nemotron, Qwen ASR or a text file.
-Both CLIs accept `--provider cpu|trt-rtx`, `--model-dir` and cache options independently.
-Reuse instances; each processes one synchronous call at a time.
-
-`Align` takes mono 16 kHz audio; `AlignFile` decodes it automatically. Alignment
-accepts at most 180 seconds per call. For long recordings, use
-`AlignSegments(audio, segments)` with text from any ASR. Each `AlignmentSegment`
-contains `text`, half-open `start_sample` / `end_sample` offsets at 16 kHz, and
-`language` (default English). The method reuses the aligner and returns timestamps
-relative to the full recording, in segment order. Bounds and the 180-second limit
-are checked before inference; overlapping intervals are preserved without
-deduplication. Each interval must contain all speech for its text.
-
-`--granularity characters` / `AlignmentGranularity::Characters` aligns Unicode
-graphemes, retaining combining marks and omitting spaces/punctuation except apostrophes.
-`AlignUnits(audio, units)` bypasses text splitting; CLI `--units` reads one unit
-per transcript line. Limits: 2048 units and 8192 context tokens per call. Character
-alignment is a sample extension: the model's 80 ms timestamp bins can give adjacent
-characters identical times; sub-word accuracy is not guaranteed.
-
-Streaming uses `StartStream()`, `PushAudio(mono16k)` and `FinishStream()`.
-The CLI emits replacement hypotheses as JSON lines; use `- --stream` to read
-little-endian float32 mono 16 kHz PCM from stdin. `--chunk-seconds` defaults to 2
-(minimum 0.5); `--unfixed-chunks 2 --unfixed-tokens 5` matches upstream rollback.
-Each update reprocesses accumulated audio using the existing engines, so latency
-grows with utterance length. The exported KV ceiling still applies and overflow
-raises an error; start a new stream for the next utterance. Streaming has no live
-timestamps: align the final text separately. `FinishStream()` flushes the tail;
-UTF-8-safe rollback also applies to that tail.
-
-ASR returns `segments` with text, detected language and half-open `start_sample` /
-`end_sample` offsets at 16 kHz. Its upstream quiet-boundary splitter uses a
-1200-second target and a ±5-second search, further limited by KV capacity.
-`--max-chunk-seconds` overrides the target (6–1200; 0 uses the default).
-For subsequent alignment, use a target of 175 seconds or less to reserve the
-search margin within the 180-second limit. Chunk boundaries are not word timestamps.
-
-`--max-new-tokens` defaults to 1024 per chunk. If `reached_eos` is false, increase
-the budget or reduce `--max-chunk-seconds`; the transcript is incomplete.
+Use `Qwen3Pipeline` ([qwen3.h](qwen3.h)) for transcription and
+`Qwen3ForcedAligner` ([forced_aligner.h](forced_aligner.h)) for text from any ASR.
+`AlignSegments` accepts timed transcript segments and returns recording-relative
+timestamps. Alignment is limited to 180 seconds, 2048 units and 8192 context tokens
+per segment; use `--max-chunk-seconds 175` when transcribing for subsequent alignment.

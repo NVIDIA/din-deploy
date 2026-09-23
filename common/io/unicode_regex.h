@@ -9,6 +9,8 @@ struct pcre2_real_code_8;
 
 namespace din::io
 {
+bool ValidUtf8(std::string_view text);
+
 // Compiled once; matching uses per-call state and validates UTF-8.
 class UnicodeRegex
 {
