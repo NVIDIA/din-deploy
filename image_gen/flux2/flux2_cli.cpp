@@ -157,10 +157,10 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("PATH")
         .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
     parser.add_argument("--precision")
-          .default_value(config.precision)
-          .nargs(1)
-          .metavar("bf16|fp8|nvfp4")
-          .help("Transformer precision to load from transformer_<precision>.");
+        .default_value(config.precision)
+        .nargs(1)
+        .metavar("bf16|fp8|nvfp4")
+        .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
           .default_value(config.ep_cache_dir.string())
           .nargs(1)
