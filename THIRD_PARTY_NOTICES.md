@@ -5,7 +5,7 @@ DIN Deploy is distributed under the Apache License, Version 2.0. The project sou
 | Component | License and notice |
 |---|---|
 | argparse | MIT: <https://github.com/p-ranav/argparse/blob/master/LICENSE> |
-| dr_libs | Public domain or MIT-0: <https://github.com/mackron/dr_libs/blob/master/LICENSE> |
+| miniaudio | MIT: <https://github.com/mackron/miniaudio/blob/0.11.23/LICENSE> |
 | lodepng | zlib: <https://github.com/lvandeve/lodepng/blob/master/LICENSE> |
 | nlohmann/json | MIT: <https://github.com/nlohmann/json/blob/develop/LICENSE.MIT> |
 | NVIDIA NVTX | Apache-2.0 with LLVM exception: <https://github.com/NVIDIA/NVTX/blob/master/LICENSE> |
@@ -24,7 +24,7 @@ For components supplied through an SDK or binary package, the corresponding vend
 ## C++
 
 - `argparse` v3.2: MIT
-- `dr_libs`: Public domain or MIT-0
+- `miniaudio` 0.11.23: MIT
 - `lodepng`: zlib
 - `nanobind` v2.9.2: BSD-3-Clause
 - `nlohmann/json` v3.11.3: MIT
