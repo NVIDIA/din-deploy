@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 
 permissions:
@@ -20,7 +19,6 @@ env:
 
 jobs:
   clang-format:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: clang-format
     runs-on: ubuntu-24.04
 
@@ -49,7 +47,6 @@ jobs:
             | xargs -0 -r clang-format-22 --dry-run --Werror --
 
   linux-x64:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Ubuntu 24.04 / Clang / x64
     runs-on: ubuntu-24.04
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
@@ -93,7 +90,6 @@ jobs:
           path: out/build/linux-x64/bin/Release/
 
   linux-arm64:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Ubuntu 24.04 / Clang / ARM64
     runs-on: ubuntu-24.04-arm
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
@@ -135,7 +131,6 @@ jobs:
           path: out/build/linux-arm64/bin/Release/
 
   windows-x64:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Windows Server 2025 / MSVC / x64
     runs-on: windows-2025
     timeout-minutes: 90

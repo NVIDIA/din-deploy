@@ -25,10 +25,7 @@ def github_api(path: str) -> object:
         return json.load(response)
 
 
-def write_outputs(*, found: bool, artifact_name: str, run_id: str = "", as_json: bool = False) -> None:
-    if as_json:
-        print(json.dumps({"found": found, "name": artifact_name if found else "", "run_id": run_id}))
-        return
+def write_outputs(*, found: bool, artifact_name: str, run_id: str = "") -> None:
     output_path = Path(os.environ["GITHUB_OUTPUT"])
     with output_path.open("a", encoding="utf-8") as output:
         output.write(f"found={'true' if found else 'false'}\n")
@@ -43,15 +40,16 @@ def main() -> None:
     parser.add_argument("--default-branch", required=True)
     parser.add_argument("--event-name", required=True)
     parser.add_argument("--source-branch", required=True)
-    parser.add_argument("--pull-request", default="")
-    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     artifact_name = args.artifact_name
     allowed_branches = {args.default_branch}
-    if args.event_name != "pull_request" or args.pull_request:
+    if args.event_name != "pull_request":
         allowed_branches.add(args.source_branch)
-    response = github_api(f"repos/{args.repository}/actions/artifacts?name={quote(artifact_name)}&per_page=100")
+    response = github_api(
+        f"repos/{args.repository}/actions/artifacts"
+        f"?name={quote(artifact_name)}&per_page=100"
+    )
     artifacts = sorted(
         (
             artifact
@@ -69,23 +67,18 @@ def main() -> None:
         run_id = int(artifact["workflow_run"]["id"])
         if run_id not in conclusions:
             run = github_api(f"repos/{args.repository}/actions/runs/{run_id}")
-            same_pr = args.pull_request and any(
-                str(pr["number"]) == args.pull_request for pr in run.get("pull_requests", [])
-            )
-            trusted_branch = run["event"] != "pull_request" and run["head_branch"] in allowed_branches
             conclusions[run_id] = (
-                (trusted_branch or same_pr) and run["status"] == "completed" and run["conclusion"] == "success"
+                run["status"] == "completed" and run["conclusion"] == "success"
             )
         if conclusions[run_id]:
             write_outputs(
                 found=True,
                 artifact_name=artifact_name,
                 run_id=str(run_id),
-                as_json=args.json,
             )
             return
 
-    write_outputs(found=False, artifact_name=artifact_name, as_json=args.json)
+    write_outputs(found=False, artifact_name=artifact_name)
 
 
 if __name__ == "__main__":

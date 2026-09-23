@@ -52,12 +52,34 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.source_ref }}
 
+      - name: Determine export requirement
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            force=false
+          elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            force=true
+          elif git diff --quiet "$BASE_SHA" "$SOURCE_REF" -- \
+            'asr/whisper/*.py' \
+            'asr/whisper/**/*.py' \
+            '.github/workflows/export-whisper-model.yml' \
+            '.github/workflows/whisper-asr.yml'; then
+            force=false
+          else
+            force=true
+          fi
+          echo "force=$force" >> "$GITHUB_OUTPUT"
+
       - name: Compute artifact names
         id: artifact-names
         shell: bash
         env:
-          MODEL_ID: ${{ inputs.model_id }}
-          ATTENTION: ${{ inputs.attention }}
           FALLBACK_PRECISION: ${{ inputs.fallback_precision }}
           MODEL_SLUG: ${{ inputs.model_slug }}
           PRECISION: ${{ inputs.precision }}
@@ -73,14 +95,13 @@ jobs:
               *) echo "Unsupported fallback precision: $FALLBACK_PRECISION" >&2; exit 2 ;;
             esac
           fi
-          source_hash="$(python .github/scripts/model_ci.py key --model "whisper" --model-id "$MODEL_ID" --attention "$ATTENTION")"
-          echo "source_hash=$source_hash" >> "$GITHUB_OUTPUT"
-          echo "primary=asr-${MODEL_SLUG}-onnx-${PRECISION}-${source_hash}" >> "$GITHUB_OUTPUT"
+          echo "primary=asr-${MODEL_SLUG}-onnx-${PRECISION}" >> "$GITHUB_OUTPUT"
           if [[ -n "$FALLBACK_PRECISION" ]]; then
-            echo "fallback=asr-${MODEL_SLUG}-onnx-${FALLBACK_PRECISION}-${source_hash}" >> "$GITHUB_OUTPUT"
+            echo "fallback=asr-${MODEL_SLUG}-onnx-${FALLBACK_PRECISION}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Find successful primary artifact
+        if: steps.changes.outputs.force != 'true'
         id: primary-artifact
         shell: bash
         env:
@@ -88,18 +109,17 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
-          PULL_REQUEST: ${{ github.event.pull_request.number }}
         run: |
           python .github/scripts/find_successful_artifact.py \
             --repository "$GITHUB_REPOSITORY" \
             --artifact-name "${{ steps.artifact-names.outputs.primary }}" \
             --default-branch "$DEFAULT_BRANCH" \
             --event-name "$EVENT_NAME" \
-            --source-branch "$SOURCE_BRANCH" \
-            --pull-request "$PULL_REQUEST"
+            --source-branch "$SOURCE_BRANCH"
 
       - name: Find successful fallback artifact
         if: >-
+          steps.changes.outputs.force != 'true' &&
           steps.primary-artifact.outputs.found != 'true' &&
           inputs.fallback_precision != ''
         id: fallback-artifact
@@ -109,15 +129,13 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
-          PULL_REQUEST: ${{ github.event.pull_request.number }}
         run: |
           python .github/scripts/find_successful_artifact.py \
             --repository "$GITHUB_REPOSITORY" \
             --artifact-name "${{ steps.artifact-names.outputs.fallback }}" \
             --default-branch "$DEFAULT_BRANCH" \
             --event-name "$EVENT_NAME" \
-            --source-branch "$SOURCE_BRANCH" \
-            --pull-request "$PULL_REQUEST"
+            --source-branch "$SOURCE_BRANCH"
 
       - name: Select export action
         id: selection
@@ -126,12 +144,15 @@ jobs:
           FALLBACK_FOUND: ${{ steps.fallback-artifact.outputs.found }}
           FALLBACK_NAME: ${{ steps.fallback-artifact.outputs.name }}
           FALLBACK_RUN_ID: ${{ steps.fallback-artifact.outputs.run_id }}
+          FORCE_EXPORT: ${{ steps.changes.outputs.force }}
           PRIMARY_FOUND: ${{ steps.primary-artifact.outputs.found }}
           PRIMARY_NAME: ${{ steps.primary-artifact.outputs.name }}
           PRIMARY_RUN_ID: ${{ steps.primary-artifact.outputs.run_id }}
         run: |
           set -euo pipefail
-          if [[ "$PRIMARY_FOUND" == "true" ]]; then
+          if [[ "$FORCE_EXPORT" == "true" ]]; then
+            echo "export=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$PRIMARY_FOUND" == "true" ]]; then
             echo "export=false" >> "$GITHUB_OUTPUT"
             echo "name=$PRIMARY_NAME" >> "$GITHUB_OUTPUT"
             echo "run_id=$PRIMARY_RUN_ID" >> "$GITHUB_OUTPUT"
@@ -183,7 +204,6 @@ jobs:
           MODEL_SLUG: ${{ inputs.model_slug }}
           PRECISION: ${{ inputs.precision }}
           SOURCE_REF: ${{ inputs.source_ref }}
-          SOURCE_HASH: ${{ steps.artifact-names.outputs.source_hash }}
         run: |
           set -uo pipefail
           run_export() {
@@ -230,7 +250,7 @@ jobs:
               json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
           )
           PY
-          echo "name=asr-${MODEL_SLUG}-onnx-${selected_precision}-${SOURCE_HASH}" >> "$GITHUB_OUTPUT"
+          echo "name=asr-${MODEL_SLUG}-onnx-${selected_precision}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Whisper ONNX
         if: steps.selection.outputs.export == 'true'
