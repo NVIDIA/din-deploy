@@ -519,10 +519,8 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     std::vector<int64_t> hidden_shape = {BATCH_SIZE, TRANSFORMER_HIDDEN_DIM, LATENT_CHANNELS};
     std::vector<int64_t> img_ids_shape = {BATCH_SIZE, IMAGE_SEQUENCE, 4};
     std::vector<int64_t> txt_ids_shape = {BATCH_SIZE, SEQUENCE_LENGTH, 4};
-    std::vector<int64_t> dec_latent_shape = {
-        BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-        LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE
-    };
+    std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
+                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
     std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH};
 
     state.token_buf = state.dx.create_shared_default_buffer(shape_numel(token_shape) * sizeof(int64_t));

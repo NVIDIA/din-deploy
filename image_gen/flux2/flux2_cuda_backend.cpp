@@ -578,10 +578,8 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
     state.transformer_output = std::make_unique<din::common::TensorBuffer<float>>(*state.transformer_runner,
                                                                                   hidden_shape, has_separate_binding);
 
-    std::vector<int64_t> dec_latent_shape = {
-        BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-        LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE
-    };
+    std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
+                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
     state.decoder_latent = std::make_unique<din::common::TensorBuffer<float>>(*state.vae_decoder_runner,
                                                                               dec_latent_shape, has_separate_binding);
 
@@ -657,17 +655,15 @@ Flux2Image run_initialized_pipeline(CudaPipelineState& state, unsigned int seed)
 {
     Ort::SyncStream* compute_stream_ptr = state.compute_stream ? &*state.compute_stream : nullptr;
 
-    FluxPipeline pipeline{
-        state.text_encoder_runner->session,
-        state.transformer_runner->session,
-        state.vae_decoder_runner->session,
-        *state.text_encoder_io,
-        *state.transformer_io,
-        *state.vae_decoder_io,
-        state.euler,
-        state.postprocess,
-        *state.timestep
-    };
+    FluxPipeline pipeline{state.text_encoder_runner->session,
+                          state.transformer_runner->session,
+                          state.vae_decoder_runner->session,
+                          *state.text_encoder_io,
+                          *state.transformer_io,
+                          *state.vae_decoder_io,
+                          state.euler,
+                          state.postprocess,
+                          *state.timestep};
 
     {
         nvtx3::scoped_range nvtx("initialize_latents");
@@ -785,7 +781,7 @@ private:
     Flux2RuntimeContext& runtime_;
     std::unique_ptr<CudaPipelineState> state_;
 };
-} // namespace
+}  // namespace
 
 std::unique_ptr<Flux2ProcessingPipeline> CreateFlux2CudaPipeline(const Flux2Config& config,
                                                                  Flux2RuntimeContext& runtime)

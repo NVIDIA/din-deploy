@@ -24,7 +24,7 @@ Flux2RuntimeContext& GetProcessRuntime(Flux2ExecutionProvider provider)
     }
     return runtime;
 }
-} // namespace
+}  // namespace
 
 std::unique_ptr<Flux2ProcessingPipeline> CreateFlux2Pipeline(const Flux2Config& config)
 {

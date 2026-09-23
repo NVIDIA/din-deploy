@@ -65,7 +65,7 @@ dim3 grid_for(size_t total_elements)
     }
     return dim3(static_cast<unsigned int>(blocks), 1, 1);
 }
-} // namespace
+}  // namespace
 
 void launch_flux_euler_kernel(cudaStream_t stream, float t_curr, float t_next, size_t total_elements,
                               float* hidden_states, const float* transformer_output)

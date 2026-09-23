@@ -832,10 +832,8 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
                                                                            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
     // VAE decoder input (GPU)
-    std::vector<int64_t> dec_latent_shape = {
-        BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-        LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE
-    };
+    std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
+                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
     state.decoder_latent = state.vk->createExternalBuffer(shape_numel(dec_latent_shape) * sizeof(float));
     state.decoder_input_tensor = state.tensor_importer->create_tensor(state.decoder_latent, dec_latent_shape,
                                                                       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);

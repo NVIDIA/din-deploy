@@ -162,31 +162,31 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("bf16|fp8|nvfp4")
         .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
-          .default_value(config.ep_cache_dir.string())
-          .nargs(1)
-          .metavar("PATH")
-          .help("TensorRT RTX runtime cache directory.");
+        .default_value(config.ep_cache_dir.string())
+        .nargs(1)
+        .metavar("PATH")
+        .help("TensorRT RTX runtime cache directory.");
     parser.add_argument("--ep-context-dir")
-          .default_value(config.ep_context_dir.string())
-          .nargs(1)
-          .metavar("PATH")
-          .help("Directory for ONNX Runtime EP-context models.");
+        .default_value(config.ep_context_dir.string())
+        .nargs(1)
+        .metavar("PATH")
+        .help("Directory for ONNX Runtime EP-context models.");
     parser.add_argument("--output")
-          .default_value(std::string{"."})
-          .nargs(1)
-          .metavar("DIR")
-          .help("Directory where generated images are written.");
+        .default_value(std::string{"."})
+        .nargs(1)
+        .metavar("DIR")
+        .help("Directory where generated images are written.");
     parser.add_argument("--prompt")
-          .default_value(config.prompt)
-          .nargs(1)
-          .metavar("TEXT")
-          .help("Prompt text to encode with the Flux2 tokenizer.");
+        .default_value(config.prompt)
+        .nargs(1)
+        .metavar("TEXT")
+        .help("Prompt text to encode with the Flux2 tokenizer.");
     parser.add_argument("--seed").default_value(std::to_string(config.seed)).nargs(1).metavar("N").help("Random seed.");
     parser.add_argument("--num-images")
-          .default_value(std::to_string(config.num_images))
-          .nargs(1)
-          .metavar("N")
-          .help("Number of images to generate.");
+        .default_value(std::to_string(config.num_images))
+        .nargs(1)
+        .metavar("N")
+        .help("Number of images to generate.");
 
     try
     {
@@ -247,15 +247,15 @@ int main(int argc, char* argv[])
     {
         const Flux2Config config = parse_args(argc, argv);
         std::cout << "Model dir: " << config.model_dir.string() << "\n"
-            << "Precision: " << config.precision << "\n"
-            << "Output: " << config.output_path.string() << "\n"
-            << "Prompt: " << config.prompt << "\n"
-            << "Seed:   " << config.seed << "\n"
-            << "Num images: " << config.num_images << "\n"
-            << "Processing: " << to_string(config.processing) << "\n"
-            << "Provider: " << to_string(config.provider) << "\n"
-            << "EP cache: " << config.ep_cache_dir.string() << "\n"
-            << "EP context dir: " << config.ep_context_dir.string() << "\n"
+                  << "Precision: " << config.precision << "\n"
+                  << "Output: " << config.output_path.string() << "\n"
+                  << "Prompt: " << config.prompt << "\n"
+                  << "Seed:   " << config.seed << "\n"
+                  << "Num images: " << config.num_images << "\n"
+                  << "Processing: " << to_string(config.processing) << "\n"
+                  << "Provider: " << to_string(config.provider) << "\n"
+                  << "EP cache: " << config.ep_cache_dir.string() << "\n"
+                  << "EP context dir: " << config.ep_context_dir.string() << "\n"
                   << std::endl;
 
         auto pipeline = CreateFlux2Pipeline(config);
