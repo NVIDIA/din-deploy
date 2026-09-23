@@ -138,7 +138,6 @@ void validate_config(const Flux2Config& config)
 Flux2Config parse_args(int argc, char* argv[])
 {
     Flux2Config config;
-    config.model_dir = DEFAULT_MODEL_BASE_PATH;
     config.prompt = DEFAULT_PROMPT;
 
     argparse::ArgumentParser parser("din_flux2");
@@ -154,7 +153,7 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("cpu|trt-rtx")
         .help("Select the ONNX Runtime execution provider.");
     parser.add_argument("--model-dir")
-        .default_value(config.model_dir.string())
+        .required()
         .nargs(1)
         .metavar("PATH")
         .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
