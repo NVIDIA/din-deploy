@@ -64,7 +64,6 @@ def save_native_assets(processor, output, task):
         data["prefixes"] = prefixes
         data["suffixes"] = suffixes
         data["languages"] = languages
-        data["suffix"] = suffixes["auto"]
     (output / "native.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -321,7 +320,7 @@ def export_aligner(model, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", "--checkpoint", dest="model", help="HF model ID or local checkpoint directory")
-    parser.add_argument("--size", choices=["0.6B", "1.7B"], default="0.6B", help="ASR model size")
+    parser.add_argument("--size", choices=["0.6B", "1.7B"], help="ASR model size (default: 0.6B)")
     parser.add_argument("--revision", help="Optional HF revision or commit")
     parser.add_argument("--output", type=Path, help="Defaults to the ONNX artifact directory for --task")
     parser.add_argument("--task", choices=["asr", "aligner"], default="asr")
@@ -331,22 +330,25 @@ def main():
     parser.add_argument("--cache-capacity", type=int, choices=range(512, 16385, 512), default=8192, metavar="TOKENS")
     args = parser.parse_args()
     prefix = "aligner-" if args.task == "aligner" else ""
-    args.model = args.model or (
-        "Qwen/Qwen3-ForcedAligner-0.6B-hf" if args.task == "aligner" else f"Qwen/Qwen3-ASR-{args.size}-hf"
+    default_model = (
+        "Qwen/Qwen3-ForcedAligner-0.6B-hf" if args.task == "aligner" else f"Qwen/Qwen3-ASR-{args.size or '0.6B'}-hf"
     )
     precision = "bf16" if args.dtype == "original" else args.dtype
-    size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in args.model.lower() else ""
+    size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in (args.model or default_model).lower() else ""
     args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}{size_suffix}")
     if args.only in ("decoder", "aligner") and args.only != ("decoder" if args.task == "asr" else "aligner"):
         parser.error("--only must match --task")
     metadata_path = args.output / "metadata.json"
     existing = json.loads(metadata_path.read_text(encoding="utf-8")) if args.only and metadata_path.exists() else {}
-    requested = {"original": "bfloat16", "fp16": "float16", "fp32": "float32"}[args.dtype]
-    if (
-        existing
-        and args.only != "mel"
-        and (existing["dtype"] != requested or existing["task"] != args.task or existing.get("quantization"))
+    source = existing.get("source", {})
+    args.model = args.model or (source.get("model") if args.size is None else None) or default_model
+    args.revision = args.revision or source.get("revision")
+    if existing and (
+        existing["task"] != args.task or source["model"] != args.model or source.get("revision") != args.revision
     ):
+        parser.error("Partial export requires the original task and checkpoint; use a new directory")
+    requested = {"original": "bfloat16", "fp16": "float16", "fp32": "float32"}[args.dtype]
+    if existing and args.only != "mel" and (existing["dtype"] != requested or existing.get("quantization")):
         parser.error("Partial export requires the same task and precision, without quantization; use a new directory")
     torch.set_num_threads(args.threads)
     args.output.mkdir(parents=True, exist_ok=True)

@@ -34,23 +34,6 @@ def session_options(provider, threads, extra_options=None):
     return options, None
 
 
-def pack_audio(features, mask, config):
-    chunk_size = config["n_window"] * 2
-    if features.shape[0] != 1 or features.shape[-1] % chunk_size:
-        raise ValueError("Expected batch-one features padded to the encoder chunk size")
-    chunks = features.reshape(1, features.shape[1], -1, chunk_size)[0].permute(1, 0, 2)
-    lengths = mask.reshape(-1, chunk_size).sum(1)
-    for _ in range(3):
-        lengths = (lengths + 1) // 2
-    indices = (torch.arange((chunk_size + 7) // 8)[None] < lengths[:, None]).flatten().nonzero().flatten()
-    if not len(indices):
-        raise ValueError("Audio has no valid feature frames")
-    window = int(lengths.max()) * (config["n_window_infer"] // chunk_size)
-    groups = torch.arange(len(indices)) // window
-    bias = torch.zeros(len(indices), len(indices)).masked_fill(groups[:, None] != groups[None], -1e4)
-    return chunks, indices, bias[None, None]
-
-
 def decoder_inputs(ids, embeddings, audio_token_id, hidden_size, past_length, capacity=None):
     ids = ids.cpu().long().reshape(1, -1)
     seq = ids.shape[1]
@@ -75,10 +58,8 @@ def decoder_inputs(ids, embeddings, audio_token_id, hidden_size, past_length, ca
 
 class OnnxAudioModel:
     def __init__(self, directory, task, threads=4, provider=None):
-        self.text_graph = "decoder.onnx" if task == "asr" else "aligner.onnx"
+        text_graph = "decoder.onnx" if task == "asr" else "aligner.onnx"
         directory = Path(directory)
-        self.directory = directory
-        self.threads = threads
         self.metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         if self.metadata["task"] != task or self.metadata["format_version"] != (3 if task == "asr" else 2):
             raise ValueError("Incompatible export; re-export the model with the current exporter")
@@ -90,7 +71,7 @@ class OnnxAudioModel:
             self.provider, threads, {f"nv_profile_{bound}_shapes": encoder_shape for bound in ("min", "opt", "max")}
         )
         self.encoder = ort.InferenceSession(str(directory / "encoder.onnx"), options, providers=providers)
-        if self.text_graph == "decoder.onnx":
+        if text_graph == "decoder.onnx":
             c = self.metadata["text_config"]
             capacity = self.metadata["cache_capacity"]
 
@@ -108,11 +89,11 @@ class OnnxAudioModel:
                     threads,
                     {f"nv_profile_{bound}_shapes": shapes(sequence) for bound in ("min", "opt", "max")},
                 )
-                sessions.append(ort.InferenceSession(str(directory / self.text_graph), options, providers=providers))
+                sessions.append(ort.InferenceSession(str(directory / text_graph), options, providers=providers))
             self.decoder, self.prefill = sessions
         else:
             options, providers = session_options(self.provider, threads)
-            self.decoder = ort.InferenceSession(str(directory / self.text_graph), options, providers=providers)
+            self.decoder = ort.InferenceSession(str(directory / text_graph), options, providers=providers)
 
     def run(self, session, feed, inplace=False):
         values = {}
@@ -150,18 +131,19 @@ class OnnxAudioModel:
         features, mask = inputs["input_features"], inputs["input_features_mask"]
         outputs = []
         for start in range(0, int(mask.sum()), window):
-            chunks, indices, _ = pack_audio(
-                features[..., start : start + window], mask[..., start : start + window], config
-            )
+            chunk_size = config["n_window"] * 2
+            chunks = features[..., start : start + window].reshape(128, -1, chunk_size).permute(1, 0, 2)
+            lengths = mask[..., start : start + window].reshape(-1, chunk_size).sum(1)
+            valid_tokens = int(((lengths + 7) // 8).sum())
             tokens = window // 100 * 13
             bias = torch.zeros(1, 1, tokens, tokens)
-            bias[..., len(indices) :] = -1e4
+            bias[..., valid_tokens:] = -1e4
             packed = torch.zeros(window // 100, 128, 100)
             packed[: len(chunks)] = chunks
             outputs.append(
                 self.run(
                     self.encoder, {"mel_chunks": packed, "valid_indices": torch.arange(tokens), "attention_bias": bias}
-                )[0][: len(indices)]
+                )[0][:valid_tokens]
             )
         return torch.cat(outputs)
 

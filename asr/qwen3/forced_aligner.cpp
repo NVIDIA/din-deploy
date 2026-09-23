@@ -97,42 +97,56 @@ std::vector<int> FixTimestamps(const std::vector<int>& data)
     return result;
 }
 
-struct AlignmentEngine
+}  // namespace din::asr::qwen3::detail
+
+namespace din::asr::qwen3
 {
+using namespace detail;
+struct Qwen3ForcedAligner::Impl
+{
+    ForcedAlignerConfig config;
+    Runtime runtime;
     AudioModel model;
     std::unique_ptr<OrtRunner> text;
-    AlignmentEngine(Runtime& runtime, const std::filesystem::path& dir);
-    std::vector<WordTimestamp> Align(const std::vector<float>& features, const std::vector<std::string>& words);
-};
-
-AlignmentEngine::AlignmentEngine(Runtime& runtime, const std::filesystem::path& dir)
-    : model(runtime, dir, "aligner")
-{
-    if (!model.metadata.value("timestamp_bins", false))
-        throw std::runtime_error("Re-export the aligner with --only aligner for GPU timestamp selection");
-    const auto shape = [&](int64_t seq, int slots)
+    explicit Impl(ForcedAlignerConfig cfg)
+        : config(std::move(cfg))
+        , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir)
+        , model(runtime, config.model_dir, "aligner")
     {
-        return TextShape(seq, model.hidden, seq) + ",timestamp_indices:" + std::to_string(slots);
-    };
-    text = runtime.Runner(dir, "aligner", shape(4, 2), shape(128, 32), shape(8192, 4096));
-}
-std::vector<WordTimestamp> AlignmentEngine::Align(const std::vector<float>& features,
-                                                  const std::vector<std::string>& words)
+        if (!model.metadata.value("timestamp_bins", false))
+            throw std::runtime_error("Re-export the aligner with --only aligner for GPU timestamp selection");
+        const auto shape = [&](int64_t seq, int slots)
+        {
+            return TextShape(seq, model.hidden, seq) + ",timestamp_indices:" + std::to_string(slots);
+        };
+        text = runtime.Runner(config.model_dir, "aligner", shape(4, 2), shape(128, 32), shape(8192, 4096));
+        runtime.LoadMel(config.model_dir);
+    }
+    std::vector<WordTimestamp> AlignFeatures(const std::vector<float>& features, const std::vector<std::string>& words);
+    std::vector<WordTimestamp> AlignAudio(const din::io::Audio& audio, const std::vector<std::string>& words)
+    {
+        if (words.size() > 2048)
+            throw std::invalid_argument("Native alignment is limited to 2048 alignment units per chunk");
+        for (const auto& word : words)
+            if (word.empty() || !din::io::ValidUtf8(word))
+                throw std::invalid_argument("Alignment units must be nonempty UTF-8 text");
+        if (words.empty())
+            return {};
+        din::io::Audio normalized;
+        const auto& source = NormalizeAudio(audio, normalized);
+        if (source.samples.size() > 180 * kRate)
+            throw std::invalid_argument("Standalone alignment accepts up to 180 seconds; supply audio/text segments");
+        return AlignFeatures(runtime.Features(source.samples), words);
+    }
+};
+std::vector<WordTimestamp> Qwen3ForcedAligner::Impl::AlignFeatures(const std::vector<float>& features,
+                                                                   const std::vector<std::string>& words)
 {
     din::common::nvtx_scoped_range range{"qwen3.align"};
     const int64_t frames = features.size() / 128;
     std::vector<WordTimestamp> result;
-    if (words.empty())
-        return {};
-    if (words.size() > 2048)
-        throw std::runtime_error("Native alignment is limited to 2048 alignment units per chunk");
-    auto audio = [&]
-    {
-        din::common::nvtx_scoped_range range{"qwen3.align_encoder"};
-        return model.Encode(features, frames);
-    }();
     std::vector<int64_t> ids = model.native["audio_start"];
-    ids.insert(ids.end(), audio.tokens, model.audio_id);
+    ids.insert(ids.end(), AudioTokens(frames), model.audio_id);
     Append(ids, model.native["audio_end"].get<std::vector<int64_t>>());
     std::vector<int64_t> slots;
     const int64_t timestamp_id = model.metadata["timestamp_token_id"];
@@ -152,6 +166,11 @@ std::vector<WordTimestamp> AlignmentEngine::Align(const std::vector<float>& feat
     const auto seq = static_cast<int64_t>(ids.size());
     if (seq > 8192)
         throw std::runtime_error("Alignment exceeds the native context limit");
+    auto audio = [&]
+    {
+        din::common::nvtx_scoped_range range{"qwen3.align_encoder"};
+        return model.Encode(features, frames);
+    }();
     TextInputs input(*text, seq, model.hidden, seq, model.dtype);
     input.Fill(ids, 0, model.audio_id, &audio);
     const int64_t labels = model.metadata["num_labels"];
@@ -188,42 +207,6 @@ std::vector<WordTimestamp> AlignmentEngine::Align(const std::vector<float>& feat
         result.push_back({words[i], times[2 * i] / 1000.f, times[2 * i + 1] / 1000.f});
     return result;
 }
-}  // namespace din::asr::qwen3::detail
-
-namespace din::asr::qwen3
-{
-using namespace detail;
-struct Qwen3ForcedAligner::Impl
-{
-    ForcedAlignerConfig config;
-    Runtime runtime;
-    AlignmentEngine engine;
-    explicit Impl(ForcedAlignerConfig cfg)
-        : config(std::move(cfg))
-        , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir)
-        , engine(runtime, config.model_dir)
-    {
-        runtime.LoadMel(config.model_dir);
-    }
-    std::vector<std::string> Units(const std::string& text, const std::string& language)
-    {
-        return AlignmentUnits(text, language, config.granularity);
-    }
-    std::vector<WordTimestamp> AlignAudio(const din::io::Audio& audio, const std::vector<std::string>& words)
-    {
-        for (const auto& word : words)
-            if (word.empty() || !din::io::ValidUtf8(word))
-                throw std::invalid_argument("Alignment units must be nonempty UTF-8 text");
-        if (words.empty())
-            return {};
-        din::io::Audio normalized;
-        const auto& source = NormalizeAudio(audio, normalized);
-        if (source.samples.size() > 180 * kRate)
-            throw std::invalid_argument("Standalone alignment accepts up to 180 seconds; supply audio/text segments");
-        const auto features = runtime.Features(source.samples);
-        return engine.Align(features, words);
-    }
-};
 Qwen3ForcedAligner::Qwen3ForcedAligner(ForcedAlignerConfig config)
 {
     impl_ = std::make_unique<Impl>(std::move(config));
@@ -232,7 +215,7 @@ Qwen3ForcedAligner::~Qwen3ForcedAligner() = default;
 std::vector<WordTimestamp> Qwen3ForcedAligner::Align(const din::io::Audio& audio, const std::string& text,
                                                      const std::string& language)
 {
-    return impl_->AlignAudio(audio, impl_->Units(text, language));
+    return impl_->AlignAudio(audio, AlignmentUnits(text, language, impl_->config.granularity));
 }
 std::vector<WordTimestamp> Qwen3ForcedAligner::AlignUnits(const din::io::Audio& audio,
                                                           const std::vector<std::string>& units)
@@ -262,7 +245,8 @@ std::vector<WordTimestamp> Qwen3ForcedAligner::AlignSegments(const din::io::Audi
     for (const auto& segment : segments)
     {
         clip.samples.assign(audio.samples.begin() + segment.start_sample, audio.samples.begin() + segment.end_sample);
-        auto aligned = impl_->AlignAudio(clip, impl_->Units(segment.text, segment.language));
+        auto aligned =
+            impl_->AlignAudio(clip, AlignmentUnits(segment.text, segment.language, impl_->config.granularity));
         const float offset = static_cast<float>(segment.start_sample) / kRate;
         for (auto& word : aligned)
         {

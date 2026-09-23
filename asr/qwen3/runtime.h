@@ -433,15 +433,14 @@ struct AudioModel
 
     struct EncoderBuffers
     {
-        int64_t frames, tokens;
+        int64_t tokens;
         FloatBuffer mel, bias;
         Buffer<int64_t> indices;
         Ort::Value output;
         Ort::IoBinding binding;
 
         EncoderBuffers(OrtRunner& runner, int64_t count, int64_t hidden, ONNXTensorElementDataType dtype)
-            : frames(count)
-            , tokens(AudioTokens(count))
+            : tokens(AudioTokens(count))
             , mel(runner, {(count + 99) / 100, 128, 100}, dtype, true)
             , bias(runner, {1, 1, tokens, tokens}, dtype, true)
             , indices(runner, {tokens}, runner.HasDeviceIo())
@@ -449,10 +448,8 @@ struct AudioModel
             , binding(runner.session)
         {
             // A call contains exactly one independent HF encoder window.
-            bias.Fill(0.f);
             for (int64_t i = 0; i < tokens; ++i)
                 indices.HostData()[i] = i;
-            bias.CopyAsyncToDevice();
             indices.CopyAsyncToDevice();
             binding.BindInput("mel_chunks", mel.BindingValue());
             binding.BindInput("valid_indices", indices.BindingValue());

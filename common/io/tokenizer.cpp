@@ -705,7 +705,7 @@ std::string Tokenizer::Decode(const std::vector<int64_t>& ids, bool skip_special
 {
     if (decode_mode_ == DecodeMode::ByteBpe)
     {
-        const auto byte_decoder = BuildByteDecoder();
+        static const auto byte_decoder = BuildByteDecoder();
         std::string text;
         for (auto id : ids)
         {

@@ -82,10 +82,7 @@ inline std::vector<AudioChunk> SplitAudio(std::span<const float> samples, size_t
         chunks.push_back({start, samples.size()});
     return chunks;
 }
-}  // namespace din::asr::qwen3::detail
 
-namespace din::asr::qwen3::detail
-{
 std::string Trim(const std::string& text)
 {
     const auto first = text.find_first_not_of(" \r\n\t");
