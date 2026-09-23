@@ -16,6 +16,7 @@
 
 #include "flux2.h"
 #include "flux2_cli.h"
+#include "utils.h"
 #include "io/image.h"
 #include <argparse/argparse.hpp>
 #include <GLFW/glfw3.h>
@@ -223,7 +224,9 @@ namespace
             {
                 const float v = img.data[c * pixels + p];
                 rgb[p * 3 + c] =
-                    std::isfinite(v) ? static_cast<unsigned char>(std::clamp(v * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f) : 0;
+                    std::isfinite(v)
+                        ? static_cast<unsigned char>(std::lround(std::clamp(v * 127.5f + 127.5f, 0.0f, 255.0f)))
+                        : 0;
             }
         glGenTextures(1, &result.texture);
         glBindTexture(GL_TEXTURE_2D, result.texture);
@@ -233,13 +236,18 @@ namespace
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.width, img.height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
     }
 
+
     int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit_after)
     {
         Generator generator;
         Flux2Config config = initial;
-        std::array<char, 2048> model{}, output{};
+        std::array<char, 2048> model{}, output{}, cache{};
+        bool cache_changed = false;
+        const auto cache_utf8 = initial.ep_cache_dir.parent_path().u8string();
+        std::snprintf(cache.data(), cache.size(), "%s", reinterpret_cast<const char*>(cache_utf8.c_str()));
         std::array<char, 8192> prompt{};
-        std::snprintf(model.data(), model.size(), "%s", config.model_dir.string().c_str());
+        const auto model_utf8 = config.model_dir.u8string();
+        std::snprintf(model.data(), model.size(), "%s", reinterpret_cast<const char*>(model_utf8.c_str()));
         std::snprintf(output.data(), output.size(), "%s", config.output_path.string().c_str());
         std::snprintf(prompt.data(), prompt.size(), "%s", config.prompt.c_str());
         int streaming_mode = 0; // Auto / Manual / Off; independent of session configuration.
@@ -302,11 +310,12 @@ namespace
             ImGui::BeginChild("controls", ImVec2(430, 0), true);
             ImGui::BeginDisabled(busy);
             ImGui::InputText("Model root", model.data(), model.size());
+            cache_changed |= ImGui::InputText("Cache root", cache.data(), cache.size());
             ImGui::InputText("Save directory", output.data(), output.size());
             ImGui::TextUnformatted("Prompt");
             ImGui::InputTextMultiline("##prompt", prompt.data(), prompt.size(), ImVec2(-1, 100));
             ImGui::RadioButton("Qwen3-4B", &encoder, 0);
-            const bool translator_exists = std::filesystem::is_regular_file(std::filesystem::path(model.data()) /
+            const bool translator_exists = std::filesystem::is_regular_file(std::filesystem::u8path(model.data()) /
                 "text_encoder_translator/model.onnx");
             ImGui::BeginDisabled(!translator_exists);
             ImGui::RadioButton("Qwen3-0.6B + translator", &encoder, 1);
@@ -339,22 +348,29 @@ namespace
             ImGui::InputScalar("Seed", ImGuiDataType_U32, &config.seed);
             ImGui::SliderInt("Denoise steps", &config.steps, 1, 50);
             ImGui::SliderInt("Images", &count, 1, 16);
+            const bool paths_valid = model[0] && (!cache_changed || cache[0]);
+            ImGui::BeginDisabled(!paths_valid);
             bool generate = ImGui::Button("Generate", ImVec2(-1, 35));
             bool random = ImGui::Button("Random sweep", ImVec2(-1, 30));
             ImGui::EndDisabled();
-            if (!busy && (generate || random || (auto_generate && !launched)))
+            ImGui::EndDisabled();
+            if (!busy && paths_valid && (generate || random || (auto_generate && !launched)))
             {
                 for (auto& result : results)
                     if (result.texture)
                         glDeleteTextures(1, &result.texture);
                 results.clear();
                 selected = -1;
-                config.model_dir = model.data();
+                config.model_dir = std::filesystem::u8path(model.data());
                 config.output_path = output.data();
                 config.prompt = prompt.data();
                 const auto cache_namespace = CacheNamespace(config.model_dir);
-                config.ep_cache_dir = initial.ep_cache_dir / cache_namespace;
-                config.ep_context_dir = initial.ep_context_dir / cache_namespace;
+                config.ep_cache_dir = (cache_changed
+                                           ? std::filesystem::u8path(cache.data()) / "runtime"
+                                           : initial.ep_cache_dir) / cache_namespace;
+                config.ep_context_dir = (cache_changed
+                                             ? std::filesystem::u8path(cache.data()) / "ep_context"
+                                             : initial.ep_context_dir) / cache_namespace;
                 config.text_encoder = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
                 config.precision = precisions[precision];
                 config.num_images = static_cast<unsigned int>(count);
@@ -437,10 +453,22 @@ int main(int argc, char** argv)
     try
     {
         argparse::ArgumentParser args("din_flux2_ui");
+#ifdef _WIN32
+        const wchar_t* local_app_data = _wgetenv(L"LOCALAPPDATA");
+        if (!local_app_data || !*local_app_data)
+            throw std::runtime_error("LOCALAPPDATA is not set; cannot determine the default cache directory");
+        const auto cache_root = std::filesystem::path(local_app_data) / "din_deploy";
+#else
+        const auto cache_root = std::filesystem::path("/tmp/din_deploy/cache");
+#endif
         args.add_argument("--model-dir").default_value(DEFAULT_MODEL_BASE_PATH.string());
         args.add_argument("--output").default_value(std::string{});
-        args.add_argument("--ep-cache").default_value(Flux2Config{}.ep_cache_dir.string());
-        args.add_argument("--ep-context-dir").default_value(Flux2Config{}.ep_context_dir.string());
+        const auto runtime_cache_utf8 = (cache_root / "runtime").u8string();
+        const auto context_cache_utf8 = (cache_root / "ep_context").u8string();
+        args.add_argument("--ep-cache").default_value(std::string(
+            reinterpret_cast<const char*>(runtime_cache_utf8.c_str())));
+        args.add_argument("--ep-context-dir").default_value(std::string(
+            reinterpret_cast<const char*>(context_cache_utf8.c_str())));
         args.add_argument("--prompt").default_value(std::string(DEFAULT_PROMPT));
         args.add_argument("--encoder").default_value(std::string("auto")).choices("auto", "4b", "translator");
         args.add_argument("--precision").default_value(std::string("bf16")).choices("bf16", "fp16", "fp8", "nvfp4");
@@ -451,8 +479,10 @@ int main(int argc, char** argv)
         Flux2Config config;
         config.model_dir = args.get<std::string>("--model-dir");
         config.output_path = args.get<std::string>("--output");
-        config.ep_cache_dir = args.get<std::string>("--ep-cache");
-        config.ep_context_dir = args.get<std::string>("--ep-context-dir");
+        config.ep_cache_dir = std::filesystem::u8path(args.get<std::string>("--ep-cache"));
+        config.ep_context_dir = std::filesystem::u8path(args.get<std::string>("--ep-context-dir"));
+        std::filesystem::create_directories(config.ep_cache_dir);
+        std::filesystem::create_directories(config.ep_context_dir);
         config.prompt = args.get<std::string>("--prompt");
         config.precision = args.get<std::string>("--precision");
         config.num_images = 1;

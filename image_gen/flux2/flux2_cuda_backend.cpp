@@ -308,7 +308,7 @@ public:
 
         constexpr int HW = static_cast<int>(LATENT_HEIGHT * LATENT_WIDTH);
         unpack_latents_with_ids(hidden, scratch, LATENT_HEIGHT, LATENT_WIDTH, LATENT_CHANNELS);
-        denormalize_latents(scratch, BN_MEAN, BN_STD, LATENT_CHANNELS, HW);
+        denormalize_latents(scratch, bn_mean_->HostData(), bn_std_->HostData(), LATENT_CHANNELS, HW);
         unpatchify_latents(scratch, decoder_input, 1, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE, LATENT_HEIGHT,
                            LATENT_WIDTH, PATCH_SIZE, PATCH_SIZE);
         if (device_is_cuda)
@@ -478,6 +478,8 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
                    ExecutionProviderMode provider_mode, SamplingBackend sampling_backend)
 {
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
+    const auto latent_stats = LoadFlux2LatentStats(
+        model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
     const Flux2ModelCachePaths cache_paths =
         MakeFlux2ModelCachePaths(config.precision, "", config.text_encoder, !config.weight_streaming_budget.empty());
     const bool trt_rtx_device = is_trt_rtx_device(ep_device);
@@ -523,7 +525,6 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
     }
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config.ep_context_dir.string();
-    ep_context.enable_cache = true;
     const std::string cache_dir = config.ep_cache_dir.string();
 
     auto make_profile = [&](std::string cache_subpath, bool transformer = false)
@@ -623,8 +624,8 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
     const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config.prompt);
     FillTextEncoderInputs(text_inputs.token_ids, text_inputs.pad_token_id, state.token->HostData(),
                           state.attention_mask->HostData(), BATCH_SIZE, SEQUENCE_LENGTH);
-    std::copy_n(BN_MEAN, LATENT_CHANNELS, state.bn_mean->HostData());
-    std::copy_n(BN_STD, LATENT_CHANNELS, state.bn_std->HostData());
+    std::copy_n(latent_stats.mean.data(), LATENT_CHANNELS, state.bn_mean->HostData());
+    std::copy_n(latent_stats.std.data(), LATENT_CHANNELS, state.bn_std->HostData());
 
     if (has_separate_binding)
     {

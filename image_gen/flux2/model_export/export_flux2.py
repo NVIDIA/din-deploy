@@ -303,6 +303,21 @@ def export_vae_decoder(
         opset=opset,
     )
     print("  vae_decoder exported.")
+    # Denormalization happens outside the decoder ONNX graph, in patchified channel order.
+    # Use learned BN buffers, not optional config.latents_mean/config.latents_std.
+    mean = vae.bn.running_mean
+    std = torch.sqrt(vae.bn.running_var + 1e-4)
+    expected_channels = vae_latent_channels * patch_size[0] * patch_size[1]
+    if mean.numel() != expected_channels or std.numel() != expected_channels:
+        raise ValueError("VAE latent statistics have an unexpected channel count")
+    if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or not (std > 0).all():
+        raise ValueError("VAE latent statistics must be finite, with positive standard deviations")
+    stats_path = output_path / "vae_decoder" / "latent_stats.json"
+    stats_path.write_text(
+        json.dumps({"bn_mean": mean.float().cpu().tolist(), "bn_std": std.float().cpu().tolist()}, allow_nan=False),
+        encoding="utf-8",
+    )
+    print(f"  VAE latent statistics exported to {stats_path}.")
 
 
 def resolve_model_snapshot(model_name: str, local_files_only: bool) -> Path:
