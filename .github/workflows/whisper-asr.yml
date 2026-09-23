@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -20,7 +21,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    uses: ./.github/workflows/model-changes.yml
+
   requirements:
+    needs: changes
+    if: needs.changes.outputs.whisper == 'true'
     name: Wait for Build
     runs-on: ubuntu-24.04
     timeout-minutes: 100

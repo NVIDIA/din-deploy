@@ -1,0 +1,32 @@
+name: Detect model changes
+
+on:
+  workflow_call:
+    outputs:
+      whisper:
+        value: ${{ jobs.changes.outputs.whisper }}
+      parakeet:
+        value: ${{ jobs.changes.outputs.parakeet }}
+      nemotron:
+        value: ${{ jobs.changes.outputs.nemotron }}
+      sam2:
+        value: ${{ jobs.changes.outputs.sam2 }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      whisper: ${{ steps.changes.outputs.whisper }}
+      parakeet: ${{ steps.changes.outputs.parakeet }}
+      nemotron: ${{ steps.changes.outputs.nemotron }}
+      sam2: ${{ steps.changes.outputs.sam2 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: changes
+        run: python .github/scripts/model_ci.py changes
