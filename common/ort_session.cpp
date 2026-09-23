@@ -399,51 +399,43 @@ bool IsCudaUnifiedMemoryDevice(Ort::ConstEpDevice ep_device)
 
 bool RegisterTensorRTRTXExecutionProvider(Ort::Env& env)
 {
-    static std::once_flag registration_once;
-    static Ort::Env* registered_env = nullptr;
-    std::call_once(registration_once,
-                   [&env]
-                   {
-                       auto provider_library = std::filesystem::path{ONNXRUNTIME_TRT_RTX_EP_LIBRARY_PATH};
-                       if (!std::filesystem::is_regular_file(provider_library))
-                       {
-#ifdef _WIN32
-                           provider_library = ExecutableDirectory() / "onnxruntime_providers_nv_tensorrt_rtx.dll";
-#else
-                           provider_library = ExecutableDirectory() / "libonnxruntime_providers_nv_tensorrt_rtx.so";
-#endif
-                           if (!std::filesystem::is_regular_file(provider_library))
-                           {
-                               throw std::runtime_error("TensorRT RTX execution provider library not found: " +
-                                                        provider_library.string());
-                           }
-                       }
-
-#ifdef _WIN32
-                       const auto provider_directory = provider_library.parent_path().wstring();
-                       if (SetDllDirectoryW(provider_directory.c_str()) == 0)
-                       {
-                           throw std::runtime_error("Failed to add TensorRT RTX EP directory to the DLL search path.");
-                       }
-#endif
-
-                       const auto provider_library_path = ToOrtPathString(provider_library);
-                       env.RegisterExecutionProviderLibrary(kDinNvTensorRTRTXExecutionProvider,
-                                                            provider_library_path.c_str());
-
-                       const auto ep_devices = env.GetEpDevices();
-                       std::cout << "Execution provider devices after TRT RTX registration:\n";
-                       for (const auto& device : ep_devices)
-                       {
-                           std::cout << "  " << device.EpName() << " vendor=" << device.EpVendor()
-                                     << " device_id=" << device.Device().DeviceId() << '\n';
-                       }
-                       registered_env = &env;
-                   });
-
-    if (registered_env != &env)
+    static std::mutex registration_mutex;
+    const std::lock_guard lock(registration_mutex);
+    // Check the native environment, not the address of its C++ wrapper.
+    for (const auto& device : env.GetEpDevices())
+        if (std::string_view{device.EpName()} == kDinNvTensorRTRTXExecutionProvider)
+            return true;
+    auto provider_library = std::filesystem::path{ONNXRUNTIME_TRT_RTX_EP_LIBRARY_PATH};
+    if (!std::filesystem::is_regular_file(provider_library))
     {
-        throw std::logic_error("TensorRT RTX was already registered on a different Ort::Env in this process.");
+#ifdef _WIN32
+        provider_library = ExecutableDirectory() / "onnxruntime_providers_nv_tensorrt_rtx.dll";
+#else
+        provider_library = ExecutableDirectory() / "libonnxruntime_providers_nv_tensorrt_rtx.so";
+#endif
+        if (!std::filesystem::is_regular_file(provider_library))
+        {
+            throw std::runtime_error("TensorRT RTX execution provider library not found: " + provider_library.string());
+        }
+    }
+
+#ifdef _WIN32
+    const auto provider_directory = provider_library.parent_path().wstring();
+    if (SetDllDirectoryW(provider_directory.c_str()) == 0)
+    {
+        throw std::runtime_error("Failed to add TensorRT RTX EP directory to the DLL search path.");
+    }
+#endif
+
+    const auto provider_library_path = ToOrtPathString(provider_library);
+    env.RegisterExecutionProviderLibrary(kDinNvTensorRTRTXExecutionProvider, provider_library_path.c_str());
+
+    const auto ep_devices = env.GetEpDevices();
+    std::cout << "Execution provider devices after TRT RTX registration:\n";
+    for (const auto& device : ep_devices)
+    {
+        std::cout << "  " << device.EpName() << " vendor=" << device.EpVendor()
+                  << " device_id=" << device.Device().DeviceId() << '\n';
     }
     return true;
 }
@@ -564,7 +556,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     const auto output_model_path = CompiledModelPath(model_path, ep_context, profile);
     if (fs::exists(output_model_path))
     {
-        if (IsCompatibleEpContext(env, output_model_path))
+        if (fs::last_write_time(output_model_path) >= fs::last_write_time(model_path) &&
+            IsCompatibleEpContext(env, output_model_path))
         {
             return output_model_path;
         }
@@ -595,6 +588,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     const size_t size_threshold_external_init = 1024;
     compile_options.SetOutputModelExternalInitializersFile(output_external_wide.c_str(), size_threshold_external_init);
 
+    if (ep_context.progress)
+        ep_context.progress({ProgressStage::CompilingModel, fs::path(model_path).filename().string()});
     const Ort::Status status = Ort::CompileModel(env, compile_options);
     if (!status.IsOK())
     {
@@ -788,6 +783,8 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
 {
     DIN_NVTX_FUNC_RANGE();
     auto session_model_path = model_path;
+    if (ep_context.progress)
+        ep_context.progress({ProgressStage::LoadingModel, fs::path(model_path).filename().string()});
 
     if (provider == "trt-rtx")
     {
@@ -825,6 +822,8 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
         throw std::runtime_error("unsupported provider: " + provider);
     }
 
+    if (ep_context.progress)
+        ep_context.progress({ProgressStage::LoadingModel, fs::path(session_model_path).filename().string()});
 #ifdef _WIN32
     const auto wide = ToOrtPathString(session_model_path);
     {

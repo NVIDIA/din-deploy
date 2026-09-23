@@ -8,12 +8,16 @@ DIN Deploy is distributed under the Apache License, Version 2.0. The project sou
 | miniaudio | MIT: <https://github.com/mackron/miniaudio/blob/0.11.23/LICENSE> |
 | lodepng | zlib: <https://github.com/lvandeve/lodepng/blob/master/LICENSE> |
 | nlohmann/json | MIT: <https://github.com/nlohmann/json/blob/develop/LICENSE.MIT> |
+| PCRE2 | BSD-3-Clause WITH PCRE2-exception: <https://github.com/PCRE2Project/pcre2/blob/pcre2-10.46/LICENCE.md> |
+| utf8proc | MIT and Unicode data license: <https://github.com/JuliaStrings/utf8proc/blob/v2.11.0/LICENSE.md> |
 | NVIDIA NVTX | Apache-2.0 with LLVM exception: <https://github.com/NVIDIA/NVTX/blob/master/LICENSE> |
 | ONNX Runtime | MIT: <https://github.com/microsoft/onnxruntime/blob/main/LICENSE> |
 | ONNX Runtime TensorRT RTX EP ABI | Apache-2.0: <https://github.com/NVIDIA/TensorRT-RTX-EP-ABI/blob/main/LICENSE> |
 | Slang | Apache-2.0 with LLVM exception: <https://github.com/shader-slang/slang/blob/master/LICENSE> |
 | Vulkan-Headers and Vulkan-Loader | Apache-2.0: <https://github.com/KhronosGroup/Vulkan-Headers/blob/main/LICENSE.txt> and <https://github.com/KhronosGroup/Vulkan-Loader/blob/main/LICENSE.txt> |
 | nanobind | BSD-3-Clause: <https://github.com/wjakob/nanobind/blob/main/LICENSE> |
+| Qwen3-ASR inference utilities | Apache-2.0, copyright 2026 The Alibaba Qwen team: <https://github.com/QwenLM/Qwen3-ASR/blob/main/LICENSE> |
+| Transformers Qwen3-ASR processing | Apache-2.0, copyright Hugging Face: <https://github.com/huggingface/transformers/blob/v5.13.0/LICENSE> |
 | Python dependencies | See the package license links and inventory below. |
 | Distributed models and model artifacts | See the model license inventory below. Model terms may differ from this project's license. |
 
@@ -28,6 +32,8 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `lodepng`: zlib
 - `nanobind` v2.9.2: BSD-3-Clause
 - `nlohmann/json` v3.11.3: MIT
+- `PCRE2` 10.46: BSD-3-Clause WITH PCRE2-exception
+- `utf8proc` 2.11.0: MIT and Unicode data license
 - NVIDIA NVTX v3.5.0 C/C++: Apache-2.0 WITH LLVM-exception
 - ONNX Runtime SDK 1.27.0: MIT
 - ONNX Runtime TensorRT RTX Execution Provider ABI: Apache-2.0
@@ -90,3 +96,7 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `openai/whisper-large-v3-turbo`: Apache-2.0
 - `openai/whisper-medium`: Apache-2.0
 - `openai/whisper-small`: Apache-2.0
+
+- `Qwen/Qwen3-ASR-0.6B-hf`: Apache-2.0
+- `Qwen/Qwen3-ASR-1.7B-hf`: Apache-2.0
+- `Qwen/Qwen3-ForcedAligner-0.6B-hf`: Apache-2.0
