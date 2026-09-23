@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "forced_aligner.h"
 
+#include "detail/japanese.h"
 #include "detail/runtime.h"
+#include "detail/text.h"
 #include "unicode_regex.h"
 
 namespace din::asr::qwen3::detail
 {
-std::vector<std::string> AlignmentUnits(const std::string& text, const std::string& language)
+std::vector<std::string> AlignmentUnits(const std::string& text, const std::string& language,
+                                        AlignmentGranularity granularity, JapaneseTokenizer* japanese_tokenizer)
 {
     static constexpr std::pair<std::string_view, std::string_view> languages[] = {
         {"zh", "chinese"}, {"yue", "cantonese"}, {"en", "english"}, {"de", "german"},
@@ -21,6 +24,20 @@ std::vector<std::string> AlignmentUnits(const std::string& text, const std::stri
     if (found == std::end(languages))
         throw std::invalid_argument("Forced alignment supports zh, yue, en, de, es, fr, it, pt, ru, ko and ja");
 
+    if (!ValidUtf8(text))
+        throw std::invalid_argument("Alignment requires valid UTF-8 text");
+    if (granularity == AlignmentGranularity::Characters)
+    {
+        static const din::io::UnicodeRegex characters(R"(\X)"), spoken(R"([\p{L}\p{N}'])");
+        std::vector<std::string> result;
+        for (auto unit : characters.FindAll(text))
+            if (!spoken.FindAll(unit).empty())
+                result.push_back(std::move(unit));
+        return result;
+    }
+    if (found->first == "ja")
+        return japanese_tokenizer->Words(text);
+
     // HF keeps Unicode letters/numbers and ASCII apostrophes, dropping punctuation and marks.
     static const din::io::UnicodeRegex kept(R"([\p{L}\p{N}'\s\x{1c}-\x{1f}]+)");
     std::string cleaned;
@@ -31,11 +48,6 @@ std::vector<std::string> AlignmentUnits(const std::string& text, const std::stri
     static const din::io::UnicodeRegex words("[" + cjk + "]|[^" + cjk + R"(\s\x{1c}-\x{1f}]+)");
     // HF's unscored Korean LTokenizer splits on whitespace before cleaning each unit.
     static const din::io::UnicodeRegex korean(R"([^\s\x{1c}-\x{1f}]+)");
-    // Japanese character timestamps avoid a separate Nagisa word-segmentation runtime.
-    static const std::string kana = R"(\x{3040}-\x{30ff}\x{31f0}-\x{31ff}\x{ff66}-\x{ff9f})";
-    static const din::io::UnicodeRegex japanese("[" + cjk + kana + "]|[^" + cjk + kana + R"(\s\x{1c}-\x{1f}]+)");
-    if (found->first == "ja")
-        return japanese.FindAll(cleaned);
     if (found->first == "ko")
         return korean.FindAll(cleaned);
     return words.FindAll(cleaned);
@@ -91,8 +103,7 @@ struct AlignmentEngine
     AudioModel model;
     std::unique_ptr<OrtRunner> text;
     AlignmentEngine(Runtime& runtime, const std::filesystem::path& dir);
-    std::vector<WordTimestamp> Align(const std::vector<float>& features, const std::string& transcript,
-                                     const std::string& language);
+    std::vector<WordTimestamp> Align(const std::vector<float>& features, const std::vector<std::string>& words);
 };
 
 AlignmentEngine::AlignmentEngine(Runtime& runtime, const std::filesystem::path& dir)
@@ -106,15 +117,12 @@ AlignmentEngine::AlignmentEngine(Runtime& runtime, const std::filesystem::path& 
     };
     text = runtime.Runner(dir, "aligner", shape(4, 2), shape(128, 32), shape(8192, 4096));
 }
-std::vector<WordTimestamp> AlignmentEngine::Align(const std::vector<float>& features, const std::string& transcript,
-                                                  const std::string& language)
+std::vector<WordTimestamp> AlignmentEngine::Align(const std::vector<float>& features,
+                                                  const std::vector<std::string>& words)
 {
     din::common::nvtx_scoped_range range{"qwen3.align"};
-    if (transcript.empty())
-        return {};
     const int64_t frames = features.size() / 128;
     std::vector<WordTimestamp> result;
-    const auto words = detail::AlignmentUnits(transcript, language);
     if (words.empty())
         return {};
     if (words.size() > 2048)
@@ -131,7 +139,11 @@ std::vector<WordTimestamp> AlignmentEngine::Align(const std::vector<float>& feat
     const int64_t timestamp_id = model.metadata["timestamp_token_id"];
     for (const auto& word : words)
     {
-        Append(ids, model.tokenizer->Encode(word, false));
+        const auto tokens = model.tokenizer->Encode(word, false);
+        if (std::find(tokens.begin(), tokens.end(), model.audio_id) != tokens.end() ||
+            std::find(tokens.begin(), tokens.end(), timestamp_id) != tokens.end())
+            throw std::invalid_argument("Alignment units must not contain audio or timestamp markers");
+        Append(ids, tokens);
         for (int i = 0; i < 2; ++i)
         {
             slots.push_back(ids.size());
@@ -187,28 +199,34 @@ struct Qwen3ForcedAligner::Impl
     ForcedAlignerConfig config;
     Runtime runtime;
     AlignmentEngine engine;
+    std::unique_ptr<JapaneseTokenizer> japanese;
     explicit Impl(ForcedAlignerConfig cfg)
         : config(std::move(cfg))
-        , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir, config.progress)
+        , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir)
         , engine(runtime, config.model_dir)
     {
         runtime.LoadMel(config.model_dir);
     }
-    std::vector<WordTimestamp> AlignAudio(const din::io::Audio& audio, const std::string& text,
-                                          const std::string& language)
+    std::vector<std::string> Units(const std::string& text, const std::string& language)
     {
+        const auto lang = LowerLanguage(language);
+        if ((lang == "ja" || lang == "japanese") && config.granularity == AlignmentGranularity::Words && !japanese)
+            japanese = std::make_unique<JapaneseTokenizer>(runtime.env, config.model_dir);
+        return AlignmentUnits(text, language, config.granularity, japanese.get());
+    }
+    std::vector<WordTimestamp> AlignAudio(const din::io::Audio& audio, const std::vector<std::string>& words)
+    {
+        for (const auto& word : words)
+            if (word.empty() || !ValidUtf8(word))
+                throw std::invalid_argument("Alignment units must be nonempty UTF-8 text");
+        if (words.empty())
+            return {};
         din::io::Audio normalized;
         const auto& source = NormalizeAudio(audio, normalized);
         if (source.samples.size() > 180 * kRate)
             throw std::invalid_argument("Standalone alignment accepts up to 180 seconds; supply audio/text segments");
-        if (config.progress)
-            config.progress({din::common::ProgressStage::Aligning, "Aligning supplied text", 0, audio.Duration()});
         const auto features = runtime.Features(source.samples);
-        auto result = engine.Align(features, text, language);
-        if (config.progress)
-            config.progress(
-                {din::common::ProgressStage::Aligning, "Alignment complete", audio.Duration(), audio.Duration()});
-        return result;
+        return engine.Align(features, words);
     }
 };
 Qwen3ForcedAligner::Qwen3ForcedAligner(ForcedAlignerConfig config)
@@ -219,13 +237,50 @@ Qwen3ForcedAligner::~Qwen3ForcedAligner() = default;
 std::vector<WordTimestamp> Qwen3ForcedAligner::Align(const din::io::Audio& audio, const std::string& text,
                                                      const std::string& language)
 {
-    return impl_->AlignAudio(audio, text, language);
+    return impl_->AlignAudio(audio, impl_->Units(text, language));
+}
+std::vector<WordTimestamp> Qwen3ForcedAligner::AlignUnits(const din::io::Audio& audio,
+                                                          const std::vector<std::string>& units)
+{
+    return impl_->AlignAudio(audio, units);
+}
+std::vector<WordTimestamp> Qwen3ForcedAligner::AlignSegments(const din::io::Audio& audio,
+                                                             std::span<const AlignmentSegment> segments)
+{
+    if (segments.empty())
+        return {};
+    if (audio.sample_rate != kRate)
+        throw std::invalid_argument("Segment alignment expects mono 16 kHz audio");
+    for (size_t i = 0; i < segments.size(); ++i)
+    {
+        const auto& segment = segments[i];
+        if (segment.start_sample >= segment.end_sample || segment.end_sample > audio.samples.size())
+            throw std::invalid_argument("Alignment segment " + std::to_string(i) + " has invalid audio bounds");
+        const auto count = segment.end_sample - segment.start_sample;
+        if (count > 180 * kRate)
+            throw std::invalid_argument("Alignment segment " + std::to_string(i) +
+                                        " exceeds 180 seconds; supply shorter audio/text segments");
+    }
+    din::io::Audio clip;
+    clip.sample_rate = kRate;
+    std::vector<WordTimestamp> result;
+    for (const auto& segment : segments)
+    {
+        clip.samples.assign(audio.samples.begin() + segment.start_sample, audio.samples.begin() + segment.end_sample);
+        auto aligned = impl_->AlignAudio(clip, impl_->Units(segment.text, segment.language));
+        const float offset = static_cast<float>(segment.start_sample) / kRate;
+        for (auto& word : aligned)
+        {
+            word.start_time += offset;
+            word.end_time += offset;
+            result.push_back(std::move(word));
+        }
+    }
+    return result;
 }
 std::vector<WordTimestamp> Qwen3ForcedAligner::AlignFile(const std::filesystem::path& path, const std::string& text,
                                                          const std::string& language)
 {
-    if (impl_->config.progress)
-        impl_->config.progress({din::common::ProgressStage::DecodingAudio, path.filename().string()});
     return Align(din::io::LoadAudio(path, kRate), text, language);
 }
 }  // namespace din::asr::qwen3

@@ -6,6 +6,7 @@ DIN Deploy is distributed under the Apache License, Version 2.0. The project sou
 |---|---|
 | argparse | MIT: <https://github.com/p-ranav/argparse/blob/master/LICENSE> |
 | miniaudio | MIT: <https://github.com/mackron/miniaudio/blob/0.11.23/LICENSE> |
+| Nagisa word segmentation | MIT: <https://github.com/taishi-i/nagisa/blob/3c4bb48d3ba7451e3314b35337c79f1256ade0cf/LICENSE.txt> |
 | lodepng | zlib: <https://github.com/lvandeve/lodepng/blob/master/LICENSE> |
 | nlohmann/json | MIT: <https://github.com/nlohmann/json/blob/develop/LICENSE.MIT> |
 | PCRE2 | BSD-3-Clause WITH PCRE2-exception: <https://github.com/PCRE2Project/pcre2/blob/pcre2-10.46/LICENCE.md> |
@@ -79,6 +80,8 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `wheel`: MIT
 
 ## Model/Artifact
+
+- Nagisa `nagisa_v001` word segmenter: MIT: <https://github.com/taishi-i/nagisa/blob/3c4bb48d3ba7451e3314b35337c79f1256ade0cf/LICENSE.txt>
 
 - `black-forest-labs/FLUX.2-klein-4b`: Apache-2.0
 - `black-forest-labs/FLUX.2-klein-4b-fp8`: Apache-2.0

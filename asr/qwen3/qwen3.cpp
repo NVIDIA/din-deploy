@@ -5,9 +5,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <optional>
 #include <sstream>
 
 #include "detail/runtime.h"
+#include "detail/text.h"
 
 namespace din::asr::qwen3::detail
 {
@@ -199,10 +201,19 @@ struct Qwen3Pipeline::Impl
     std::unique_ptr<Buffer<int64_t>> next_token;
     std::unique_ptr<Ort::IoBinding> decode_binding, prefill_binding;
     Ort::RunOptions decode_options;
+    struct Stream
+    {
+        StreamingConfig config;
+        size_t chunk_samples;
+        std::vector<float> audio;
+        std::string raw;
+        StreamingResult result;
+    };
+    std::optional<Stream> stream;
 
     explicit Impl(Qwen3Config cfg)
         : config(std::move(cfg))
-        , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir, config.progress)
+        , runtime(config.provider, config.ep_cache_dir, config.ep_context_dir)
         , asr(runtime, config.model_dir, "asr")
     {
         if (config.max_new_tokens <= 0)
@@ -257,21 +268,26 @@ struct Qwen3Pipeline::Impl
         binding.BindOutput("next_token", next_token->BindingValue());
     }
 
-    TranscriptionResult TranscribeChunk(std::span<const float> audio)
+    TranscriptionResult TranscribeChunk(std::span<const float> audio, const std::string& prefix = {},
+                                        std::string* raw_output = nullptr)
     {
         if (audio.empty() || audio.size() > kMaxSamples)
             throw std::runtime_error("Expected nonempty mono 16 kHz audio, at most 1205 seconds per chunk");
-        auto features = runtime.Features(audio);
-        const int64_t frames = features.size() / 128;
-        auto encoded = asr.Encode(features, frames);
         std::vector<int64_t> ids = asr.native["prefixes"][config.lang_id];
-        ids.insert(ids.end(), encoded.tokens, asr.audio_id);
+        const auto audio_tokens = AudioTokens(std::max<size_t>(8000, audio.size()) / 160);
+        ids.insert(ids.end(), audio_tokens, asr.audio_id);
         if (!asr.native.contains("suffixes"))
             throw std::runtime_error("Re-export native prompt assets with --only mel for official language forcing");
         Append(ids, asr.native["suffixes"][config.lang_id].get<std::vector<int64_t>>());
+        if (!prefix.empty())
+            Append(ids, asr.tokenizer->Encode(prefix, false));
+        if (ids.size() + config.max_new_tokens > asr.metadata["cache_capacity"].get<size_t>())
+            throw std::runtime_error("Audio, text prefix and generation budget exceed the exported KV capacity; "
+                                     "use shorter utterances or export a larger cache");
+        auto features = runtime.Features(audio);
+        const int64_t frames = features.size() / 128;
+        auto encoded = asr.Encode(features, frames);
         PrepareCache();
-        if (ids.size() + config.max_new_tokens > static_cast<size_t>(capacity))
-            throw std::runtime_error("Prompt and generation budget exceed the exported KV capacity");
         // Clear on the shared CUDA stream. Unused NaN cache values can poison attention even when masked.
         for (auto& value : cache)
             ZeroTensor(*text, value);
@@ -307,21 +323,48 @@ struct Qwen3Pipeline::Impl
         auto text_tokens = result.tokens;
         if (result.reached_eos)
             text_tokens.pop_back();
-        const auto parsed = detail::ParseOutput(asr.tokenizer->Decode(text_tokens, false),
-                                                asr.native["languages"][config.lang_id].get<std::string>());
+        const auto raw = prefix + asr.tokenizer->Decode(text_tokens, false);
+        if (raw_output)
+            *raw_output = raw;
+        const auto parsed = detail::ParseOutput(raw, asr.native["languages"][config.lang_id].get<std::string>());
         result.language = parsed.first;
         result.text = parsed.second;
         return result;
     }
 
+    StreamingResult DecodeStream(size_t samples, bool final)
+    {
+        auto& s = *stream;
+        std::string prefix;
+        if (s.result.updates >= static_cast<size_t>(s.config.unfixed_chunks) && !s.raw.empty())
+        {
+            auto ids = asr.tokenizer->Encode(s.raw, false);
+            // Roll back incomplete UTF-8 tokens as well as the editable suffix.
+            ids.resize(ids.size() > static_cast<size_t>(s.config.unfixed_tokens) ? ids.size() - s.config.unfixed_tokens
+                                                                                 : 0);
+            while (!ids.empty())
+            {
+                prefix = asr.tokenizer->Decode(ids, false);
+                if (ValidUtf8(prefix) && prefix.find("\xef\xbf\xbd") == std::string::npos)
+                    break;
+                ids.pop_back();
+                prefix.clear();
+            }
+        }
+        auto result = TranscribeChunk(std::span(s.audio).first(samples), prefix, &s.raw);
+        s.result = {std::move(result.text), std::move(result.language), samples,
+                    s.result.updates + 1,   result.reached_eos,         final};
+        return s.result;
+    }
+
     TranscriptionResult Transcribe(const din::io::Audio& audio)
     {
+        if (stream && !stream->result.final)
+            throw std::logic_error("Finish the active stream before offline transcription");
         din::common::nvtx_scoped_range range{"qwen3.transcribe"};
         const auto start = std::chrono::steady_clock::now();
         din::io::Audio normalized;
         const auto* source = &NormalizeAudio(audio, normalized);
-        if (config.progress)
-            config.progress({din::common::ProgressStage::Transcribing, "Transcribing", 0, audio.Duration()});
         TranscriptionResult result;
         result.reached_eos = true;
         std::string previous_language;
@@ -354,12 +397,6 @@ struct Qwen3Pipeline::Impl
             result.segments.push_back({std::move(part.text), std::move(part.language), chunk.begin, chunk.end});
             ++result.chunks_processed;
             result.reached_eos = result.reached_eos && part.reached_eos;
-            if (config.progress)
-                config.progress(
-                    {din::common::ProgressStage::Transcribing,
-                     "Completed chunk " + std::to_string(result.chunks_processed),
-                     chunk.end == source->samples.size() ? audio.Duration() : static_cast<float>(chunk.end) / kRate,
-                     audio.Duration()});
         }
         result.audio_seconds = static_cast<float>(audio.Duration());
         result.transcribe_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
@@ -372,14 +409,45 @@ Qwen3Pipeline::Qwen3Pipeline(Qwen3Config config)
 {
 }
 Qwen3Pipeline::~Qwen3Pipeline() = default;
+void Qwen3Pipeline::StartStream(StreamingConfig config)
+{
+    if (!std::isfinite(config.chunk_seconds) || config.chunk_seconds < 0.5f || config.chunk_seconds > 1200.f ||
+        config.unfixed_chunks < 0 || config.unfixed_tokens < 0)
+        throw std::invalid_argument("Streaming requires chunk-seconds 0.5..1200 and nonnegative rollback settings");
+    impl_->stream = Impl::Stream{config, static_cast<size_t>(std::lround(config.chunk_seconds * kRate)), {}, {}, {}};
+}
+std::vector<StreamingResult> Qwen3Pipeline::PushAudio(std::span<const float> pcm16k)
+{
+    if (!impl_->stream || impl_->stream->result.final)
+        throw std::logic_error("Call StartStream before supplying audio");
+    for (float sample : pcm16k)
+        if (!std::isfinite(sample) || std::abs(sample) > 1.f)
+            throw std::invalid_argument("Streaming expects finite mono 16 kHz float PCM in [-1, 1]");
+    auto& s = *impl_->stream;
+    if (pcm16k.size() > kMaxSamples - s.audio.size())
+        throw std::invalid_argument("Streaming utterance is too long; finish it and start a new stream");
+    s.audio.insert(s.audio.end(), pcm16k.begin(), pcm16k.end());
+    std::vector<StreamingResult> updates;
+    while (s.audio.size() - s.result.samples_processed >= s.chunk_samples)
+        updates.push_back(impl_->DecodeStream(s.result.samples_processed + s.chunk_samples, false));
+    return updates;
+}
+StreamingResult Qwen3Pipeline::FinishStream()
+{
+    if (!impl_->stream)
+        throw std::logic_error("Call StartStream before finishing audio");
+    auto& s = *impl_->stream;
+    if (!s.result.final && s.audio.size() > s.result.samples_processed)
+        impl_->DecodeStream(s.audio.size(), true);
+    s.result.final = true;
+    return s.result;
+}
 TranscriptionResult Qwen3Pipeline::Transcribe(const din::io::Audio& audio)
 {
     return impl_->Transcribe(audio);
 }
 TranscriptionResult Qwen3Pipeline::TranscribeFile(const std::filesystem::path& path)
 {
-    if (impl_->config.progress)
-        impl_->config.progress({din::common::ProgressStage::DecodingAudio, path.filename().string()});
     return Transcribe(din::io::LoadAudio(path, kRate));
 }
 }  // namespace din::asr::qwen3

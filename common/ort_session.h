@@ -13,7 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include "progress.h"
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_run_options_config_keys.h>
 #include <onnxruntime_session_options_config_keys.h>
@@ -69,7 +68,6 @@ QueryCudaGraphicsInteropSharedMemoryInfo(int cuda_device_ordinal, bool high_prio
 struct EpContextOptions
 {
     std::string output_dir;
-    ProgressCallback progress;
 };
 
 struct ModelProfile

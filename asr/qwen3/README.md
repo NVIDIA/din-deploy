@@ -1,6 +1,6 @@
 # Qwen3 ASR and forced alignment
 
-Offline C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; TensorRT RTX supports BF16 (default), FP16 and FP32.
+C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; TensorRT RTX supports BF16 (default), FP16 and FP32.
 
 ## Supported models
 
@@ -15,24 +15,28 @@ Offline C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; Tensor
 | Model / upstream toolkit capability | C++ sample |
 |---|:---:|
 | Offline, single stream | ✓ |
-| Online / streaming | — |
+| Online / streaming, single utterance | ✓ |
 | Batched inference | — |
 | Long-form audio | ✓ |
 | ASR with / without forced alignment | ✓ |
 | Standalone alignment of supplied text | ✓ |
+| Long-form alignment with timed transcript segments (C++ API) | ✓ |
+| Long-form alignment of unsegmented text | — |
 | Automatic language identification / language hint | ✓ |
 | Multilingual ASR: 30 languages and 22 Chinese dialects | ✓ |
 | Word timestamps: en, de, es, fr, it, pt, ru, ko | ✓ |
 | Chinese / Cantonese character timestamps | ✓ |
-| Japanese character timestamps | ✓ |
+| Japanese word timestamps (Nagisa) | ✓ |
+| Character alignment units: all 11 languages (sample extension) | ✓ |
+| Caller-supplied alignment units | ✓ |
 | All 11 upstream alignment languages | ✓ |
 
 ASR uses the [upstream model's language support](https://github.com/QwenLM/Qwen3-ASR).
 ASR accepts all 30 upstream language codes/names and `auto`; dialects use automatic
 recognition or the corresponding language hint, not separate dialect switches.
 Alignment supports Chinese, Cantonese, English, German, Spanish, French, Italian,
-Portuguese, Russian, Korean and Japanese. Japanese uses character timestamps;
-upstream's Nagisa word boundaries differ. Latin words in CJK text stay together.
+Portuguese, Russian, Korean and Japanese. Japanese word boundaries use upstream
+Nagisa; Chinese/Cantonese default to characters, keeping Latin words together.
 Language names/codes are case-insensitive. ASR's other languages require alignment
 to be disabled. Language coverage is not an accuracy guarantee for every dialect.
 
@@ -63,7 +67,12 @@ HF downloads checkpoints automatically. Use `--model` for a local checkpoint or
 `--revision` to pin the source. Keep each export directory intact. Log-mel
 processing reuses the shared Whisper frontend.
 
-Exports contain one encoder and one decoder, each with one weight file, plus the
+Aligner exports also include Nagisa's small FP32 word segmenter and vocabulary.
+It runs on CPU without Python. Add it to an existing aligner export with
+`--task aligner --only japanese --output <aligner-directory>`; no ASR/aligner
+weights or GPU engines need rebuilding.
+
+ASR exports contain one encoder and one decoder, each with one weight file, plus the
 shared log-mel graph. Prefill and token generation update one KV bank in place.
 The decoder uses two fixed TensorRT profiles (512-token prefill and one-token
 steps), compiled once and cached; audio length does not create more encoder/decoder
@@ -104,6 +113,8 @@ cmake --build out\build\windows-x64 --target din_asr_qwen3_cli din_asr_qwen3_ali
 ```powershell
 out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --model-dir D:\models\qwen3-asr-1.7b-onnx-bf16
 out\build\windows-x64\bin\din_asr_qwen3_aligner_cli.exe audio.mp3 --model-dir D:\models\qwen3-aligner-onnx-bf16 --transcript transcript.txt --lang-id zh
+out\build\windows-x64\bin\din_asr_qwen3_aligner_cli.exe audio.mp3 --model-dir D:\models\qwen3-aligner-onnx-bf16 --transcript transcript.txt --lang-id ja --granularity characters
+out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --model-dir D:\models\qwen3-asr-0.6b-onnx-bf16 --stream
 ```
 
 Multi-configuration builds add the configuration (for example, `Release`) under `bin`.
@@ -117,12 +128,33 @@ ASR and alignment are independent APIs in the same library:
 Include `qwen3.h` for ASR or `forced_aligner.h` for alignment. The aligner loads
 no ASR model; use text from Whisper, Parakeet, Nemotron, Qwen ASR or a text file.
 Both CLIs accept `--provider cpu|trt-rtx`, `--model-dir` and cache options independently.
-Reuse instances; each processes one synchronous call at a time. Both configs expose
-`progress` callbacks for loading, compilation and processing.
+Reuse instances; each processes one synchronous call at a time.
 
 `Align` takes mono 16 kHz audio; `AlignFile` decodes it automatically. Alignment
-accepts at most 180 seconds per call. Long recordings require matching audio/text
-segments, with returned timestamps offset by each segment's start.
+accepts at most 180 seconds per call. For long recordings, use
+`AlignSegments(audio, segments)` with text from any ASR. Each `AlignmentSegment`
+contains `text`, half-open `start_sample` / `end_sample` offsets at 16 kHz, and
+`language` (default English). The method reuses the aligner and returns timestamps
+relative to the full recording, in segment order. Bounds and the 180-second limit
+are checked before inference; overlapping intervals are preserved without
+deduplication. Each interval must contain all speech for its text.
+
+`--granularity characters` / `AlignmentGranularity::Characters` aligns Unicode
+graphemes, retaining combining marks and omitting spaces/punctuation except apostrophes.
+`AlignUnits(audio, units)` bypasses text splitting; CLI `--units` reads one unit
+per transcript line. Limits: 2048 units and 8192 context tokens per call. Character
+alignment is a sample extension: the model's 80 ms timestamp bins can give adjacent
+characters identical times; sub-word accuracy is not guaranteed.
+
+Streaming uses `StartStream()`, `PushAudio(mono16k)` and `FinishStream()`.
+The CLI emits replacement hypotheses as JSON lines; use `- --stream` to read
+little-endian float32 mono 16 kHz PCM from stdin. `--chunk-seconds` defaults to 2
+(minimum 0.5); `--unfixed-chunks 2 --unfixed-tokens 5` matches upstream rollback.
+Each update reprocesses accumulated audio using the existing engines, so latency
+grows with utterance length. The exported KV ceiling still applies and overflow
+raises an error; start a new stream for the next utterance. Streaming has no live
+timestamps: align the final text separately. `FinishStream()` flushes the tail;
+UTF-8-safe rollback also applies to that tail.
 
 ASR returns `segments` with text, detected language and half-open `start_sample` /
 `end_sample` offsets at 16 kHz. Its upstream quiet-boundary splitter uses a

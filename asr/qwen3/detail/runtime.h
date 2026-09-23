@@ -354,17 +354,15 @@ struct Runtime
 {
     std::string provider;
     std::filesystem::path ep_cache_dir, ep_context_dir;
-    din::common::ProgressCallback progress;
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "din_asr_qwen3"};
     Ort::SyncStream stream{nullptr};
     std::unique_ptr<OrtRunner> mel;
 
     Runtime(const std::string& execution_provider, const std::filesystem::path& cache,
-            const std::filesystem::path& context, din::common::ProgressCallback callback)
+            const std::filesystem::path& context)
         : provider(execution_provider)
         , ep_cache_dir(cache)
         , ep_context_dir(context)
-        , progress(std::move(callback))
     {
         if (provider == "trt-rtx")
         {
@@ -404,7 +402,7 @@ struct Runtime
         // ORT names external engines by graph, so different profiles need separate directories.
         return std::make_unique<OrtRunner>(
             env, (dir / (name + ".onnx")).string(), provider, ep_cache_dir.string(),
-            din::common::EpContextOptions{(ep_context_dir / profile.cache_subpath).string(), progress}, profile,
+            din::common::EpContextOptions{(ep_context_dir / profile.cache_subpath).string()}, profile,
             stream ? &stream : nullptr);
     }
 

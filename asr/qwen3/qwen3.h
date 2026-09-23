@@ -4,11 +4,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "audio.h"
-#include "progress.h"
 
 namespace din::asr::qwen3
 {
@@ -21,7 +21,6 @@ struct Qwen3Config
     std::string lang_id = "auto";
     int max_new_tokens = 1024;
     int max_chunk_seconds = 0;  // Auto: 1200 s, limited by KV capacity; boundaries add up to 5 s.
-    din::common::ProgressCallback progress;
 };
 
 struct TranscriptionSegment
@@ -45,6 +44,23 @@ struct TranscriptionResult
     float transcribe_seconds = 0;
 };
 
+struct StreamingConfig
+{
+    float chunk_seconds = 2.f;
+    int unfixed_chunks = 2;
+    int unfixed_tokens = 5;
+};
+
+struct StreamingResult
+{
+    std::string text;
+    std::string language;
+    size_t samples_processed = 0;
+    size_t updates = 0;
+    bool reached_eos = true;
+    bool final = false;
+};
+
 // One synchronous stream per instance. Reuse the instance across files.
 class Qwen3Pipeline
 {
@@ -55,6 +71,10 @@ public:
     Qwen3Pipeline& operator=(const Qwen3Pipeline&) = delete;
     TranscriptionResult Transcribe(const din::io::Audio& audio);
     TranscriptionResult TranscribeFile(const std::filesystem::path& path);
+    // One utterance per stream. Each update replaces the previous hypothesis.
+    void StartStream(StreamingConfig config = {});
+    std::vector<StreamingResult> PushAudio(std::span<const float> pcm16k);
+    StreamingResult FinishStream();
 
 private:
     struct Impl;
