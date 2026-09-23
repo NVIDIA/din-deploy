@@ -50,7 +50,7 @@ jobs:
           while [[ -z "$run_id" ]]; do
             run_id="$(
               gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?per_page=100" \
-                --jq ".workflow_runs | map(select(.head_sha == \"$SOURCE_SHA\" and .event == \"$EVENT_NAME\")) | sort_by(.created_at) | last | .id // empty"
+                --jq ".workflow_runs | map(select(.head_sha == \"$SOURCE_SHA\" and .event == \"$EVENT_NAME\" and .conclusion != \"skipped\")) | sort_by(.created_at) | last | .id // empty"
             )"
             [[ -n "$run_id" ]] || sleep 10
           done
