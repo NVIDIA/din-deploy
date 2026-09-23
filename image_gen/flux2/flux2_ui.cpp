@@ -315,7 +315,8 @@ namespace
             ImGui::TextUnformatted("Prompt");
             ImGui::InputTextMultiline("##prompt", prompt.data(), prompt.size(), ImVec2(-1, 100));
             ImGui::RadioButton("Qwen3-4B", &encoder, 0);
-            const bool translator_exists = std::filesystem::is_regular_file(std::filesystem::u8path(model.data()) /
+            const bool translator_exists = model[0] && std::filesystem::is_regular_file(
+                std::filesystem::u8path(model.data()) /
                 "text_encoder_translator/model.onnx");
             ImGui::BeginDisabled(!translator_exists);
             ImGui::RadioButton("Qwen3-0.6B + translator", &encoder, 1);
@@ -461,7 +462,7 @@ int main(int argc, char** argv)
 #else
         const auto cache_root = std::filesystem::path("/tmp/din_deploy/cache");
 #endif
-        args.add_argument("--model-dir").default_value(DEFAULT_MODEL_BASE_PATH.string());
+        args.add_argument("--model-dir").default_value(std::string{});
         args.add_argument("--output").default_value(std::string{});
         const auto runtime_cache_utf8 = (cache_root / "runtime").u8string();
         const auto context_cache_utf8 = (cache_root / "ep_context").u8string();
@@ -478,6 +479,8 @@ int main(int argc, char** argv)
         args.parse_args(argc, argv);
         Flux2Config config;
         config.model_dir = args.get<std::string>("--model-dir");
+        if (config.model_dir.empty() && args.get<bool>("--auto-generate"))
+            throw std::runtime_error("--auto-generate requires --model-dir");
         config.output_path = args.get<std::string>("--output");
         config.ep_cache_dir = std::filesystem::u8path(args.get<std::string>("--ep-cache"));
         config.ep_context_dir = std::filesystem::u8path(args.get<std::string>("--ep-context-dir"));
@@ -488,7 +491,7 @@ int main(int argc, char** argv)
         config.num_images = 1;
         const auto encoder = args.get<std::string>("--encoder");
         const bool translator = encoder == "translator" ||
-        (encoder == "auto" && std::filesystem::is_regular_file(
+        (encoder == "auto" && !config.model_dir.empty() && std::filesystem::is_regular_file(
             config.model_dir / "text_encoder_translator/model.onnx"));
         config.text_encoder = translator ? Flux2TextEncoder::Qwen3_06BTranslator : Flux2TextEncoder::Qwen3_4B;
         config.weight_streaming_budget = "-1";

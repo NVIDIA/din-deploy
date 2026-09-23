@@ -22,12 +22,6 @@
 // Configuration
 // ============================================================================
 
-#ifdef _WIN32
-static const std::filesystem::path DEFAULT_MODEL_BASE_PATH = "S:/din_deploy_artifacts/FLUX.2-klein-4B-onnx";
-#else
-static const std::filesystem::path DEFAULT_MODEL_BASE_PATH = "/mnt/share/onnx/FLUX.2-klein-4B-onnx/";
-#endif
-
 struct Flux2ModelPaths
 {
     std::filesystem::path base_dir;
@@ -49,7 +43,7 @@ inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir, cons
 {
     if (model_dir.empty())
     {
-        model_dir = DEFAULT_MODEL_BASE_PATH;
+        throw std::invalid_argument("Model directory must be specified");
     }
     return {
         model_dir,
