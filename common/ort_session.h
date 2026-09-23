@@ -77,7 +77,6 @@ QueryCudaGraphicsInteropSharedMemoryInfo(int cuda_device_ordinal, bool high_prio
 struct EpContextOptions
 {
     std::string output_dir;
-    bool enable_cache = true;
 };
 
 struct ModelProfile
