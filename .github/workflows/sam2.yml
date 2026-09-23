@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -20,7 +21,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    uses: ./.github/workflows/model-changes.yml
+
   requirements:
+    needs: changes
+    if: needs.changes.outputs.sam2 == 'true'
     name: Wait for Build
     runs-on: ubuntu-24.04
     timeout-minutes: 100
@@ -105,25 +112,29 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          source_hash="$(
-            git ls-files -z -- 'vision/sam2/python/*.py' 'vision/sam2/python/**/*.py' \
-              | xargs -0 sha256sum \
-              | sha256sum \
-              | cut -d' ' -f1
-          )"
           models='{}'
           for slug in \
             sam2.1-hiera-tiny \
             sam2.1-hiera-small \
             sam2.1-hiera-base-plus \
             sam2.1-hiera-large; do
+            source_hash="$(python .github/scripts/model_ci.py key --model sam2 --model-id "facebook/${slug}")"
             artifact_name="vision-${slug}-onnx-v1-${source_hash:0:16}"
-            artifact_run_id="$(
-              gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100" \
-                --jq '.artifacts | map(select(.expired | not)) | sort_by(.created_at) | last | .workflow_run.id // empty'
-            )"
+            artifact_run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$artifact_name\" and (.expired | not)) | \"$GITHUB_RUN_ID\"")"
+            if [[ -z "$artifact_run_id" ]]; then
+              artifact="$(python .github/scripts/find_successful_artifact.py \
+                --repository "$GITHUB_REPOSITORY" --artifact-name "$artifact_name" \
+                --default-branch "$DEFAULT_BRANCH" --event-name "$EVENT_NAME" \
+                --source-branch "$SOURCE_BRANCH" --pull-request "$PULL_REQUEST" --json)"
+              artifact_run_id="$(jq -r '.run_id' <<< "$artifact")"
+            fi
             test -n "$artifact_run_id"
             models="$(jq \
               --arg slug "$slug" \

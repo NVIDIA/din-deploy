@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -20,7 +21,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    uses: ./.github/workflows/model-changes.yml
+
   requirements:
+    needs: changes
+    if: needs.changes.outputs.parakeet == 'true' || needs.changes.outputs.nemotron == 'true'
     name: Wait for Build
     runs-on: ubuntu-24.04
     timeout-minutes: 100
@@ -62,8 +69,9 @@ jobs:
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
 
   export-parakeet:
+    if: needs.changes.outputs.parakeet == 'true'
     name: Export Parakeet TDT ONNX
-    needs: requirements
+    needs: [requirements, changes]
     uses: ./.github/workflows/export-nvidia-asr-model.yml
     with:
       model_slug: parakeet-tdt
@@ -75,8 +83,9 @@ jobs:
       source_ref: ${{ needs.requirements.outputs.source_ref }}
 
   export-nemotron:
+    if: needs.changes.outputs.nemotron == 'true'
     name: Export Nemotron 3.5 ASR Streaming ONNX
-    needs: requirements
+    needs: [requirements, changes]
     uses: ./.github/workflows/export-nvidia-asr-model.yml
     with:
       model_slug: nemotron-3.5-asr-streaming-0.6b
@@ -89,7 +98,10 @@ jobs:
 
   artifacts:
     name: Collect NVIDIA ASR artifacts
-    needs: [export-parakeet, export-nemotron]
+    needs: [requirements, export-parakeet, export-nemotron]
+    if: >-
+      !cancelled() && !failure() &&
+      (needs.export-parakeet.result == 'success' || needs.export-nemotron.result == 'success')
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -127,6 +139,7 @@ jobs:
                   },
               ]
           }
+          matrix["include"] = [model for model in matrix["include"] if model["artifact_name"]]
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
               output.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
           PY
