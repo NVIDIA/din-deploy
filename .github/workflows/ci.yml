@@ -26,25 +26,21 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Install clang-format
+      - name: Install released clang-format
         shell: bash
         run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates curl
-          llvm_install_script="${RUNNER_TEMP}/llvm.sh"
-          curl --fail --location --silent --show-error https://apt.llvm.org/llvm.sh --output "$llvm_install_script"
-          sudo bash "$llvm_install_script" 22
-          sudo apt-get install -y --no-install-recommends clang-format-22
+          set -euo pipefail
+          python3 -m pip install --user --disable-pip-version-check "clang-format==22.1.8"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Check formatting
         shell: bash
         run: |
           set -euo pipefail
-          clang-format-22 --version
+          clang-format --version
           git ls-files -z -- \
             '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.hxx' '*.cu' '*.cuh' \
-            | xargs -0 -r clang-format-22 --dry-run --Werror --
+            | xargs -0 -r clang-format --dry-run --Werror --
 
   linux-x64:
     name: Ubuntu 24.04 / Clang / x64
@@ -58,7 +54,7 @@ jobs:
         run: |
           set -euxo pipefail
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev
+          apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 
       - name: Check out source
         uses: actions/checkout@v7
@@ -101,7 +97,7 @@ jobs:
         run: |
           set -euxo pipefail
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev
+          apt-get install -y --no-install-recommends ca-certificates clang cmake git ninja-build python3 python3-dev libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 
       - name: Check out source
         uses: actions/checkout@v7

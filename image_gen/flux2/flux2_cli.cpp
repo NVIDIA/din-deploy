@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -19,12 +20,12 @@
 
 namespace
 {
-
 unsigned int parse_uint(const std::string& value, const char* flag_name)
 {
     size_t parsed_chars = 0;
     const unsigned long parsed = std::stoul(value, &parsed_chars, 10);
-    if (parsed_chars != value.size())
+    if (value.empty() || value.front() == '-' || parsed_chars != value.size() ||
+        parsed > std::numeric_limits<unsigned int>::max())
     {
         throw std::invalid_argument(std::string(flag_name) + " must be an unsigned integer");
     }
@@ -45,6 +46,8 @@ std::string to_string(Flux2ProcessingBackend backend)
         return "dx-cig";
     case Flux2ProcessingBackend::Vk:
         return "vk";
+    case Flux2ProcessingBackend::VkCig:
+        return "vk-cig";
     }
     return "unknown";
 }
@@ -87,7 +90,11 @@ Flux2ProcessingBackend parse_processing_backend(std::string value)
     {
         return Flux2ProcessingBackend::Vk;
     }
-    throw std::invalid_argument("Processing must be one of: cpu, cuda, dx, dx-cig, vk");
+    if (value == "vk-cig")
+    {
+        return Flux2ProcessingBackend::VkCig;
+    }
+    throw std::invalid_argument("Processing must be one of: cpu, cuda, dx, dx-cig, vk, vk-cig");
 }
 
 Flux2ExecutionProvider parse_execution_provider(std::string value)
@@ -107,6 +114,19 @@ Flux2ExecutionProvider parse_execution_provider(std::string value)
     throw std::invalid_argument("Provider must be one of: cpu, trt-rtx");
 }
 
+std::string parse_precision(std::string value)
+{
+    for (char& c : value)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (value == "bf16" || value == "fp16" || value == "fp8" || value == "nvfp4")
+    {
+        return value;
+    }
+    throw std::invalid_argument("Precision must be one of: bf16, fp16, fp8, nvfp4");
+}
+
 void validate_config(const Flux2Config& config)
 {
     if (config.provider == Flux2ExecutionProvider::Cpu && config.processing != Flux2ProcessingBackend::Cpu)
@@ -118,7 +138,6 @@ void validate_config(const Flux2Config& config)
 Flux2Config parse_args(int argc, char* argv[])
 {
     Flux2Config config;
-    config.model_dir = DEFAULT_MODEL_BASE_PATH;
     config.prompt = DEFAULT_PROMPT;
 
     argparse::ArgumentParser parser("din_flux2");
@@ -126,7 +145,7 @@ Flux2Config parse_args(int argc, char* argv[])
     parser.add_argument("--processing")
         .default_value(to_string(config.processing))
         .nargs(1)
-        .metavar("cpu|cuda|dx|dx-cig|vk")
+        .metavar("cpu|cuda|dx|dx-cig|vk|vk-cig")
         .help("Select the processing backend.");
     parser.add_argument("--provider")
         .default_value(to_string(config.provider))
@@ -134,10 +153,15 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("cpu|trt-rtx")
         .help("Select the ONNX Runtime execution provider.");
     parser.add_argument("--model-dir")
-        .default_value(config.model_dir.string())
+        .required()
         .nargs(1)
         .metavar("PATH")
-        .help("Directory with exported Flux2 ONNX artifacts.");
+        .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
+    parser.add_argument("--precision")
+        .default_value(config.precision)
+        .nargs(1)
+        .metavar("bf16|fp16|fp8|nvfp4")
+        .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
         .default_value(config.ep_cache_dir.string())
         .nargs(1)
@@ -159,6 +183,11 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("TEXT")
         .help("Prompt text to encode with the Flux2 tokenizer.");
     parser.add_argument("--seed").default_value(std::to_string(config.seed)).nargs(1).metavar("N").help("Random seed.");
+    parser.add_argument("--encoder").default_value(std::string("4b")).help("4b or translator.");
+    parser.add_argument("--steps").default_value(std::string("4")).help("Denoise steps, 1 through 50.");
+    parser.add_argument("--ws")
+          .default_value(std::string("off"))
+          .help("Transformer resident budget: off or 0% through 100%.");
     parser.add_argument("--num-images")
         .default_value(std::to_string(config.num_images))
         .nargs(1)
@@ -178,16 +207,29 @@ Flux2Config parse_args(int argc, char* argv[])
     config.processing = parse_processing_backend(parser.get<std::string>("--processing"));
     config.provider = parse_execution_provider(parser.get<std::string>("--provider"));
     config.model_dir = parser.get<std::string>("--model-dir");
+    config.precision = parse_precision(parser.get<std::string>("--precision"));
     config.ep_cache_dir = parser.get<std::string>("--ep-cache");
     config.ep_context_dir = parser.get<std::string>("--ep-context-dir");
     config.prompt = parser.get<std::string>("--prompt");
     config.seed = parse_uint(parser.get<std::string>("--seed"), "--seed");
+    const auto encoder = parser.get<std::string>("--encoder");
+    if (encoder != "4b" && encoder != "translator")
+        throw std::invalid_argument("--encoder must be 4b or translator");
+    config.text_encoder = encoder == "4b" ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+    const auto steps = parse_uint(parser.get<std::string>("--steps"), "--steps");
+    if (steps < 1 || steps > 50)
+        throw std::invalid_argument("--steps must be 1 through 50");
+    config.steps = static_cast<int>(steps);
+    config.weight_streaming_budget = parser.get<std::string>("--ws");
+    if (config.weight_streaming_budget == "off")
+        config.weight_streaming_budget.clear();
     config.num_images = parse_uint(parser.get<std::string>("--num-images"), "--num-images");
 
     const std::filesystem::path output_dir = parser.get<std::string>("--output");
     std::filesystem::create_directories(output_dir);
     config.output_path = output_dir / "flux2.png";
     validate_config(config);
+    ValidateFlux2Config(config);
 
     return config;
 }
@@ -212,7 +254,6 @@ void save_image(const std::filesystem::path& output_path, const Flux2Image& imag
     }
     std::cout << "Image saved to " << output_path.string() << std::endl;
 }
-
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -224,6 +265,7 @@ int main(int argc, char* argv[])
     {
         const Flux2Config config = parse_args(argc, argv);
         std::cout << "Model dir: " << config.model_dir.string() << "\n"
+                  << "Precision: " << config.precision << "\n"
                   << "Output: " << config.output_path.string() << "\n"
                   << "Prompt: " << config.prompt << "\n"
                   << "Seed:   " << config.seed << "\n"
@@ -244,6 +286,10 @@ int main(int argc, char* argv[])
                       << " (seed=" << current_seed << ") ==========" << std::endl;
             const auto image_start = std::chrono::steady_clock::now();
             Flux2Image image = pipeline->GenerateImage(current_seed);
+            const auto& times = image.timings;
+            std::cout << "Timings (ms): encode=" << times.encode_ms << " rng=" << times.rng_ms
+                << " denoise=" << times.denoise_ms << " decode=" << times.decode_ms << " total=" << times.total_ms
+                << std::endl;
             const auto image_end = std::chrono::steady_clock::now();
             save_image(make_output_path(config, image_index), image);
             const std::chrono::duration<double> image_duration = image_end - image_start;

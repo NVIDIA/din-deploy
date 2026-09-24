@@ -4,6 +4,7 @@ enable_language(CUDA)
 include(slang)
 
 option(FLUX2_ENABLE_VULKAN_VALIDATION "Enable Vulkan validation layers for the Flux2 Vulkan target" ON)
+option(DIN_BUILD_FLUX2_UI "Build the GLFW/OpenGL Flux2 desktop sample" ON)
 
 add_library(din_flux2_common STATIC
     utils.cpp
@@ -18,6 +19,8 @@ target_include_directories(din_flux2_common
 target_link_libraries(din_flux2_common
     PUBLIC
         din_common_ort
+        PRIVATE
+        nlohmann_json::nlohmann_json
 )
 
 set_target_properties(din_flux2_common PROPERTIES
@@ -135,6 +138,11 @@ add_din_executable(din_flux2_cli
     flux2_cli.cpp
 )
 target_link_libraries(din_flux2_cli PRIVATE argparse din_flux2_runtime)
+if (DIN_BUILD_FLUX2_UI)
+    include(imgui)
+    add_din_ui_executable(din_flux2_ui flux2_ui.cpp)
+    target_link_libraries(din_flux2_ui PRIVATE argparse din_flux2_runtime CUDA::cudart)
+endif ()
 if(TARGET din_flux2_dx)
     target_link_libraries(din_flux2_cli PRIVATE din_flux2_dx)
 endif()

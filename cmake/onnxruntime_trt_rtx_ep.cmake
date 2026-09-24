@@ -9,7 +9,7 @@ set(ONNXRUNTIME_TRT_RTX_EP_GIT_REPOSITORY
     "https://github.com/NVIDIA/TensorRT-RTX-EP-ABI.git"
     CACHE STRING "Git repository for the ONNX Runtime TensorRT RTX Execution Provider")
 set(ONNXRUNTIME_TRT_RTX_EP_GIT_TAG
-    "v0.4.0"
+        "v0.5.0"
     CACHE STRING "Git tag, branch, or commit for the ONNX Runtime TensorRT RTX Execution Provider")
 set(ONNXRUNTIME_TRT_RTX_EP_GIT_HTTP_TOKEN
     ""

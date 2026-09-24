@@ -14,7 +14,7 @@ Usage:
 Output layout:
     <output>/
         text_encoder/model.onnx + model.onnx_data
-        transformer/model.onnx + model.onnx_data
+        transformer_bf16/model.onnx + model.onnx_data
         vae_encoder/model.onnx + model.onnx_data
         vae_decoder/model.onnx + model.onnx_data
         scheduler/ (config only)
@@ -33,13 +33,14 @@ import sys
 from pathlib import Path
 
 import torch
-from diffusers import Flux2KleinPipeline as FluxPipeline
 from huggingface_hub import snapshot_download
+from translator import add_translator_arguments, load_translator_encoder
 
 EXTERNAL_DATA_NAME = "model.onnx_data"
 DEFAULT_MODEL_NAME = "black-forest-labs/FLUX.2-klein-4b"
 DEFAULT_MODEL_OPSETS = {
     "text_encoder": 25,
+    "text_encoder_translator": 25,
     "transformer": 25,
     "vae_encoder": 22,
     "vae_decoder": 22,
@@ -49,6 +50,11 @@ DEFAULT_MODEL_OPSETS = {
 IO_PRECISION_MAP = {
     "fp32": torch.float32,
 }
+
+
+def model_output_path(output_path: Path, name: str, transformer_precision: str) -> Path:
+    directory = f"transformer_{transformer_precision}" if name == "transformer" else name
+    return output_path / directory / "model.onnx"
 
 
 def _configure_stdio():
@@ -165,6 +171,7 @@ def export_transformer(
     image_size: int = 1024,
     seq_len: int = 512,
     io_dtype: torch.dtype = torch.float32,
+    transformer_precision: str = "bf16",
 ):
     """Export with static shapes for image_size x image_size (default 1024x1024)."""
     trans = pipe.transformer
@@ -209,7 +216,7 @@ def export_transformer(
     _onnx_export(
         wrapper,
         (dummy_hidden, dummy_encoder, dummy_timestep, dummy_img_ids, dummy_txt_ids),
-        output_path / "transformer" / "model.onnx",
+        model_output_path(output_path, "transformer", transformer_precision),
         input_names=["hidden_states", "encoder_hidden_states", "timestep", "img_ids", "txt_ids"],
         output_names=["sample"],
         opset=opset,
@@ -296,6 +303,21 @@ def export_vae_decoder(
         opset=opset,
     )
     print("  vae_decoder exported.")
+    # Denormalization happens outside the decoder ONNX graph, in patchified channel order.
+    # Use learned BN buffers, not optional config.latents_mean/config.latents_std.
+    mean = vae.bn.running_mean
+    std = torch.sqrt(vae.bn.running_var + 1e-4)
+    expected_channels = vae_latent_channels * patch_size[0] * patch_size[1]
+    if mean.numel() != expected_channels or std.numel() != expected_channels:
+        raise ValueError("VAE latent statistics have an unexpected channel count")
+    if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or not (std > 0).all():
+        raise ValueError("VAE latent statistics must be finite, with positive standard deviations")
+    stats_path = output_path / "vae_decoder" / "latent_stats.json"
+    stats_path.write_text(
+        json.dumps({"bn_mean": mean.float().cpu().tolist(), "bn_std": std.float().cpu().tolist()}, allow_nan=False),
+        encoding="utf-8",
+    )
+    print(f"  VAE latent statistics exported to {stats_path}.")
 
 
 def resolve_model_snapshot(model_name: str, local_files_only: bool) -> Path:
@@ -309,6 +331,8 @@ def copy_scheduler_and_tokenizer(model_snapshot: Path, output_path: Path):
     for name in ("scheduler", "tokenizer"):
         src = model_snapshot / name
         dst = output_path / name
+        if src.resolve() == dst.resolve():
+            continue
         if src.exists():
             if dst.exists():
                 shutil.rmtree(dst)
@@ -422,7 +446,7 @@ def main():
         nargs="+",
         default=None,
         metavar="NAME",
-        help="Model(s) to export: one or more of all, text_encoder, transformer, vae_encoder, vae_decoder (default: all)",
+        help="Models to export: all, text_encoder, text_encoder_translator, transformer, vae_encoder, vae_decoder. Translator is opt-in.",
     )
     ap.add_argument(
         "--opset",
@@ -445,6 +469,12 @@ def main():
         choices=list(IO_PRECISION_MAP.keys()),
         default="fp32",
         help="IO precision of ONNX models; only fp32 is supported by the C++ pipeline",
+    )
+    ap.add_argument(
+        "--transformer-precision",
+        choices=["bf16", "fp8", "nvfp4"],
+        default="bf16",
+        help="Precision label used for the transformer_<precision> output directory.",
     )
     ap.add_argument(
         "--compile_trt",
@@ -474,6 +504,7 @@ def main():
         default=[],
         help="Additional argument to pass to tensorrt_rtx. May be specified more than once.",
     )
+    add_translator_arguments(ap)
     args = ap.parse_args()
 
     model_snapshot = resolve_model_snapshot(args.model_name, args.local_files_only)
@@ -483,7 +514,7 @@ def main():
     seq_len    = 512  # static text sequence length for FLUX.2-klein
 
     # Parse --model: default all; otherwise one or more of all, text_encoder, transformer, …
-    model_choices = ["all"] + list(MODELS)
+    model_choices = ["all", "text_encoder_translator"] + list(MODELS)
     raw = args.model if args.model is not None else ["all"]
     to_export: list[str] = []
     for m in raw:
@@ -506,27 +537,42 @@ def main():
         f"Loading pipeline from {args.model_name} ({model_snapshot}) "
         f"(dtype={dtype}, image_size={image_size}, io_precision={args.io_precision})..."
     )
-    pipe = FluxPipeline.from_pretrained(str(model_snapshot), torch_dtype=dtype).to(device)
+    pipe = None
+    if any(name != "text_encoder_translator" for name in to_export):
+        from diffusers import Flux2KleinPipeline as FluxPipeline
+        pipe = FluxPipeline.from_pretrained(str(model_snapshot), torch_dtype=dtype).to(device)
 
     exported_model_paths: list[Path] = []
     for name in to_export:
         model_opset = args.opset if args.opset is not None else DEFAULT_MODEL_OPSETS[name]
         print(f"Exporting {name}...")
+        if name == "text_encoder_translator":
+            encoder = load_translator_encoder(args, device)
+            ids = torch.zeros((1, seq_len), dtype=torch.int64, device=device)
+            mask = torch.ones_like(ids)
+            path = model_output_path(output_path, name, args.transformer_precision)
+            _onnx_export(encoder, (ids, mask), path,
+                         ["input_ids", "attention_mask"], ["prompt_embeds"], model_opset)
+            exported_model_paths.append(path)
+            del encoder
+            torch.cuda.empty_cache()
+            continue
         fn = EXPORTERS[name]
         if name == "text_encoder":
             fn(pipe, output_path, device, model_opset,
                seq_len=seq_len, io_dtype=io_dtype)
         elif name == "transformer":
             fn(pipe, output_path, device, model_opset,
-               image_size=image_size, seq_len=seq_len, io_dtype=io_dtype)
+               image_size=image_size, seq_len=seq_len, io_dtype=io_dtype,
+               transformer_precision=args.transformer_precision)
         elif name in ("vae_encoder", "vae_decoder"):
             fn(pipe, output_path, device, model_opset,
                image_size=image_size, io_dtype=io_dtype)
         else:
             fn(pipe, output_path, device, model_opset, io_dtype=io_dtype)
-        exported_model_paths.append(output_path / name / "model.onnx")
+        exported_model_paths.append(model_output_path(output_path, name, args.transformer_precision))
 
-    if export_all:
+    if export_all or "text_encoder_translator" in to_export:
         copy_scheduler_and_tokenizer(model_snapshot, output_path)
         write_model_index(output_path)
 

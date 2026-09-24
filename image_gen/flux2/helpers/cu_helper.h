@@ -212,6 +212,7 @@ public:
     {
         return stream_;
     }
+
     cudaStream_t runtime() const
     {
         return reinterpret_cast<cudaStream_t>(stream_);
