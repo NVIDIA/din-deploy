@@ -94,3 +94,8 @@ audio/
 TODO
 frames/
 .run/
+
+# Local Qwen3 validation and development helpers
+asr/qwen3/internal/
+asr/qwen3/model_export/_internal/
+asr/qwen3/tests/

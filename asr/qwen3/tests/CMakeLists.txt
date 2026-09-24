@@ -1,0 +1,3 @@
+add_executable(din_qwen3_text_output_test text_output_test.cpp)
+target_link_libraries(din_qwen3_text_output_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME din_qwen3_text_output COMMAND din_qwen3_text_output_test)
