@@ -1,0 +1,100 @@
+{
+  "name": "sam2",
+  "source_roots": [
+    "vision/sam2"
+  ],
+  "targets": [
+    "din_sam2_cli",
+    "din_sam2_verify_masks"
+  ],
+  "export": {
+    "cache_epoch": 1,
+    "install": [
+      [
+        "{python}",
+        "-m",
+        "pip",
+        "install",
+        "--index-url",
+        "https://download.pytorch.org/whl/cpu",
+        "torch",
+        "torchvision"
+      ],
+      [
+        "{python}",
+        "-m",
+        "pip",
+        "install",
+        "huggingface_hub",
+        "numpy",
+        "onnx",
+        "onnxscript",
+        "sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4"
+      ]
+    ],
+    "command": [
+      "{python}",
+      "vision/sam2/python/export_sam2_onnx.py",
+      "--model",
+      "{model_id}",
+      "--output",
+      "{output}",
+      "--device",
+      "cpu",
+      "--dtype",
+      "{dtype}",
+      "--max-points",
+      "3"
+    ],
+    "required_files": [
+      "image_preprocess.onnx",
+      "image_encoder.onnx",
+      "sam2_decoder.onnx",
+      "sam2_decoder_propagate.onnx",
+      "memory_attention.onnx",
+      "memory_encoder.onnx",
+      "mask_postprocess.onnx",
+      "metadata.json"
+    ]
+  },
+  "smoke": {
+    "decode_base64": {
+      "assets/sam2-ci.png.base64": "assets/sam2-ci.png"
+    },
+    "mkdir": [
+      "out/{slug}"
+    ],
+    "command": [
+      "{executable}",
+      "assets/sam2-ci.png",
+      "assets/sam2-ci-prompt.json",
+      "out/{slug}",
+      "--model-dir",
+      "{output}",
+      "--provider",
+      "cpu"
+    ]
+  },
+  "variants": [
+    {
+      "slug": "sam2.1-hiera-tiny",
+      "model_id": "facebook/sam2.1-hiera-tiny",
+      "precision": "fp16"
+    },
+    {
+      "slug": "sam2.1-hiera-small",
+      "model_id": "facebook/sam2.1-hiera-small",
+      "precision": "fp16"
+    },
+    {
+      "slug": "sam2.1-hiera-base-plus",
+      "model_id": "facebook/sam2.1-hiera-base-plus",
+      "precision": "fp16"
+    },
+    {
+      "slug": "sam2.1-hiera-large",
+      "model_id": "facebook/sam2.1-hiera-large",
+      "precision": "fp16"
+    }
+  ]
+}

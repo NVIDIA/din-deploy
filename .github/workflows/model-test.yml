@@ -1,0 +1,109 @@
+name: Model export and inference
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        required: true
+        type: string
+      variant:
+        required: true
+        type: string
+      force_export:
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    outputs:
+      name: ${{ steps.resolve.outputs.name || steps.export.outputs.name }}
+      run_id: ${{ steps.resolve.outputs.run_id || steps.export.outputs.run_id }}
+    env:
+      MODEL: ${{ inputs.model }}
+      VARIANT: ${{ inputs.variant }}
+      FORCE_EXPORT: ${{ inputs.force_export }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Find a successful matching export
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+          PULL_REQUEST: ${{ github.event.pull_request.number }}
+        run: python .github/scripts/run_model_ci.py resolve
+      - name: Reclaim export disk space
+        if: steps.resolve.outputs.found != 'true'
+        run: sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android /usr/share/dotnet
+      - name: Install dependencies and export model
+        if: steps.resolve.outputs.found != 'true'
+        id: export
+        run: python .github/scripts/run_model_ci.py export
+      - uses: actions/upload-artifact@v7
+        if: steps.resolve.outputs.found != 'true'
+        with:
+          name: ${{ steps.export.outputs.name }}
+          path: artifacts/ci/${{ inputs.variant }}/
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    needs: export
+    name: ${{ matrix.platform }} / CPU
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            container: nvidia/cuda:13.2.1-runtime-ubuntu24.04
+          - platform: windows-x64
+            runner: windows-2025
+            container: ''
+    env:
+      MODEL: ${{ inputs.model }}
+      VARIANT: ${{ inputs.variant }}
+    steps:
+      - name: Install Python in Linux runtime container
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y --no-install-recommends python3
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.12'
+      - name: Download native build from this run
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.platform }}-release
+          path: runtime
+      - name: Download matching model export
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.export.outputs.name }}
+          path: artifacts/ci/${{ inputs.variant }}/
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.export.outputs.run_id }}
+      - name: Run model inference
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            python3 .github/scripts/run_model_ci.py smoke
+          else
+            python .github/scripts/run_model_ci.py smoke
+          fi

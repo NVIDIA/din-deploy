@@ -1,0 +1,105 @@
+{
+  "name": "whisper",
+  "source_roots": [
+    "asr/whisper"
+  ],
+  "targets": [
+    "din_asr_whisper_cli"
+  ],
+  "export": {
+    "cache_epoch": 1,
+    "install": [
+      [
+        "{python}",
+        "-m",
+        "pip",
+        "install",
+        "--index-url",
+        "https://download.pytorch.org/whl/cpu",
+        "torch"
+      ],
+      [
+        "{python}",
+        "-m",
+        "pip",
+        "install",
+        "onnx",
+        "onnxscript",
+        "safetensors",
+        "transformers"
+      ]
+    ],
+    "command": [
+      "{python}",
+      "asr/whisper/model_export/export_whisper.py",
+      "--model",
+      "{model_id}",
+      "--output",
+      "{output}",
+      "--device",
+      "cpu",
+      "--dtype",
+      "{precision}",
+      "--attention",
+      "{attention}"
+    ],
+    "required_files": [
+      "encoder.onnx",
+      "decoder.onnx",
+      "mel.onnx",
+      "vocab.json"
+    ]
+  },
+  "smoke": {
+    "command": [
+      "{executable}",
+      "assets/sample.wav",
+      "--model-dir",
+      "{output}",
+      "--provider",
+      "cpu"
+    ]
+  },
+  "variants": [
+    {
+      "slug": "whisper-tiny",
+      "model_id": "openai/whisper-tiny",
+      "precision": "fp16",
+      "attention": "sdpa",
+      "fallback_precision": "fp32"
+    },
+    {
+      "slug": "whisper-base",
+      "model_id": "openai/whisper-base",
+      "precision": "fp32",
+      "attention": "sdpa"
+    },
+    {
+      "slug": "whisper-small",
+      "model_id": "openai/whisper-small",
+      "precision": "fp16",
+      "attention": "math",
+      "fallback_precision": "fp32"
+    },
+    {
+      "slug": "whisper-medium",
+      "model_id": "openai/whisper-medium",
+      "precision": "fp32",
+      "attention": "sdpa"
+    },
+    {
+      "slug": "whisper-large-v3",
+      "model_id": "openai/whisper-large-v3",
+      "precision": "fp16",
+      "attention": "sdpa",
+      "fallback_precision": "fp32"
+    },
+    {
+      "slug": "whisper-large-v3-turbo",
+      "model_id": "openai/whisper-large-v3-turbo",
+      "precision": "fp16",
+      "attention": "sdpa",
+      "fallback_precision": "fp32"
+    }
+  ]
+}
