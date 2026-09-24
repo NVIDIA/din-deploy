@@ -15,6 +15,7 @@ enum class Flux2ProcessingBackend
     Dx,
     DxCig,
     Vk,
+    VkCig,
 };
 
 enum class Flux2ExecutionProvider
@@ -28,6 +29,7 @@ struct Flux2Config
     Flux2ProcessingBackend processing = Flux2ProcessingBackend::Cuda;
     Flux2ExecutionProvider provider = Flux2ExecutionProvider::TrtRtx;
     std::filesystem::path model_dir;
+    std::string precision = "bf16";
     std::filesystem::path ep_cache_dir = "artifacts/flux2/trt_rtx_cache";
     std::filesystem::path ep_context_dir = "artifacts/flux2/ep_context";
     std::filesystem::path output_path;

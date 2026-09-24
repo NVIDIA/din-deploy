@@ -20,6 +20,7 @@
 
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <Windows.h>
 #include <wrl/client.h>
 
@@ -50,9 +51,13 @@ struct DxBuffer
 class DxContext
 {
 public:
-    DxContext()
+    explicit DxContext(uint64_t ort_luid)
     {
-        LoadLibraryW(L"dxgi.dll");
+        HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+        if (dxgi == nullptr)
+        {
+            throw std::runtime_error("dxgi.dll is not available");
+        }
         HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
         if (d3d12 == nullptr)
         {
@@ -60,13 +65,60 @@ public:
         }
 
         using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+        using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
+        auto create_factory = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+        if (create_factory == nullptr)
+        {
+            throw std::runtime_error("CreateDXGIFactory1 is not available");
+        }
         auto create_device = reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(d3d12, "D3D12CreateDevice"));
         if (create_device == nullptr)
         {
             throw std::runtime_error("D3D12CreateDevice is not available");
         }
 
-        dx_check(create_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+        ComPtr<IDXGIFactory1> factory;
+        dx_check(create_factory(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
+
+        ComPtr<IDXGIAdapter1> selected_adapter;
+        uint32_t matching_adapters = 0;
+        for (UINT adapter_index = 0;; ++adapter_index)
+        {
+            ComPtr<IDXGIAdapter1> adapter;
+            const HRESULT enum_result = factory->EnumAdapters1(adapter_index, &adapter);
+            if (enum_result == DXGI_ERROR_NOT_FOUND)
+            {
+                break;
+            }
+            dx_check(enum_result, "EnumAdapters1");
+
+            DXGI_ADAPTER_DESC1 desc{};
+            dx_check(adapter->GetDesc1(&desc), "IDXGIAdapter1::GetDesc1");
+            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0)
+            {
+                continue;
+            }
+            const uint64_t adapter_luid =
+                (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32) |
+                static_cast<uint32_t>(desc.AdapterLuid.LowPart);
+            if (adapter_luid == ort_luid)
+            {
+                selected_adapter = adapter;
+                ++matching_adapters;
+            }
+        }
+        if (matching_adapters != 1)
+        {
+            char msg[192];
+            snprintf(msg, sizeof(msg), "Expected exactly one DXGI adapter matching ORT LUID 0x%016llX, found %u",
+                     static_cast<unsigned long long>(ort_luid), matching_adapters);
+            throw std::runtime_error(msg);
+        }
+        printf("ORT LUID: 0x%016llX; selected DXGI LUID: 0x%016llX\n", static_cast<unsigned long long>(ort_luid),
+               static_cast<unsigned long long>(ort_luid));
+
+        dx_check(create_device(selected_adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
+                 "D3D12CreateDevice");
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
