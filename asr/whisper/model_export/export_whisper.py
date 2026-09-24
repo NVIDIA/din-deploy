@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import torch
@@ -29,6 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from common.model_export.kv_cache import FixedKVCache  # noqa: E402
 from common.model_export.log_mel import LogMel as WhisperMel  # noqa: E402
 
 EXT_SUFFIX = ".onnx.data"  # external data file sits next to <name>.onnx
@@ -81,10 +83,8 @@ def _configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            try:
+            with suppress(Exception):
                 reconfigure(encoding="utf-8")
-            except Exception:
-                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -170,7 +170,7 @@ class EncoderExport(nn.Module):
         out_dtype = audio_features.dtype
         hidden = self.encoder(audio_features.float()).last_hidden_state  # fp32 [1, 1500, E]
         keys, values = [], []
-        for k_proj, v_proj in zip(self.cross_k, self.cross_v):
+        for k_proj, v_proj in zip(self.cross_k, self.cross_v, strict=True):
             keys.append(_split_heads(k_proj(hidden), self.n_heads, self.head_dim).to(out_dtype))
             values.append(_split_heads(v_proj(hidden), self.n_heads, self.head_dim).to(out_dtype))
         # Order must match output_names: hidden, all keys, then all values (fp16 IO).
@@ -203,7 +203,7 @@ class DecoderExport(nn.Module):
         self.embed_dim = cfg.d_model
         self.n_heads = cfg.decoder_attention_heads
         self.head_dim = cfg.d_model // cfg.decoder_attention_heads
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.max_length = cfg.max_target_positions
         self.use_sdpa = use_sdpa
 
@@ -229,10 +229,8 @@ class DecoderExport(nn.Module):
         valid = populated & causal
         self_bias = torch.where(valid, 0.0, -1e4).unsqueeze(0).unsqueeze(0)
 
-        present = []
+        kv_cache = FixedKVCache(cache, write_indices, layer_stride=4)
         for i, layer in enumerate(self.layers):
-            past_k_self = cache[4 * i + 0]
-            past_v_self = cache[4 * i + 1]
             past_k_cross = cache[4 * i + 2]
             past_v_cross = cache[4 * i + 3]
 
@@ -243,13 +241,9 @@ class DecoderExport(nn.Module):
             q = _split_heads(attn.q_proj(x), self.n_heads, self.head_dim)
             new_k = _split_heads(attn.k_proj(x), self.n_heads, self.head_dim)  # [1, H, 1, Dh]
             new_v = _split_heads(attn.v_proj(x), self.n_heads, self.head_dim)
-            # Scatter this token's K/V into the fixed-capacity cache at write_index.
-            present_k = past_k_self.index_copy(2, write_indices, new_k)
-            present_v = past_v_self.index_copy(2, write_indices, new_v)
+            present_k, present_v = kv_cache.update(new_k, new_v, i)
             ctx = _attend(q, present_k, present_v, self.scaling, self_bias, self.use_sdpa)
             hidden = residual + attn.out_proj(_merge_heads(ctx, self.embed_dim))
-            present.append(present_k)
-            present.append(present_v)
 
             # --- cross-attention against the pre-projected encoder K/V ---
             residual = hidden
@@ -268,7 +262,7 @@ class DecoderExport(nn.Module):
         hidden = _fp32_layer_norm(self.final_norm, hidden)
         # Only the final position is sampled; history buckets need KV updates.
         logits = self.proj_out(hidden[:, -1:, :])
-        return (logits, *present)
+        return (logits, *kv_cache.present)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,8 +290,9 @@ def _cast_attention_masks(onnx_path, onnx_dtype):
             mask = node.input[3]
             if mask not in casted:
                 cast_out = mask + "_io_cast"
-                new_nodes.append(onnx.helper.make_node(
-                    "Cast", [mask], [cast_out], to=onnx_dtype, name=mask + "_io_cast"))
+                new_nodes.append(
+                    onnx.helper.make_node("Cast", [mask], [cast_out], to=onnx_dtype, name=mask + "_io_cast")
+                )
                 casted[mask] = cast_out
             node.input[3] = casted[mask]
         new_nodes.append(node)
@@ -338,7 +333,7 @@ def _sanitize_fp16_initializers(onnx_path):
     from onnx import numpy_helper
 
     model = onnx.load(str(onnx_path))  # with external data (the inf lives in the .data file)
-    data_name = Path(onnx_path).name + EXT_SUFFIX[len(".onnx"):]
+    data_name = Path(onnx_path).name + EXT_SUFFIX[len(".onnx") :]
     fixed = []
     for init in model.graph.initializer:
         if init.data_type != onnx.TensorProto.FLOAT16:
@@ -356,13 +351,15 @@ def _sanitize_fp16_initializers(onnx_path):
         init.CopyFrom(numpy_helper.from_array(f32.astype(np.float16), init.name))
         fixed.append((init.name, int(bad.sum())))
     if fixed:
-        onnx.save_model(model, str(onnx_path), save_as_external_data=True,
-                        all_tensors_to_one_file=True, location=data_name)
+        onnx.save_model(
+            model, str(onnx_path), save_as_external_data=True, all_tensors_to_one_file=True, location=data_name
+        )
     return fixed
 
 
-def _onnx_export(model, args_tuple, output_path, input_names, output_names, opset, mask_cast_dtype=None,
-                 dynamic_shapes=None):
+def _onnx_export(
+    model, args_tuple, output_path, input_names, output_names, opset, mask_cast_dtype=None, dynamic_shapes=None
+):
     """Export to ONNX (dynamo) and rewrite weights as a single external-data file."""
     import onnx
 
@@ -385,7 +382,7 @@ def _onnx_export(model, args_tuple, output_path, input_names, output_names, opse
     )
     # Consolidate weights into a single <name>.onnx.data file next to the model
     # (e.g. encoder.onnx -> encoder.onnx.data), matching the C++ runtime layout.
-    data_name = output_path.name + EXT_SUFFIX[len(".onnx"):]  # "encoder.onnx" -> "encoder.onnx.data"
+    data_name = output_path.name + EXT_SUFFIX[len(".onnx") :]  # "encoder.onnx" -> "encoder.onnx.data"
     onnx_model = onnx.load(str(output_path))
     onnx.save_model(
         onnx_model,
@@ -431,7 +428,9 @@ def export_mel(model_id, out_dir, dtype, opset):
         mel_fb = mel_fb.T
     wrapper = WhisperMel(mel_fb, dtype).eval()
     samples = torch.zeros(1, MEL_SAMPLES)  # fp32 PCM
-    print(f"[mel] n_mels={fe.feature_size}, samples [1, {MEL_SAMPLES}] -> audio_features [1, {fe.feature_size}, {MEL_FRAMES}]")
+    print(
+        f"[mel] n_mels={fe.feature_size}, samples [1, {MEL_SAMPLES}] -> audio_features [1, {fe.feature_size}, {MEL_FRAMES}]"
+    )
     with torch.inference_mode():
         _onnx_export(wrapper, (samples,), out_dir / "mel.onnx", ["samples"], ["audio_features"], opset)
 
@@ -443,14 +442,19 @@ def export_encoder(model, out_dir, device, dtype, n_mels, mel_frames, opset):
 
     audio = torch.zeros(1, n_mels, mel_frames, dtype=dtype, device=device)
     output_names = (
-        ["hidden_states"]
-        + _layer_names("present_key_cross", n_layers)
-        + _layer_names("present_value_cross", n_layers)
+        ["hidden_states"] + _layer_names("present_key_cross", n_layers) + _layer_names("present_value_cross", n_layers)
     )
     print(f"[encoder] {n_layers} layers, audio_features [1, {n_mels}, {mel_frames}]")
     with torch.inference_mode():
-        _onnx_export(wrapper, (audio,), out_dir / "encoder.onnx", ["audio_features"], output_names, opset,
-                     mask_cast_dtype=_mask_cast_dtype(dtype))
+        _onnx_export(
+            wrapper,
+            (audio,),
+            out_dir / "encoder.onnx",
+            ["audio_features"],
+            output_names,
+            opset,
+            mask_cast_dtype=_mask_cast_dtype(dtype),
+        )
 
 
 def export_decoder(model, out_dir, device, dtype, enc_frames, use_sdpa, opset):
@@ -465,12 +469,14 @@ def export_decoder(model, out_dir, device, dtype, enc_frames, use_sdpa, opset):
     nonpad = torch.tensor([4], dtype=torch.int64, device=device)
     cache, inputs = [], ["input_ids", "write_indices", "nonpad_kv_seqlen"]
     for i in range(n_layers):
-        cache += [torch.zeros(shape, dtype=dtype, device=device)
-                  for shape in (self_shape, self_shape, cross_shape, cross_shape)]
-        inputs += [f"past_key_self_{i}", f"past_value_self_{i}",
-                   f"past_key_cross_{i}", f"past_value_cross_{i}"]
-    outputs = ["logits"] + [name for i in range(n_layers)
-                            for name in (f"present_key_self_{i}", f"present_value_self_{i}")]
+        cache += [
+            torch.zeros(shape, dtype=dtype, device=device)
+            for shape in (self_shape, self_shape, cross_shape, cross_shape)
+        ]
+        inputs += [f"past_key_self_{i}", f"past_value_self_{i}", f"past_key_cross_{i}", f"past_value_cross_{i}"]
+    outputs = ["logits"] + [
+        name for i in range(n_layers) for name in (f"present_key_self_{i}", f"present_value_self_{i}")
+    ]
     wrapper = DecoderExport(model, use_sdpa).to(device).eval()
     export_args = (input_ids, write_indices, nonpad, cache)
     sequence = torch.export.Dim("sequence_length", min=1, max=min(220, max_length))
@@ -479,9 +485,16 @@ def export_decoder(model, out_dir, device, dtype, enc_frames, use_sdpa, opset):
     shapes[write_indices] = {0: sequence}
     print(f"[decoder] {n_layers} layers, self cache {self_shape}, cross cache {cross_shape}, dynamic sequence")
     with torch.inference_mode():
-        _onnx_export(wrapper, export_args, out_dir / "decoder.onnx", inputs, outputs, opset,
-                     mask_cast_dtype=_mask_cast_dtype(dtype),
-                     dynamic_shapes=shapes.dynamic_shapes(wrapper, export_args))
+        _onnx_export(
+            wrapper,
+            export_args,
+            out_dir / "decoder.onnx",
+            inputs,
+            outputs,
+            opset,
+            mask_cast_dtype=_mask_cast_dtype(dtype),
+            dynamic_shapes=shapes.dynamic_shapes(wrapper, export_args),
+        )
 
 
 def _save_tokenizer(model_id, out_dir):
@@ -510,10 +523,9 @@ def load_model(model_id, device, dtype, use_sdpa):
     # Eager attention => the encoder's self-attention also exports as decomposed
     # MatMul/Softmax (no fused ONNX Attention op); sdpa lets it fuse.
     impl = "sdpa" if use_sdpa else "eager"
-    model = WhisperForConditionalGeneration.from_pretrained(
-        model_id, attn_implementation=impl, torch_dtype=dtype
-    )
+    model = WhisperForConditionalGeneration.from_pretrained(model_id, attn_implementation=impl, torch_dtype=dtype)
     return model.to(device).eval()
+
 
 def _verify(out_dir, which):
     import onnx
@@ -527,9 +539,11 @@ def _verify(out_dir, which):
     ins = [(value.name, shape(value)) for value in m.graph.input]
     outs = [(value.name, shape(value)) for value in m.graph.output]
     fused = [n.op_type for n in m.graph.node if n.op_type == "Attention"]
-    print(f"  [{which}] {len(ins)} inputs, {len(outs)} outputs, "
-          f"opsets={[(o.domain, o.version) for o in m.opset_import]}, "
-          f"fused Attention nodes={len(fused)}")
+    print(
+        f"  [{which}] {len(ins)} inputs, {len(outs)} outputs, "
+        f"opsets={[(o.domain, o.version) for o in m.opset_import]}, "
+        f"fused Attention nodes={len(fused)}"
+    )
     if which == "decoder":
         inputs, outputs = dict(ins), dict(outs)
         sequence = inputs["input_ids"][1]
@@ -541,19 +555,31 @@ def _verify(out_dir, which):
 def main():
     _configure_stdio()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default="openai/whisper-medium",
-                        help="HF model id or local path (default: openai/whisper-medium).")
-    parser.add_argument("--output", type=Path, default=Path("D:/models/whisper-medium-onnx"),
-                        help="Output directory for encoder.onnx / decoder.onnx / vocab.json.")
-    parser.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16",
-                        help="Model and cache precision (default: fp16).")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device used to trace the export.")
-    parser.add_argument("--attention", choices=["math", "sdpa"], default="sdpa",
-                        help="Attention export for both encoder and decoder.")
+    parser.add_argument(
+        "--model", default="openai/whisper-medium", help="HF model id or local path (default: openai/whisper-medium)."
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("D:/models/whisper-medium-onnx"),
+        help="Output directory for encoder.onnx / decoder.onnx / vocab.json.",
+    )
+    parser.add_argument(
+        "--dtype", choices=["fp16", "fp32"], default="fp16", help="Model and cache precision (default: fp16)."
+    )
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device used to trace the export."
+    )
+    parser.add_argument(
+        "--attention", choices=["math", "sdpa"], default="sdpa", help="Attention export for both encoder and decoder."
+    )
     parser.add_argument("--opset", type=int, default=DEFAULT_OPSET)
-    parser.add_argument("--only", choices=["encoder", "decoder", "mel"], default=None,
-                        help="Export only one graph (default: encoder + decoder + mel).")
+    parser.add_argument(
+        "--only",
+        choices=["encoder", "decoder", "mel"],
+        default=None,
+        help="Export only one graph (default: encoder + decoder + mel).",
+    )
     args = parser.parse_args()
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
@@ -567,8 +593,10 @@ def main():
         print(f"Loading {args.model} ({dtype}, attn={args.attention}) on {device} ...")
         model = load_model(args.model, device, dtype, use_sdpa)
         cfg = model.config
-        print(f"  d_model={cfg.d_model} layers={cfg.decoder_layers} heads={cfg.decoder_attention_heads} "
-              f"mels={cfg.num_mel_bins} vocab={cfg.vocab_size}")
+        print(
+            f"  d_model={cfg.d_model} layers={cfg.decoder_layers} heads={cfg.decoder_attention_heads} "
+            f"mels={cfg.num_mel_bins} vocab={cfg.vocab_size}"
+        )
 
     if args.only in (None, "encoder"):
         # TODO also accept opset, blocked by TRT support for attention dimensions
