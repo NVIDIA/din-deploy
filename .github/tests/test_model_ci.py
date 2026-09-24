@@ -262,7 +262,7 @@ class ExportExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'model'
             outputs = Path(directory) / 'outputs'
-            entry = {'export': {'install': [], 'command': ['export'], 'required_files': ['model.onnx']}}
+            entry = {'export': {'install': [], 'command': ['export'], 'required_files': ['model.onnx', 'metadata.json']}}
             variant = {'slug': 'example', 'model_id': 'org/model', 'precision': 'fp16', 'fallback_precision': 'fp32'}
             attempted = []
 
@@ -271,9 +271,12 @@ class ExportExecutionTests(unittest.TestCase):
                 output.mkdir(parents=True)
                 if values['precision'] == 'fp16':
                     (output / 'partial').write_text('partial export')
+                    (output / 'model.onnx').write_text('stale model')
                 else:
                     self.assertFalse((output / 'partial').exists())
+                    self.assertFalse((output / 'model.onnx').exists())
                     (output / 'model.onnx').write_text('valid model')
+                    (output / 'metadata.json').write_text('valid metadata')
 
             with patch.object(runner, 'run', side_effect=execute), patch.dict(os.environ, {'GITHUB_OUTPUT': str(outputs), 'GITHUB_RUN_ID': '123'}):
                 runner.export_model(entry, variant, {'output': str(output)}, 'fingerprint')
