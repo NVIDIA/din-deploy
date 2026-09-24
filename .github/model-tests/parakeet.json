@@ -26,7 +26,7 @@
         "onnx",
         "onnxscript",
         "soundfile",
-        "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"
+        "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@cf724ac337d1ebc7d0dda1e23fb80916f52927a5"
       ]
     ],
     "command": [

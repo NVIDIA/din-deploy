@@ -55,7 +55,10 @@ def export_model(entry, variant, values, key):
             continue
         missing = [name for name in definition['required_files'] if not (output / name).is_file()]
         if missing:
-            raise RuntimeError(f'Export did not produce required files: {missing}')
+            if index == len(precisions) - 1:
+                raise RuntimeError(f'Export did not produce required files: {missing}')
+            print(f'::warning::{precision} export missing required files: {missing}; trying {precisions[index + 1]}', flush=True)
+            continue
         manifest = {'model_id': variant['model_id'], 'precision': precision, 'source_hash': key,
                     'commit': os.getenv('GITHUB_SHA'), 'variant': variant}
         (output / 'ci-export-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

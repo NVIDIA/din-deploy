@@ -258,6 +258,47 @@ class ExportExecutionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'required files'):
                     runner.export_model(entry, variant, {'output': str(Path(directory) / 'model')}, 'key')
 
+    def test_missing_artifacts_retry_fallback_and_clear_partial_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'model'
+            outputs = Path(directory) / 'outputs'
+            entry = {'export': {'install': [], 'command': ['export'], 'required_files': ['model.onnx']}}
+            variant = {'slug': 'example', 'model_id': 'org/model', 'precision': 'fp16', 'fallback_precision': 'fp32'}
+            attempted = []
+
+            def execute(command, values, env):
+                attempted.append(values['precision'])
+                output.mkdir(parents=True)
+                if values['precision'] == 'fp16':
+                    (output / 'partial').write_text('partial export')
+                else:
+                    self.assertFalse((output / 'partial').exists())
+                    (output / 'model.onnx').write_text('valid model')
+
+            with patch.object(runner, 'run', side_effect=execute), patch.dict(os.environ, {'GITHUB_OUTPUT': str(outputs), 'GITHUB_RUN_ID': '123'}):
+                runner.export_model(entry, variant, {'output': str(output)}, 'fingerprint')
+            self.assertEqual(attempted, ['fp16', 'fp32'])
+            self.assertIn('name=model-example-fp32-fingerprint', outputs.read_text())
+            self.assertEqual(json.loads((output / 'ci-export-manifest.json').read_text())['precision'], 'fp32')
+
+    def test_missing_artifacts_after_fallback_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'model'
+            entry = {'export': {'install': [], 'command': ['export'], 'required_files': ['model.onnx']}}
+            variant = {'precision': 'fp16', 'fallback_precision': 'fp32'}
+            attempted = []
+
+            def execute(command, values, env):
+                attempted.append(values['precision'])
+                output.mkdir(parents=True)
+
+            with patch.object(runner, 'run', side_effect=execute), patch.object(runner, 'write_outputs') as write_outputs:
+                with self.assertRaisesRegex(RuntimeError, 'required files.*model.onnx'):
+                    runner.export_model(entry, variant, {'output': str(output)}, 'key')
+            self.assertEqual(attempted, ['fp16', 'fp32'])
+            self.assertFalse((output / 'ci-export-manifest.json').exists())
+            write_outputs.assert_not_called()
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_malformed_optional_configuration_disables_optimization(self):
