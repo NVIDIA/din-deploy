@@ -1,0 +1,76 @@
+{
+  "name": "nemotron",
+  "source_roots": [
+    "asr/rnnt"
+  ],
+  "targets": [
+    "din_asr_nemotron_cli"
+  ],
+  "export": {
+    "cache_epoch": 1,
+    "install": [
+      [
+        "{python}",
+        "-m",
+        "pip",
+        "install",
+        "--index-url",
+        "https://download.pytorch.org/whl/cpu",
+        "torch"
+      ],
+      [
+        "{python}",
+        "-m",
+        "pip",
+        "install",
+        "onnx",
+        "onnxscript",
+        "soundfile",
+        "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"
+      ]
+    ],
+    "command": [
+      "{python}",
+      "asr/rnnt/python/tools/export_nemotron_onnx.py",
+      "--model",
+      "{model_id}",
+      "--output",
+      "{output}",
+      "--device",
+      "cpu",
+      "--dtype",
+      "{dtype}",
+      "--external-data"
+    ],
+    "required_files": [
+      "preprocessor.onnx",
+      "encoder_step.onnx",
+      "predict_step.onnx",
+      "metadata.json",
+      "vocab.txt",
+      "decoder_init_hidden.f32",
+      "decoder_init_cell.f32"
+    ],
+    "env": {
+      "PYTHONPATH": "asr/rnnt/python"
+    }
+  },
+  "smoke": {
+    "command": [
+      "{executable}",
+      "assets/sample.wav",
+      "--model-dir",
+      "{output}",
+      "--provider",
+      "cpu"
+    ]
+  },
+  "variants": [
+    {
+      "slug": "nemotron-3.5-asr-streaming-0.6b",
+      "model_id": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "precision": "fp16",
+      "fallback_precision": "fp32"
+    }
+  ]
+}

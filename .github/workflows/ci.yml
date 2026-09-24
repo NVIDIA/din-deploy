@@ -19,8 +19,31 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
 jobs:
-  clang-format:
+  plan:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      targets: ${{ steps.plan.outputs.targets }}
+      models: ${{ steps.plan.outputs.models }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      format: ${{ steps.plan.outputs.format }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Validate CI selection and execution recipes
+        run: python -m unittest discover -s .github/tests -v
+      - name: Select affected components
+        id: plan
+        run: python .github/scripts/model_ci.py plan
+
+  clang-format:
+    needs: plan
+    if: needs.plan.outputs.format == 'true'
     name: clang-format
     runs-on: ubuntu-24.04
 
@@ -49,7 +72,8 @@ jobs:
             | xargs -0 -r clang-format-22 --dry-run --Werror --
 
   linux-x64:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     name: Ubuntu 24.04 / Clang / x64
     runs-on: ubuntu-24.04
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
@@ -79,7 +103,9 @@ jobs:
             -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
-        run: cmake --build --preset linux-x64-release --parallel
+        env:
+          BUILD_TARGETS: ${{ needs.plan.outputs.targets }}
+        run: python3 .github/scripts/model_ci.py build --preset linux-x64-release
 
       - name: List registered CTest tests
         run: ctest --test-dir out/build/linux-x64 --build-config Release --show-only=human
@@ -93,7 +119,8 @@ jobs:
           path: out/build/linux-x64/bin/Release/
 
   linux-arm64:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     name: Ubuntu 24.04 / Clang / ARM64
     runs-on: ubuntu-24.04-arm
     container: nvidia/cuda:13.2.1-devel-ubuntu24.04
@@ -121,7 +148,9 @@ jobs:
         run: cmake --preset linux-arm64 -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
-        run: cmake --build --preset linux-arm64-release --parallel
+        env:
+          BUILD_TARGETS: ${{ needs.plan.outputs.targets }}
+        run: python3 .github/scripts/model_ci.py build --preset linux-arm64-release
 
       - name: List registered CTest tests
         run: ctest --test-dir out/build/linux-arm64 --build-config Release --show-only=human
@@ -135,7 +164,8 @@ jobs:
           path: out/build/linux-arm64/bin/Release/
 
   windows-x64:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     name: Windows Server 2025 / MSVC / x64
     runs-on: windows-2025
     timeout-minutes: 90
@@ -167,7 +197,9 @@ jobs:
             -DDIN_BUILD_TRT_RTX_EP=ON
 
       - name: Build
-        run: cmake --build --preset windows-x64-release --parallel
+        env:
+          BUILD_TARGETS: ${{ needs.plan.outputs.targets }}
+        run: python .github/scripts/model_ci.py build --preset windows-x64-release
 
       - name: List registered CTest tests
         run: ctest --test-dir out/build/windows-x64 --build-config Release --show-only=human
@@ -179,3 +211,18 @@ jobs:
           name: windows-x64-release
           if-no-files-found: error
           path: out/build/windows-x64/bin/Release/
+
+  model-tests:
+    needs: [plan, linux-x64, windows-x64]
+    if: >-
+      !cancelled() && needs.plan.outputs.models == 'true' &&
+      needs.linux-x64.result == 'success' && needs.windows-x64.result == 'success'
+    name: ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    uses: ./.github/workflows/model-test.yml
+    with:
+      model: ${{ matrix.model }}
+      variant: ${{ matrix.variant }}
+      force_export: ${{ matrix.force_export }}

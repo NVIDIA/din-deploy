@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "ignore": [
+    "**/*.md",
+    "*.md",
+    ".coderabbit.yaml",
+    ".coderabbit.yml",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "groups": {
+    "native": [
+      "CMakeLists.txt",
+      "CMakePresets.json",
+      "cmake/**",
+      "common/**/*.cpp",
+      "common/**/*.h",
+      "common/*.cpp",
+      "common/*.h",
+      "common/**/CMakeLists.txt",
+      "common/CMakeLists.txt"
+    ],
+    "nemo-export": [
+      "asr/rnnt/python/tools/nemo_preprocessor_export.py",
+      "asr/rnnt/python/rnnt/__init__.py",
+      "asr/rnnt/python/rnnt/audio.py"
+    ],
+    "rnnt-runtime": [
+      "asr/rnnt/cpp/asr*",
+      "asr/rnnt/CMakeLists.txt",
+      "asr/rnnt/python/rnnt/validation/**",
+      "asr/rnnt/python/tests/**"
+    ],
+    "audio-test": [
+      "assets/sample.wav"
+    ]
+  },
+  "models": {
+    "parakeet": {
+      "export": {
+        "paths": [
+          "asr/rnnt/python/tools/export_parakeet_tdt_onnx.py",
+          "asr/rnnt/python/rnnt/parakeet_tdt/nemo_backend.py",
+          "asr/rnnt/python/rnnt/parakeet_tdt/__init__.py"
+        ],
+        "groups": [
+          "nemo-export"
+        ]
+      },
+      "runtime": {
+        "paths": [
+          "asr/rnnt/cpp/parakeet*",
+          "asr/rnnt/python/rnnt/parakeet_tdt/**"
+        ],
+        "groups": [
+          "native",
+          "rnnt-runtime",
+          "audio-test"
+        ]
+      }
+    },
+    "nemotron": {
+      "export": {
+        "paths": [
+          "asr/rnnt/python/tools/export_nemotron_onnx.py",
+          "asr/rnnt/python/rnnt/nemotron_asr/nemo_backend.py",
+          "asr/rnnt/python/rnnt/nemotron_asr/__init__.py"
+        ],
+        "groups": [
+          "nemo-export"
+        ]
+      },
+      "runtime": {
+        "paths": [
+          "asr/rnnt/cpp/nemotron*",
+          "asr/rnnt/python/rnnt/nemotron_asr/**"
+        ],
+        "groups": [
+          "native",
+          "rnnt-runtime",
+          "audio-test"
+        ]
+      }
+    },
+    "whisper": {
+      "export": {
+        "paths": [
+          "asr/whisper/model_export/**",
+          "common/model_export/**"
+        ]
+      },
+      "runtime": {
+        "paths": [
+          "asr/whisper/**"
+        ],
+        "groups": [
+          "native",
+          "audio-test"
+        ]
+      }
+    },
+    "sam2": {
+      "export": {
+        "paths": [
+          "vision/sam2/python/export_sam2_onnx.py",
+          "vision/sam2/python/modeling.py"
+        ]
+      },
+      "runtime": {
+        "paths": [
+          "vision/sam2/**",
+          "assets/sam2-*"
+        ],
+        "groups": [
+          "native"
+        ]
+      }
+    }
+  },
+  "build_only": {
+    "flux2": {
+      "targets": [
+        "din_flux2_cli"
+      ],
+      "paths": [
+        "image_gen/flux2/**"
+      ],
+      "groups": [
+        "native"
+      ],
+      "reason": "GPU inference requires model assets and a GPU runner; existing hosted CI only builds this sample."
+    },
+    "base": {
+      "targets": [
+        "din_base_onnx"
+      ],
+      "paths": [
+        "tests/base/**"
+      ],
+      "groups": [
+        "native"
+      ],
+      "reason": "Existing hosted CI builds this sample; it has no portable CPU smoke recipe."
+    }
+  }
+}

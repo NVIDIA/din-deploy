@@ -21,3 +21,9 @@ reviews:
     base_branches: [".*"]
     auto_incremental_review: true
     auto_pause_after_reviewed_commits: 0
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "REVIEW_GUIDELINES.md"
