@@ -101,6 +101,7 @@ add_subdirectory(asr/rnnt)
 add_subdirectory(vision/sam2)
 add_subdirectory(asr/whisper)
 add_subdirectory(asr/qwen3)
+add_subdirectory(asr/diarization)
 
 if(DIN_BUILD_TESTING)
     set(_din_cli_test_audio "${DIN_DEPLOY_ARTIFACTS_ROOT}/audio/de/schakaleundaraber_elli.mp3")

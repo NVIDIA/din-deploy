@@ -80,6 +80,8 @@ For components supplied through an SDK or binary package, the corresponding vend
 
 ## Model/Artifact
 
+- `nvidia/Nemotron-3-Diarization`: [OpenMDW 1.1](https://openmdw.ai/license/1-1/); model artifacts are not included.
+
 - `black-forest-labs/FLUX.2-klein-4b`: Apache-2.0
 - `black-forest-labs/FLUX.2-klein-4b-fp8`: Apache-2.0
 - `black-forest-labs/FLUX.2-klein-4b-nvfp4`: Apache-2.0
