@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "runtime.h"
+#include "text_output.h"
 #include "unicode_regex.h"
 
 namespace din::asr::qwen3::detail
@@ -320,7 +321,10 @@ struct Qwen3Pipeline::Impl
         auto text_tokens = result.tokens;
         if (result.reached_eos)
             text_tokens.pop_back();
-        const auto raw = prefix + asr.tokenizer->Decode(text_tokens, false);
+        auto decoded = asr.tokenizer->Decode(text_tokens, false);
+        if (!result.reached_eos)
+            detail::TrimIncompleteUtf8Suffix(decoded);
+        const auto raw = prefix + decoded;
         if (raw_output)
             *raw_output = raw;
         const auto parsed = detail::ParseOutput(raw, asr.native["languages"][config.lang_id].get<std::string>());

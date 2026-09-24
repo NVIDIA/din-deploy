@@ -431,10 +431,10 @@ bool RegisterTensorRTRTXExecutionProvider(Ort::Env& env)
     env.RegisterExecutionProviderLibrary(kDinNvTensorRTRTXExecutionProvider, provider_library_path.c_str());
 
     const auto ep_devices = env.GetEpDevices();
-    std::cout << "Execution provider devices after TRT RTX registration:\n";
+    std::cerr << "Execution provider devices after TRT RTX registration:\n";
     for (const auto& device : ep_devices)
     {
-        std::cout << "  " << device.EpName() << " vendor=" << device.EpVendor()
+        std::cerr << "  " << device.EpName() << " vendor=" << device.EpVendor()
                   << " device_id=" << device.Device().DeviceId() << '\n';
     }
     return true;
@@ -633,7 +633,7 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
     const auto ort_luid = luid_text != nullptr ? ParseUint64(*luid_text) : std::optional<uint64_t>{};
     if (luid_text != nullptr && !ort_luid.has_value())
     {
-        std::cout << "Ignoring unparsable ORT LUID metadata value: " << *luid_text << std::endl;
+        std::cerr << "Ignoring unparsable ORT LUID metadata value: " << *luid_text << std::endl;
     }
 #else
     const std::string* pci_bus_id_text = FindMetadataValue(metadata, "pci_bus_id");
@@ -641,7 +641,7 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
         pci_bus_id_text != nullptr ? ParsePciBusId(*pci_bus_id_text) : std::optional<PciBusId>{};
     if (pci_bus_id_text != nullptr && !ort_pci_bus_id.has_value())
     {
-        std::cout << "Ignoring unparsable ORT pci_bus_id metadata value: " << *pci_bus_id_text << std::endl;
+        std::cerr << "Ignoring unparsable ORT pci_bus_id metadata value: " << *pci_bus_id_text << std::endl;
     }
 #endif
 
@@ -693,24 +693,24 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
 
     if (metadata_matches.size() > 1)
     {
-        std::cout << "Multiple CUDA devices match ORT device metadata";
+        std::cerr << "Multiple CUDA devices match ORT device metadata";
     }
     else
     {
-        std::cout << "No CUDA device matches ORT device metadata";
+        std::cerr << "No CUDA device matches ORT device metadata";
     }
 #ifdef _WIN32
     if (luid_text != nullptr)
     {
-        std::cout << " LUID=" << *luid_text;
+        std::cerr << " LUID=" << *luid_text;
     }
 #else
     if (pci_bus_id_text != nullptr)
     {
-        std::cout << " pci_bus_id=" << *pci_bus_id_text;
+        std::cerr << " pci_bus_id=" << *pci_bus_id_text;
     }
 #endif
-    std::cout << " for ORT hardware device_id=" << ort_hardware_device_id << "; defaulting to CUDA ordinal 0. Set "
+    std::cerr << " for ORT hardware device_id=" << ort_hardware_device_id << "; defaulting to CUDA ordinal 0. Set "
               << (override_env_var != nullptr ? override_env_var : "FLUX_CUDA_DEVICE_ID") << " to override."
               << std::endl;
 

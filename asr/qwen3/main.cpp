@@ -46,26 +46,22 @@ int main(int argc, char** argv)
         config.ep_context_dir = parser.get<std::string>("--ep-context-dir");
         config.max_new_tokens = parser.get<int>("--max-new-tokens");
         config.max_chunk_seconds = parser.get<int>("--max-chunk-seconds");
-        std::ostream results(std::cout.rdbuf());
-        // Keep runtime diagnostics off the streaming JSON output.
-        if (parser.get<bool>("--stream"))
-            std::cout.rdbuf(std::cerr.rdbuf());
         Qwen3Pipeline pipeline(std::move(config));
         if (parser.get<bool>("--stream"))
         {
             pipeline.StartStream({parser.get<float>("--chunk-seconds"), parser.get<int>("--unfixed-chunks"),
                                   parser.get<int>("--unfixed-tokens")});
-            auto print = [&results](const StreamingResult& result)
+            auto print = [](const StreamingResult& result)
             {
-                results << nlohmann::json{{"transcription", result.text},
-                                          {"language", result.language},
-                                          {"samples_processed", result.samples_processed},
-                                          {"sample_rate", 16000},
-                                          {"updates", result.updates},
-                                          {"final", result.final},
-                                          {"reached_eos", result.reached_eos}}
-                               .dump()
-                        << std::endl;
+                std::cout << nlohmann::json{{"transcription", result.text},
+                                            {"language", result.language},
+                                            {"samples_processed", result.samples_processed},
+                                            {"sample_rate", 16000},
+                                            {"updates", result.updates},
+                                            {"final", result.final},
+                                            {"reached_eos", result.reached_eos}}
+                                 .dump()
+                          << std::endl;
             };
             auto feed = [&](std::span<const float> samples)
             {
