@@ -2,14 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """PixelDiT text-to-image DiT, vendored from NVlabs/PixelDiT (pixdit_core/) for ONNX export.
 
-Numerically equivalent to upstream PixDiTTrainer + PixDiT_T2I at inference, with three
-export-friendly changes:
-  * RoPE uses real cos/sin tables instead of complex tensors (torch.polar / view_as_complex).
-  * Patchify / unpatchify use reshape + permute instead of F.unfold / F.fold.
+Numerically equivalent to upstream PixDiTTrainer + PixDiT_T2I at inference. Changes:
+  * RoPE uses real cos/sin tables instead of complex tensors. Required: upstream unsqueezes
+    complex tensors (precompute_freqs_cis_2d, and freqs_cis[None, :, None, :] in
+    apply_rotary_emb), and the ONNX exporter has no lowering for unsqueeze on complex inputs.
+    Other complex ops (polar, view_as_complex/real, multiply) would export.
+  * Patchify / unpatchify use reshape + permute instead of F.unfold / F.fold (bit-identical,
+    since kernel == stride). Required for TensorRT RTX: the model runs them in bf16, and
+    TensorRT RTX has no bf16 Col2Im (F.fold); the unfold+fold export fails to create a session.
   * Position tables are built once by set_image_size() instead of lazily filled Python dict
-    caches, so tracing never writes fake tensors into a cache and they export as graph
-    constants. They are plain attributes (not buffers) so Module.to(dtype) leaves the fp32
-    RoPE tables alone, as upstream's complex64 tables are.
+    caches, so tracing never writes trace-time tensors into a cache. They are plain
+    attributes (not buffers) so Module.to(dtype) leaves the fp32 RoPE tables alone, as
+    upstream's complex64 tables are.
 Training-only pieces (REPA projector, attention masks, class embedder) are dropped.
 """
 

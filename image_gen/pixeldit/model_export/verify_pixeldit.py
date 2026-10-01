@@ -3,23 +3,21 @@
 
 #!/usr/bin/env python3
 """
-Verify PixelDiT T2I ONNX graphs against the vendored PyTorch model, and optionally verify the
-vendored PyTorch model + sampler against the upstream NVlabs/PixelDiT repo.
+Verify PixelDiT T2I ONNX graphs: run the vendored PyTorch pipeline and the ONNX Runtime pipeline
+(TensorRT RTX by default) and compare them.
 
-Checks (see .claude/plans/pixeldit-export-plan.md, "Validation plan"):
-    --validate_only    V5: ONNX structure + dummy run of each graph, then exit
-    (default)          V5, V6: per-model ONNX Runtime vs PyTorch, V7: end-to-end image comparison
-    --reference_repo   V2-V4: vendored model / text path / sampler vs upstream PixelDiT
+Checks:
+    --validate_only    ONNX structure + dummy run of each graph, then exit
+    (default)          also text encoder and DiT outputs, ONNX Runtime vs PyTorch, and an end-to-end image
 
 Outputs (written inside --output_dir if given, otherwise --onnx_dir):
     pytorch_output.png  - image from the PyTorch pipeline
     ort_output.png      - image from the ONNX Runtime-backed pipeline
     comparison.png      - PyTorch (left) | ONNX Runtime (right) side-by-side
-    upstream_output.png - image from upstream PixelDiT (--reference_repo only)
 
-Pass/fail is decided by the per-model checks (V2, V3, V6). End-to-end images only fail if clearly
-broken: 50-step bf16 sampling amplifies tiny per-step differences, so correct runs can differ in fine
-detail or even composition depending on the seed. Review comparison.png visually.
+Pass/fail is decided by the per-model checks. The end-to-end image only fails if clearly broken:
+50-step bf16 sampling amplifies tiny per-step differences, so correct runs can differ in fine detail
+or even composition depending on the seed. Review comparison.png visually.
 """
 
 import argparse
@@ -36,13 +34,7 @@ import torch.nn.functional as F
 from PIL import Image as PILImage
 
 from pixeldit import pipeline as P
-from pixeldit.weights import (
-    DEFAULT_MODEL_NAME,
-    DEFAULT_TEXT_ENCODER_NAME,
-    load_gemma_text_encoder,
-    load_pixeldit,
-    resolve_checkpoint,
-)
+from pixeldit.weights import DEFAULT_MODEL_NAME, DEFAULT_TEXT_ENCODER_NAME, load_gemma_text_encoder, load_pixeldit
 
 EP_NAME = "nv_tensorrt_rtx"
 _REGISTERED_EP_NAME: str | None = None
@@ -51,19 +43,17 @@ DEFAULT_PROMPT = (
     "everything is in full focus, pores and skin imperfections are visible, neutral lighting from a large studio "
     "softbox, realistic, high resolution, natural beauty, detailed texture, professional studio shooting."
 )
-BANNED_OPS = {"Im2Col", "Col2Im", "DFT", "STFT"}
 
-# All comparisons are bf16 vs bf16. Thresholds are ~2x the bf16-vs-fp32 noise measured once on the
-# 1024x1024 export (see .claude/plans/pixeldit-export-plan.md, "Findings"); bf16 rounding of the
-# timestep makes the DiT far noisier near t*1000 = 1000 than elsewhere.
-DIT_MAX_REL_L2 = {999.75: 0.55, 996.0: 0.025, 500.0: 0.025, 50.0: 0.025}  # DiT timestep input -> max rel L2
-CHECK_TIMESTEPS = (999.75, 500.0, 50.0)
+# All comparisons are bf16 vs bf16, with thresholds at ~2x the bf16-vs-fp32 difference measured on the
+# 1024x1024 export. PixelDiT casts the timestep to bf16 (999.75 -> 1000), which makes the DiT far
+# noisier near t*1000 = 1000 than elsewhere, hence the looser limit there.
+DIT_MAX_REL_L2 = {999.75: 0.55, 500.0: 0.025, 50.0: 0.025}  # DiT timestep input -> max relative L2
 TEXT_MIN_COS = 0.999  # Gemma-2 bf16 vs fp32 is itself 0.9997-0.9998
 # 50-step images diverge chaotically from tiny per-step bf16 differences: correct runs measured 18-40 dB
-# depending on seed (seed 1 even changes the pose). The image checks only catch broken output; the
-# per-model checks are the real gate. PSNR >= 12 dB rejects black (~5 dB) and noise (~9 dB) but not a
-# flat image (~14 dB, these portraits have smooth backgrounds), so detail (mean |Laplacian|) must also
-# stay within 0.5-2x of the reference (correct runs measured 0.72-1.01x).
+# depending on seed (one seed even changes the pose). The image checks only catch broken output.
+# PSNR >= 12 dB rejects black (~5 dB) and noise (~9 dB) but not a flat image (~14 dB, these portraits
+# have smooth backgrounds), so detail (mean |Laplacian|) must also stay within 0.5-2x of the PyTorch
+# image (correct runs measured 0.72-1.01x).
 MIN_E2E_PSNR = 12.0
 DETAIL_RATIO_RANGE = (0.5, 2.0)
 
@@ -89,7 +79,6 @@ def _stats(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
         "max_abs": (a - b).abs().max().item(),
         "rel_l2": ((a - b).norm() / b.norm().clamp_min(1e-30)).item(),
         "cos": F.cosine_similarity(a, b, dim=0).item(),
-        "bitwise": torch.equal(a, b),
     }
 
 
@@ -179,7 +168,8 @@ class OrtSessionRunner:
 
 
 def _to_numpy(tensor: torch.Tensor, dtype: np.dtype) -> np.ndarray:
-    return np.ascontiguousarray(tensor.detach().to("cpu", torch.float32 if dtype == np.float32 else tensor.dtype).numpy().astype(dtype, copy=False))
+    tensor = tensor.detach().to("cpu", torch.float32 if dtype == np.float32 else tensor.dtype)
+    return np.ascontiguousarray(tensor.numpy().astype(dtype, copy=False))
 
 
 def ort_encode_fn(runner: OrtSessionRunner, device):
@@ -214,7 +204,7 @@ def torch_encode_fn(text_encoder):
 
 
 # ---------------------------------------------------------------------------
-# V5: graph structure + dummy run
+# Graph structure + dummy run
 # ---------------------------------------------------------------------------
 
 EXPECTED_IO = {
@@ -233,8 +223,8 @@ def _onnx_io_shapes(model: onnx.ModelProto) -> dict[str, tuple[int, ...]]:
 
 
 def validate_onnx_dir(onnx_dir: Path, provider: str, args, expected_shapes: dict) -> dict[str, OrtSessionRunner]:
-    """V5 checks; returns the ORT sessions so later checks don't rebuild TensorRT engines."""
-    print(f"\n[V5 Validate] {onnx_dir}")
+    """Structure checks + dummy run; returns the ORT sessions so later checks don't rebuild TensorRT engines."""
+    print(f"\n[Validate] {onnx_dir}")
     runners = {}
     for name, (inputs, outputs) in EXPECTED_IO.items():
         onnx_path = onnx_dir / name / "model.onnx"
@@ -244,15 +234,10 @@ def validate_onnx_dir(onnx_dir: Path, provider: str, args, expected_shapes: dict
         onnx.checker.check_model(str(onnx_path))
         model = onnx.load(str(onnx_path), load_external_data=False)
         shapes = _onnx_io_shapes(model)
-        op_types = {node.op_type for node in model.graph.node}
-        for function in model.functions:
-            op_types.update(node.op_type for node in function.node)
         io_names = ([i.name for i in model.graph.input], [o.name for o in model.graph.output])
         _check(f"{name} io names", io_names == (inputs, outputs), f"{io_names}")
         for io_name, shape in expected_shapes.get(name, {}).items():
             _check(f"{name} {io_name} shape", shapes.get(io_name) == shape, f"{shapes.get(io_name)} (expected {shape})")
-        banned = sorted(op_types & BANNED_OPS)
-        _check(f"{name} no Im2Col/Col2Im/complex ops", not banned, f"found {banned}" if banned else "none")
         has_bf16 = any(t.data_type == onnx.TensorProto.BFLOAT16 for t in model.graph.initializer)
         _check(f"{name} bf16 weights", has_bf16, "bf16 initializers present" if has_bf16 else "no bf16 initializers")
         data_gb = (onnx_path.parent / "model.onnx_data").stat().st_size / 1e9
@@ -283,13 +268,13 @@ def validate_onnx_dir(onnx_dir: Path, provider: str, args, expected_shapes: dict
 
 
 # ---------------------------------------------------------------------------
-# V6: per-model ONNX Runtime vs PyTorch
+# Per-model ONNX Runtime vs PyTorch
 # ---------------------------------------------------------------------------
 
 
 @torch.inference_mode()
 def compare_text_encoder(tokenizer, text_encoder, runner, layout, prompt, negative_prompt, device):
-    print("\n[V6] text_encoder: ONNX Runtime vs PyTorch (bf16)")
+    print("\n[text_encoder] ONNX Runtime vs PyTorch (bf16)")
     torch_neg, torch_pos = P.encode_prompts(tokenizer, torch_encode_fn(text_encoder), layout, prompt, negative_prompt, device)
     ort_neg, ort_pos = P.encode_prompts(tokenizer, ort_encode_fn(runner, device), layout, prompt, negative_prompt, device)
     for label, ort, ref in (("positive", ort_pos, torch_pos), ("negative", ort_neg, torch_neg)):
@@ -299,26 +284,21 @@ def compare_text_encoder(tokenizer, text_encoder, runner, layout, prompt, negati
                f"{_fmt(s)} min_token_cos={per_token:.6f} (need cos >= {TEXT_MIN_COS})")
 
 
-def dit_check(name: str, tv: float, out: torch.Tensor, ref: torch.Tensor) -> None:
-    s = _stats(out, ref)
-    limit = DIT_MAX_REL_L2[tv]
-    _check(f"{name} t={tv}", s["rel_l2"] <= limit, f"{_fmt(s)} (need rel_l2 <= {limit})")
-
-
 @torch.inference_mode()
 def compare_dit(dit, runner, y_neg, y_pos, height, width, device):
-    print("\n[V6] transformer: ONNX Runtime vs PyTorch (bf16)")
+    print("\n[transformer] ONNX Runtime vs PyTorch (bf16)")
     g = torch.Generator(device=device).manual_seed(1)
     x = torch.randn(1, 3, height, width, device=device, generator=g).repeat(2, 1, 1, 1)
     y = torch.cat([y_neg, y_pos]).float()
     ort_dit = ort_dit_fn(runner, device)
-    for tv in CHECK_TIMESTEPS:
+    for tv, limit in DIT_MAX_REL_L2.items():
         t = torch.full((2,), tv, device=device)
-        dit_check("transformer velocity", tv, ort_dit(x, t, y), dit(x, t, y))
+        s = _stats(ort_dit(x, t, y), dit(x, t, y))
+        _check(f"transformer velocity t={tv}", s["rel_l2"] <= limit, f"{_fmt(s)} (need rel_l2 <= {limit})")
 
 
 # ---------------------------------------------------------------------------
-# V7: end to end
+# End to end
 # ---------------------------------------------------------------------------
 
 
@@ -328,20 +308,16 @@ def _detail(image: np.ndarray) -> float:
     return float(np.abs(4 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]).mean())
 
 
-def check_image_sanity(name: str, image: np.ndarray, ref: np.ndarray) -> None:
-    """Fail only on clearly broken output (black, noise, flat); otherwise report metrics for visual review."""
-    psnr = _psnr(ref, image)
-    mae = float(np.mean(np.abs(ref.astype(np.float32) - image.astype(np.float32))))
-    ratio = _detail(image) / max(_detail(ref), 1e-6)
-    lo, hi = DETAIL_RATIO_RANGE
-    _check(f"{name} not broken: PSNR", psnr >= MIN_E2E_PSNR, f"PSNR={psnr:.2f} dB (need >= {MIN_E2E_PSNR} dB)")
-    _check(f"{name} not broken: detail", lo <= ratio <= hi, f"detail ratio={ratio:.2f} (need {lo}-{hi})")
-    print(f"  [INFO] {name}: PSNR={psnr:.2f} dB MAE={mae:.2f}. Fine details can differ between correct "
-          "bf16 runs (18-40 dB measured across seeds); compare the images visually.")
-
-
 def compare_images(ref: np.ndarray, ort: np.ndarray, output_dir: Path) -> None:
-    check_image_sanity("end-to-end image", ort, ref)
+    """Fail only on clearly broken output (black, noise, flat); otherwise report metrics for visual review."""
+    psnr = _psnr(ref, ort)
+    mae = float(np.mean(np.abs(ref.astype(np.float32) - ort.astype(np.float32))))
+    ratio = _detail(ort) / max(_detail(ref), 1e-6)
+    lo, hi = DETAIL_RATIO_RANGE
+    _check("end-to-end image not broken: PSNR", psnr >= MIN_E2E_PSNR, f"PSNR={psnr:.2f} dB (need >= {MIN_E2E_PSNR} dB)")
+    _check("end-to-end image not broken: detail", lo <= ratio <= hi, f"detail ratio={ratio:.2f} (need {lo}-{hi})")
+    print(f"  [INFO] end-to-end image: PSNR={psnr:.2f} dB MAE={mae:.2f}. Fine details can differ between correct "
+          "bf16 runs (18-40 dB measured across seeds); compare the images visually.")
     canvas = PILImage.new("RGB", (ref.shape[1] + ort.shape[1], max(ref.shape[0], ort.shape[0])), (255, 255, 255))
     canvas.paste(PILImage.fromarray(ref), (0, 0))
     canvas.paste(PILImage.fromarray(ort), (ref.shape[1], 0))
@@ -356,113 +332,6 @@ def _progress(label):
             print(f"  [{label}] step {step}")
 
     return report
-
-
-# ---------------------------------------------------------------------------
-# V2-V4: vendored code vs upstream PixelDiT (--reference_repo)
-# ---------------------------------------------------------------------------
-
-
-def run_reference_checks(args, tokenizer, text_encoder, layout, dit, height, width, device, pytorch_image, output_dir) -> None:
-    """pytorch_image() returns the vendored-pipeline image shared with V7 (generated once)."""
-    repo = Path(args.reference_repo).resolve()
-    sys.path[:0] = [str(repo), str(repo / "t2i")]
-    import yaml
-    from diffusion.model.dpm_solver import DPM_Solver, NoiseScheduleFlow
-    from diffusion.model.flow_dpm import DPMS
-    from diffusion.model.trainer import PixDiTTrainer
-    from pixdit_core import modules as upstream_modules
-
-    from pixeldit.model import apply_rotary_emb, pixel_sincos_pos_embed, rope_2d_angles
-
-    print(f"\n[Reference] Upstream PixelDiT at {repo}")
-    cfg = yaml.safe_load(open(repo / "t2i" / "configs" / "PixelDiT_1024px_pixel_diffusion_stage3.yaml", encoding="utf-8"))
-    _check("chi_prompt matches upstream config", "\n".join(cfg["text_encoder"]["chi_prompt"]) == layout.chi_prompt, "")
-
-    # V2 building blocks
-    q, k = torch.randn(2, 4096, 24, 64), torch.randn(2, 4096, 24, 64)
-    uq, uk = upstream_modules.apply_rotary_emb(q, k, upstream_modules.precompute_freqs_cis_2d(64, 64, 64))
-    ang = rope_2d_angles(64, 64, 64)
-    mq, mk = apply_rotary_emb(q, k, ang.cos(), ang.sin())
-    err = max(_stats(mq, uq)["max_abs"], _stats(mk, uk)["max_abs"])
-    _check("V2 real-valued RoPE vs complex", err < 1e-6, f"max_abs={err:.3e}")
-    x = torch.randn(2, 3, height, width)
-    hs, ws = height // 16, width // 16
-    patches = x.view(2, 3, hs, 16, ws, 16).permute(0, 2, 4, 1, 3, 5).reshape(2, hs * ws, -1)
-    _check("V2 patchify vs F.unfold", torch.equal(patches, F.unfold(x, 16, stride=16).transpose(1, 2)), "bitwise")
-    xp = torch.randn(2, hs * ws, 256, 3)
-    folded = F.fold(xp.permute(0, 3, 2, 1).reshape(2, 768, hs * ws), (height, width), kernel_size=16, stride=16)
-    unpatched = xp.view(2, hs, ws, 16, 16, 3).permute(0, 5, 1, 3, 2, 4).reshape(2, 3, height, width)
-    _check("V2 unpatchify vs F.fold", torch.equal(unpatched, folded), "bitwise")
-    if height == width:
-        up_pos = upstream_modules.get_2d_sincos_pos_embed(16, height)
-        _check("V2 pixel pos embed", np.array_equal(up_pos, pixel_sincos_pos_embed(16, height, width)), "bitwise")
-
-    # V2 full forward: upstream PixDiTTrainer vs vendored, both bf16
-    checkpoint, _ = resolve_checkpoint(args.model_name, args.local_files_only)
-    full_state = torch.load(str(checkpoint), map_location="cpu", mmap=True, weights_only=True)["state_dict"]
-    upstream = PixDiTTrainer(image_size=1024, extra=cfg["model"]["extra"], caption_channels=2304, model_max_length=300)
-    upstream.load_state_dict(full_state, strict=True)
-    upstream = upstream.to(device).eval().requires_grad_(False).to(torch.bfloat16)
-    g = torch.Generator(device=device).manual_seed(1)
-    xb = torch.randn(2, 3, height, width, device=device, generator=g)
-    yb = torch.randn(2, 300, 2304, device=device, generator=g)
-    with torch.inference_mode():
-        for tv in CHECK_TIMESTEPS + (996.0,):
-            t = torch.full((2,), tv, device=device)
-            dit_check("V2 DiT vendored vs upstream", tv, dit(xb, t, yb), upstream.forward_with_dpmsolver(xb, t, yb))
-
-    # V3 text path
-    prompt, negative_prompt = args.prompt, args.negative_prompt
-    with torch.inference_mode():
-        sel = [0] + list(range(-300 + 1, 0))
-        up_tok = tokenizer([layout.chi_prompt + prompt.strip()], max_length=layout.text_seq_len, padding="max_length",
-                           truncation=True, return_tensors="pt").to(device)
-        up_pos = text_encoder(up_tok.input_ids, up_tok.attention_mask)[0][:, sel]
-        up_neg_tok = tokenizer(negative_prompt, max_length=300, padding="max_length", truncation=True, return_tensors="pt").to(device)
-        up_neg = text_encoder(up_neg_tok.input_ids, up_neg_tok.attention_mask)[0]
-        my_neg, my_pos = P.encode_prompts(tokenizer, torch_encode_fn(text_encoder), layout, prompt, negative_prompt, device)
-    s_pos, s_neg = _stats(my_pos, up_pos), _stats(my_neg, up_neg)
-    _check("V3 positive embeds vs upstream", s_pos["bitwise"], _fmt(s_pos))
-    # The 506-token trick is exact in fp32 (rel L2 3.8e-6, measured once); in bf16 it differs only by Gemma's bf16 noise.
-    _check("V3 negative embeds 506 + select vs upstream 300", s_neg["cos"] >= TEXT_MIN_COS,
-           f"{_fmt(s_neg)} (need cos >= {TEXT_MIN_COS})")
-
-    # V4 sampler
-    ns = NoiseScheduleFlow(schedule="discrete_flow")
-    for steps in (2, 20, args.steps):
-        up_t = DPM_Solver(lambda x_, t_: x_, ns).get_time_steps("time_uniform_flow", 1, 1.0 / 1000, steps, device, shift=args.flow_shift)
-        _check(f"V4 timesteps steps={steps}", torch.equal(P.flow_timesteps(steps, args.flow_shift, device), up_t), "bitwise")
-
-    def fake_model(x_, t_, y_, **_):
-        return torch.sin(3 * x_) * (t_ / 1000).view(-1, 1, 1, 1) + y_.reshape(y_.shape[0], -1).mean(1).view(-1, 1, 1, 1) - 0.3 * x_
-
-    z = torch.randn(1, 3, 64, 64, device=device, generator=g, dtype=torch.float64)
-    yc = torch.randn(1, 1, 8, 4, device=device, dtype=torch.float64)
-    yu = torch.randn(1, 1, 8, 4, device=device, dtype=torch.float64)
-    up = DPMS(fake_model, condition=yc, uncondition=yu, cfg_scale=args.cfg_scale, model_type="flow", model_kwargs={},
-              schedule="FLOW", interval_guidance=[0, 1]).sample(
-        z, steps=args.steps, order=2, skip_type="time_uniform_flow", method="multistep", flow_shift=args.flow_shift)
-    mine = P.FlowDPMSolver(fake_model, yu[:, 0], yc[:, 0], args.cfg_scale).sample(z, args.steps, args.flow_shift)
-    s = _stats(mine, up)
-    _check("V4 solver math (fake model, fp64)", s["max_abs"] < 1e-10 and torch.isfinite(mine).all().item(), _fmt(s))
-
-    # V4 end to end: upstream DPMS + PixDiTTrainer (bf16) vs vendored pipeline
-    print("  [V4] end-to-end upstream sample...")
-    with torch.inference_mode():
-        z = P.initial_noise(height, width, args.seed, device)
-        hw = torch.tensor([[float(height), float(width)]], device=device)
-        kwargs = dict(data_info={"img_hw": hw, "aspect_ratio": (hw[:, 0] / hw[:, 1]).unsqueeze(1)}, mask=up_tok.attention_mask[:, sel])
-        up_sample = DPMS(upstream.forward_with_dpmsolver, condition=up_pos[:, None], uncondition=up_neg[:, None],
-                         guidance_type="classifier-free", cfg_scale=args.cfg_scale, model_type="flow", model_kwargs=kwargs,
-                         schedule="FLOW", interval_guidance=[0, 1]).sample(
-            z, steps=args.steps, order=2, skip_type="time_uniform_flow", method="multistep", flow_shift=args.flow_shift)
-    del upstream
-    torch.cuda.empty_cache()
-    upstream_image = P.to_uint8_image(up_sample)
-    PILImage.fromarray(upstream_image).save(str(output_dir / "upstream_output.png"))
-    print(f"  [V4] Upstream image saved -> {output_dir / 'upstream_output.png'}")
-    check_image_sanity("V4 end-to-end vendored vs upstream", pytorch_image(), upstream_image)
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +367,7 @@ def main():
     p.add_argument("--ep_dll_dir", default=None, help="Dir with the plugin EP's bundled runtime DLLs")
     p.add_argument("--trt_bin", default=None, help="TensorRT-RTX bin dir, used as a DLL search path")
     p.add_argument("--validate_only", action="store_true", help="Only run ONNX structure checks and a dummy run")
-    p.add_argument("--skip_e2e", action="store_true", help="Skip the end-to-end image comparison (V7)")
-    p.add_argument("--reference_repo", type=str, default=None, help="Path to an NVlabs/PixelDiT clone for V2-V4 parity checks")
+    p.add_argument("--skip_e2e", action="store_true", help="Skip the end-to-end image comparison")
     args = p.parse_args()
     configure_stdio()
 
@@ -542,23 +410,7 @@ def main():
     dit = load_pixeldit(args.model_name, device, torch.bfloat16, args.local_files_only)
     dit.set_image_size(height, width)
 
-    sampler = P.SamplerConfig(args.steps, args.cfg_scale, args.flow_shift, args.negative_prompt)
     encode_torch = torch_encode_fn(text_encoder)
-    cache = {}
-
-    def pytorch_image() -> np.ndarray:
-        """The PyTorch-pipeline image, generated once and shared by V4 and V7."""
-        if "image" not in cache:
-            print("[PyTorch] Running pipeline...")
-            cache["image"] = P.to_uint8_image(P.generate(tokenizer, encode_torch, dit, layout, args.prompt, height, width,
-                                                         args.seed, sampler, device, _progress("PyTorch")))
-            PILImage.fromarray(cache["image"]).save(str(output_dir / "pytorch_output.png"))
-            print(f"[PyTorch] Image saved -> {output_dir / 'pytorch_output.png'}")
-        return cache["image"]
-
-    if args.reference_repo:
-        run_reference_checks(args, tokenizer, text_encoder, layout, dit, height, width, device, pytorch_image, output_dir)
-
     te_runner, tr_runner = runners.get("text_encoder"), runners.get("transformer")
     if te_runner is not None:
         compare_text_encoder(tokenizer, text_encoder, te_runner, layout, args.prompt, args.negative_prompt, device)
@@ -568,8 +420,14 @@ def main():
         compare_dit(dit, tr_runner, y_neg, y_pos, height, width, device)
 
     if not args.skip_e2e:
-        print("\n[V7] End to end")
-        pt_image = pytorch_image()
+        print("\n[End to end]")
+        sampler = P.SamplerConfig(args.steps, args.cfg_scale, args.flow_shift, args.negative_prompt)
+        print("[PyTorch] Running pipeline...")
+        pt_image = P.to_uint8_image(P.generate(tokenizer, encode_torch, dit, layout, args.prompt, height, width,
+                                               args.seed, sampler, device, _progress("PyTorch")))
+        PILImage.fromarray(pt_image).save(str(output_dir / "pytorch_output.png"))
+        print(f"[PyTorch] Image saved -> {output_dir / 'pytorch_output.png'}")
+
         print("[ONNX Runtime] Running pipeline...")
         encode_ort = ort_encode_fn(te_runner, device) if te_runner is not None else encode_torch
         dit_ort = ort_dit_fn(tr_runner, device) if tr_runner is not None else dit

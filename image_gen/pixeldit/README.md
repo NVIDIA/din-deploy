@@ -39,6 +39,6 @@ Shapes are static. `--height` and `--width` (default 1024, multiples of 16) set 
 python verify_pixeldit.py --onnx_dir ./models/PixelDiT-1300M-1024px-onnx --provider trt-rtx
 ```
 
-Compares each ONNX model with the vendored PyTorch model, then generates one image with each and saves `pytorch_output.png`, `ort_output.png`, and `comparison.png`. Pass `--validate_only` to only check the graphs, or `--reference_repo <PixelDiT clone>` to also compare the vendored model and sampler with upstream PixelDiT.
+Compares each ONNX model running on TensorRT RTX with the vendored PyTorch model, then generates one image with each and saves `pytorch_output.png`, `ort_output.png`, and `comparison.png`. Pass `--validate_only` to only check the graphs.
 
 Per-model checks decide pass or fail. The image check only fails on broken output: 50-step BF16 sampling amplifies tiny rounding differences, so correct runs can differ in fine detail, or with some seeds in composition. Compare the images visually.
