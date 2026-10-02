@@ -97,6 +97,7 @@ endfunction()
 add_subdirectory(common)
 add_subdirectory(tests/base)
 add_subdirectory(image_gen/flux2)
+add_subdirectory(image_gen/pixeldit)
 add_subdirectory(asr/rnnt)
 add_subdirectory(vision/sam2)
 add_subdirectory(asr/whisper)
@@ -213,6 +214,16 @@ if(DIN_BUILD_TESTING)
                 vk
         )
     endif ()
+
+    add_din_cli_test(din_pixeldit_bf16_trt-rtx_cpu din_pixeldit_cli
+            --model-dir "${DIN_DEPLOY_ARTIFACTS_ROOT}/PixelDiT-1300M-1024px-onnx"
+            --provider trt-rtx
+            --processing cpu
+            --ep-cache "${DIN_CLI_TEST_EP_CACHE_DIR}"
+            --ep-context-dir "${DIN_CLI_TEST_EP_CONTEXT_DIR}"
+            --num-images 2
+            --output "${PROJECT_SOURCE_DIR}/din_pixeldit_bf16_trt-rtx_cpu"
+    )
 
     unset(_din_cli_test_audio)
 endif()

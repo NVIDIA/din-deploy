@@ -51,6 +51,28 @@ private:
         WhisperByteBpe,
     };
 
+    // ByteLevelBpe: GPT-2 style (Qwen, Whisper). SentencePieceBpe: tokenizer.json BPE with a
+    // Replace(" " -> "▁") normalizer and byte_fallback (Gemma, Llama).
+    enum class EncodeMode
+    {
+        ByteLevelBpe,
+        SentencePieceBpe,
+    };
+
+    struct NormalizerStep
+    {
+        enum class Kind
+        {
+            Prepend,
+            Replace,
+        };
+        Kind kind;
+        std::string pattern;
+        std::string content;
+    };
+
+    [[nodiscard]] std::vector<int64_t> EncodeSentencePieceBpe(const std::string& text, bool add_special_tokens) const;
+
     std::vector<std::string> id_to_token_;
     std::unordered_map<std::string, int64_t> token_to_id_;
     std::unordered_map<std::string, int32_t> bpe_ranks_;
@@ -58,6 +80,15 @@ private:
     std::vector<std::string> special_tokens_;
     std::vector<std::string> lang_codes_;
     DecodeMode decode_mode_ = DecodeMode::Pieces;
+    EncodeMode encode_mode_ = EncodeMode::ByteLevelBpe;
+    // SentencePieceBpe only: all added tokens (special or not), longest first, split before BPE.
+    std::vector<std::string> added_tokens_;
+    std::vector<NormalizerStep> normalizer_;
+    bool byte_fallback_ = false;
+    int64_t unk_id_ = -1;
+    // Post-processor TemplateProcessing "single" special tokens around the sequence.
+    std::vector<int64_t> prefix_special_ids_;
+    std::vector<int64_t> suffix_special_ids_;
 };
 
 }  // namespace din::io

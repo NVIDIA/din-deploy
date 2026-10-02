@@ -1,6 +1,6 @@
 # PixelDiT
 
-ONNX export and verification for PixelDiT text-to-image with ONNX Runtime. There is no C++ runtime yet.
+CLI image generation with ONNX Runtime.
 
 ## Supported models
 
@@ -20,7 +20,15 @@ PixelDiT generates pixels directly, so there is no VAE. The model code is vendor
 | DiT | `transformer/model.onnx` | Batch of 2: negative and positive prompt for classifier-free guidance. Returns velocity. |
 | Sampling | Host | CFG and flow DPM-Solver++ (2nd order), 50 steps, CFG scale 2.75, flow shift 4.0 by default. |
 
-Sampling defaults and the token layout are written to `pipeline_config.json`.
+Sampling defaults and the token layout are written to `pipeline_config.json`. The C++ runtime reads it at startup and falls back to built-in defaults (matching the 1024x1024 export) for missing fields.
+
+## Backends
+
+| Mode | CLI | Inference and sampling |
+| --- | --- | --- |
+| Direct TensorRT RTX | `--provider trt-rtx --processing cpu` | TensorRT RTX inference with CPU sampling. |
+
+CUDA, DirectX, and Vulkan processing are not implemented yet. `--provider cpu` is not supported.
 
 ## Export
 
@@ -42,3 +50,18 @@ python verify_pixeldit.py --onnx_dir ./models/PixelDiT-1300M-1024px-onnx --provi
 Compares each ONNX model running on TensorRT RTX with the vendored PyTorch model, then generates one image with each and saves `pytorch_output.png`, `ort_output.png`, and `comparison.png`. Pass `--validate_only` to only check the graphs.
 
 Per-model checks decide pass or fail. The image check only fails on broken output: 50-step BF16 sampling amplifies tiny rounding differences, so correct runs can differ in fine detail, or with some seeds in composition. Compare the images visually.
+
+## Build
+
+```powershell
+cmake --preset windows-x64
+cmake --build --preset windows-x64-release --target din_pixeldit_cli
+```
+
+## Run
+
+```powershell
+out\build\windows-x64\bin\Release\din_pixeldit_cli.exe --model-dir D:\models\PixelDiT-1300M-1024px-onnx --provider trt-rtx --processing cpu --prompt "a red fox" --output out
+```
+
+Optional: `--negative-prompt`, `--seed`, `--num-images`, `--steps`, `--cfg-scale`, `--flow-shift` (defaults come from `pipeline_config.json`). The C++ noise generator differs from PyTorch's, so the same seed gives a different image than the Python scripts.
