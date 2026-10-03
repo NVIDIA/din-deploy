@@ -96,6 +96,7 @@ endfunction()
 
 add_subdirectory(common)
 add_subdirectory(tests/base)
+add_subdirectory(tests/tokenizer)
 add_subdirectory(image_gen/flux2)
 add_subdirectory(image_gen/pixeldit)
 add_subdirectory(asr/rnnt)
