@@ -716,8 +716,8 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
-    const auto latent_stats = LoadFlux2LatentStats(
-        model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
+    const auto latent_stats =
+        LoadFlux2LatentStats(model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
     state.use_cig = config.processing == Flux2ProcessingBackend::VkCig;
     const Flux2ModelCachePaths cache_paths =
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk", config.text_encoder,
@@ -749,7 +749,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         state.cig_external_compute_queue_data = state.vk->createCudaGraphicsInteropData();
         state.graphics_interop = std::make_unique<OrtVulkanGraphicsInteropScope>(*state.interop_api, state.trt_device,
-            state.cig_external_compute_queue_data);
+                                                                                 state.cig_external_compute_queue_data);
     }
 
     // -----------------------------------------------------------------

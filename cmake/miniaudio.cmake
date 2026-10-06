@@ -3,7 +3,7 @@ include_guard(GLOBAL)
 include(FetchContent)
 FetchContent_Declare(din_miniaudio
     GIT_REPOSITORY https://github.com/mackron/miniaudio.git
-        GIT_TAG "0.11.25"
+    GIT_TAG "0.11.25"
     SOURCE_SUBDIR header-only)
 FetchContent_MakeAvailable(din_miniaudio)
 

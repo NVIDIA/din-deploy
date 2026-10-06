@@ -186,8 +186,8 @@ Flux2Config parse_args(int argc, char* argv[])
     parser.add_argument("--encoder").default_value(std::string("4b")).help("4b or translator.");
     parser.add_argument("--steps").default_value(std::string("4")).help("Denoise steps, 1 through 50.");
     parser.add_argument("--ws")
-          .default_value(std::string("off"))
-          .help("Transformer resident budget: off or 0% through 100%.");
+        .default_value(std::string("off"))
+        .help("Transformer resident budget: off or 0% through 100%.");
     parser.add_argument("--num-images")
         .default_value(std::to_string(config.num_images))
         .nargs(1)
@@ -288,8 +288,8 @@ int main(int argc, char* argv[])
             Flux2Image image = pipeline->GenerateImage(current_seed);
             const auto& times = image.timings;
             std::cout << "Timings (ms): encode=" << times.encode_ms << " rng=" << times.rng_ms
-                << " denoise=" << times.denoise_ms << " decode=" << times.decode_ms << " total=" << times.total_ms
-                << std::endl;
+                      << " denoise=" << times.denoise_ms << " decode=" << times.decode_ms << " total=" << times.total_ms
+                      << std::endl;
             const auto image_end = std::chrono::steady_clock::now();
             save_image(make_output_path(config, image_index), image);
             const std::chrono::duration<double> image_duration = image_end - image_start;

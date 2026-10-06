@@ -16,19 +16,19 @@
 #include "utils.h"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <fstream>
+
 #include <nlohmann/json.hpp>
 
 Flux2LatentStats LoadFlux2LatentStats(const std::filesystem::path& path, size_t channels)
 {
     std::ifstream file(path);
     if (!file)
-        throw std::runtime_error("Missing VAE latent statistics: " + path.string() +
-            ". Re-export the VAE decoder.");
+        throw std::runtime_error("Missing VAE latent statistics: " + path.string() + ". Re-export the VAE decoder.");
     try
     {
         const auto document = nlohmann::json::parse(file);
@@ -36,8 +36,7 @@ Flux2LatentStats LoadFlux2LatentStats(const std::filesystem::path& path, size_t 
         {
             const auto& values = document.at(key);
             if (!values.is_array() || values.size() != channels)
-                throw std::runtime_error(std::string(key) + " must contain " +
-                    std::to_string(channels) + " values");
+                throw std::runtime_error(std::string(key) + " must contain " + std::to_string(channels) + " values");
             std::vector<float> result;
             result.reserve(channels);
             for (const auto& value : values)

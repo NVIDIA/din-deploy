@@ -11,10 +11,8 @@ namespace
 {
 Flux2RuntimeContext& GetProcessRuntime(Flux2ExecutionProvider provider)
 {
-    static Ort::Env env{
-        std::getenv("DIN_FLUX2_VERBOSE") ? ORT_LOGGING_LEVEL_VERBOSE : ORT_LOGGING_LEVEL_WARNING,
-        "Flux2"
-    };
+    static Ort::Env env{std::getenv("DIN_FLUX2_VERBOSE") ? ORT_LOGGING_LEVEL_VERBOSE : ORT_LOGGING_LEVEL_WARNING,
+                        "Flux2"};
     static Flux2RuntimeContext runtime{env};
     static std::once_flag register_trt_once;
 

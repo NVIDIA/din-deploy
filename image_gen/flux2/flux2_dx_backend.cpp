@@ -459,8 +459,8 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         throw std::runtime_error("DirectX processing requires --provider trt-rtx");
     }
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
-    const auto latent_stats = LoadFlux2LatentStats(
-        model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
+    const auto latent_stats =
+        LoadFlux2LatentStats(model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
     const Flux2ModelCachePaths cache_paths =
         MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx", config.text_encoder,
                                  !config.weight_streaming_budget.empty());

@@ -16,8 +16,8 @@
 
 #include "flux2.h"
 #include "flux2_cli.h"
-#include "utils.h"
 #include "io/image.h"
+#include "utils.h"
 #include <argparse/argparse.hpp>
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -26,425 +26,416 @@
 
 namespace
 {
-    // Stable per-root namespace prevents a different model directory from reusing stale engines.
-    std::string CacheNamespace(const std::filesystem::path& root)
+// Stable per-root namespace prevents a different model directory from reusing stale engines.
+std::string CacheNamespace(const std::filesystem::path& root)
+{
+    const auto path = std::filesystem::weakly_canonical(root).generic_u8string();
+    uint64_t hash = 14695981039346656037ull;
+    for (const auto c : path)
     {
-        const auto path = std::filesystem::weakly_canonical(root).generic_u8string();
-        uint64_t hash = 14695981039346656037ull;
-        for (const auto c : path)
-        {
-            hash ^= static_cast<unsigned char>(c);
-            hash *= 1099511628211ull;
-        }
-        return "root_" + std::to_string(hash);
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ull;
+    }
+    return "root_" + std::to_string(hash);
+}
+
+struct Request
+{
+    Flux2Config config;
+    Flux2GenerationOptions generation;
+    bool random_seeds = false;
+};
+
+struct Result
+{
+    Flux2Image image;
+    unsigned int seed = 0;
+    GLuint texture = 0;
+};
+
+// Only the worker touches the pipeline; all graphics resources belong to the UI thread.
+class Generator
+{
+public:
+    Generator()
+        : worker_(
+              [this]
+              {
+                  Run();
+              })
+    {
     }
 
-    struct Request
+    ~Generator()
     {
-        Flux2Config config;
-        Flux2GenerationOptions generation;
-        bool random_seeds = false;
-    };
-
-    struct Result
-    {
-        Flux2Image image;
-        unsigned int seed = 0;
-        GLuint texture = 0;
-    };
-
-    // Only the worker touches the pipeline; all graphics resources belong to the UI thread.
-    class Generator
-    {
-    public:
-        Generator()
-            : worker_(
-                [this]
-                {
-                    Run();
-                })
-        {
-        }
-
-        ~Generator()
-        {
-            {
-                std::lock_guard lock(mutex);
-                closing_ = true;
-            }
-            cv_.notify_one();
-            worker_.join();
-        }
-
-        void Submit(Request request)
         {
             std::lock_guard lock(mutex);
-            if (busy)
-                return;
-            busy = true;
-            failed = false;
-            status = "Loading models (first compilation can take several minutes)";
-            completed = 0;
-            total = request.config.steps * static_cast<int>(request.config.num_images);
-            request_ = std::move(request);
-            cv_.notify_one();
+            closing_ = true;
         }
+        cv_.notify_one();
+        worker_.join();
+    }
 
-        std::mutex mutex;
-        bool busy = false, failed = false;
-        std::string status = "Ready";
-        int completed = 0, total = 1;
-        size_t used_mb = 0, total_mb = 0;
-        std::vector<Result> ready;
+    void Submit(Request request)
+    {
+        std::lock_guard lock(mutex);
+        if (busy)
+            return;
+        busy = true;
+        failed = false;
+        status = "Loading models (first compilation can take several minutes)";
+        completed = 0;
+        total = request.config.steps * static_cast<int>(request.config.num_images);
+        request_ = std::move(request);
+        cv_.notify_one();
+    }
 
-    private:
-        static bool SameModels(const Flux2Config& a, const Flux2Config& b)
+    std::mutex mutex;
+    bool busy = false, failed = false;
+    std::string status = "Ready";
+    int completed = 0, total = 1;
+    size_t used_mb = 0, total_mb = 0;
+    std::vector<Result> ready;
+
+private:
+    static bool SameModels(const Flux2Config& a, const Flux2Config& b)
+    {
+        return a.model_dir == b.model_dir && a.processing == b.processing && a.provider == b.provider &&
+               a.precision == b.precision && a.text_encoder == b.text_encoder && a.steps == b.steps &&
+               a.weight_streaming_budget == b.weight_streaming_budget && a.ep_cache_dir == b.ep_cache_dir &&
+               a.ep_context_dir == b.ep_context_dir;
+    }
+
+    void UpdateMemory()
+    {
+        size_t free = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free, &total_bytes) == cudaSuccess)
         {
-            return a.model_dir == b.model_dir && a.processing == b.processing && a.provider == b.provider &&
-                a.precision == b.precision && a.text_encoder == b.text_encoder && a.steps == b.steps &&
-                a.weight_streaming_budget == b.weight_streaming_budget &&
-                a.ep_cache_dir == b.ep_cache_dir && a.ep_context_dir == b.ep_context_dir;
+            std::lock_guard lock(mutex);
+            used_mb = (total_bytes - free) / (1024 * 1024);
+            total_mb = total_bytes / (1024 * 1024);
         }
+        else
+            cudaGetLastError();
+    }
 
-        void UpdateMemory()
+    void Run()
+    {
+        std::unique_ptr<Flux2ProcessingPipeline> pipeline;
+        std::optional<Flux2Config> loaded;
+        std::mt19937 random(std::random_device{}());
+        for (;;)
         {
-            size_t free = 0, total_bytes = 0;
-            if (cudaMemGetInfo(&free, &total_bytes) == cudaSuccess)
+            std::unique_lock lock(mutex);
+            cv_.wait_for(lock, std::chrono::milliseconds(500),
+                         [&]
+                         {
+                             return closing_ || request_.has_value();
+                         });
+            if (closing_)
+                break;
+            if (!request_)
             {
-                std::lock_guard lock(mutex);
-                used_mb = (total_bytes - free) / (1024 * 1024);
-                total_mb = total_bytes / (1024 * 1024);
-            }
-            else
-                cudaGetLastError();
-        }
-
-        void Run()
-        {
-            std::unique_ptr<Flux2ProcessingPipeline> pipeline;
-            std::optional<Flux2Config> loaded;
-            std::mt19937 random(std::random_device{}());
-            for (;;)
-            {
-                std::unique_lock lock(mutex);
-                cv_.wait_for(lock, std::chrono::milliseconds(500),
-                             [&]
-                             {
-                                 return closing_ || request_.has_value();
-                             });
-                if (closing_)
-                    break;
-                if (!request_)
-                {
-                    lock.unlock();
-                    if (loaded && loaded->provider == Flux2ExecutionProvider::TrtRtx)
-                        UpdateMemory();
-                    continue;
-                }
-                Request request = std::move(*request_);
-                request_.reset();
                 lock.unlock();
-                try
+                if (loaded && loaded->provider == Flux2ExecutionProvider::TrtRtx)
+                    UpdateMemory();
+                continue;
+            }
+            Request request = std::move(*request_);
+            request_.reset();
+            lock.unlock();
+            try
+            {
+                const auto& config = request.config;
+                ValidateFlux2Config(config);
+                if (!loaded || !SameModels(*loaded, config))
                 {
-                    const auto& config = request.config;
-                    ValidateFlux2Config(config);
-                    if (!loaded || !SameModels(*loaded, config))
-                    {
-                        pipeline.reset(); // Release old engines before allocating the replacement.
-                        loaded.reset();
-                        pipeline = CreateFlux2Pipeline(config);
-                        pipeline->Initialize();
-                        loaded = config;
-                    }
-                    pipeline->SetPrompt(config.prompt);
-                    for (unsigned int i = 0; i < config.num_images; ++i)
-                    {
-                        const unsigned int seed = request.random_seeds ? random() : config.seed + i;
-                        auto image = pipeline->GenerateImage(
-                            seed,
-                            [&](const char* stage, int step, int)
-                            {
-                                {
-                                    std::lock_guard guard(mutex);
-                                    completed = static_cast<int>(i) * config.steps + step;
-                                    status = "Image " + std::to_string(i + 1) + "/" + std::to_string(config.num_images)
-                                        +
-                                        ": " + stage;
-                                }
-                                if (config.provider == Flux2ExecutionProvider::TrtRtx)
-                                    UpdateMemory();
-                            },
-                            request.generation);
-                        if (!config.output_path.empty())
-                        {
-                            std::filesystem::create_directories(config.output_path);
-                            const auto file =
-                                config.output_path / ("flux2_" + std::to_string(i) + "_" + std::to_string(seed) +
-                                    ".png");
-                            if (!din::io::SaveRgbFloatImage(file.string(), image.data.data(), image.height, image.width,
-                                                            din::io::ImageValueRange::MinusOneToOne))
-                                throw std::runtime_error("Could not save " + file.string());
-                        }
-                        std::lock_guard guard(mutex);
-                        ready.push_back({std::move(image), seed, 0});
-                    }
-                    std::lock_guard guard(mutex);
-                    completed = total;
-                    status = "Done";
-                }
-                catch (const std::exception& error)
-                {
-                    pipeline.reset();
+                    pipeline.reset();  // Release old engines before allocating the replacement.
                     loaded.reset();
+                    pipeline = CreateFlux2Pipeline(config);
+                    pipeline->Initialize();
+                    loaded = config;
+                }
+                pipeline->SetPrompt(config.prompt);
+                for (unsigned int i = 0; i < config.num_images; ++i)
+                {
+                    const unsigned int seed = request.random_seeds ? random() : config.seed + i;
+                    auto image = pipeline->GenerateImage(
+                        seed,
+                        [&](const char* stage, int step, int)
+                        {
+                            {
+                                std::lock_guard guard(mutex);
+                                completed = static_cast<int>(i) * config.steps + step;
+                                status = "Image " + std::to_string(i + 1) + "/" + std::to_string(config.num_images) +
+                                         ": " + stage;
+                            }
+                            if (config.provider == Flux2ExecutionProvider::TrtRtx)
+                                UpdateMemory();
+                        },
+                        request.generation);
+                    if (!config.output_path.empty())
+                    {
+                        std::filesystem::create_directories(config.output_path);
+                        const auto file =
+                            config.output_path / ("flux2_" + std::to_string(i) + "_" + std::to_string(seed) + ".png");
+                        if (!din::io::SaveRgbFloatImage(file.string(), image.data.data(), image.height, image.width,
+                                                        din::io::ImageValueRange::MinusOneToOne))
+                            throw std::runtime_error("Could not save " + file.string());
+                    }
                     std::lock_guard guard(mutex);
-                    status = std::string("Error: ") + error.what();
-                    failed = true;
+                    ready.push_back({std::move(image), seed, 0});
                 }
                 std::lock_guard guard(mutex);
-                busy = false;
+                completed = total;
+                status = "Done";
             }
-            // Destroy sessions, streams and GPU allocations on their owning thread.
-        }
-
-        std::condition_variable cv_;
-        bool closing_ = false;
-        std::optional<Request> request_;
-        std::thread worker_;
-    };
-
-    void Upload(Result& result)
-    {
-        const auto& img = result.image;
-        const size_t pixels = static_cast<size_t>(img.width) * img.height;
-        if (!pixels || img.data.size() != pixels * 3)
-            throw std::runtime_error("Invalid image returned by pipeline");
-        std::vector<unsigned char> rgb(pixels * 3);
-        for (size_t p = 0; p < pixels; ++p)
-            for (size_t c = 0; c < 3; ++c)
+            catch (const std::exception& error)
             {
-                const float v = img.data[c * pixels + p];
-                rgb[p * 3 + c] =
-                    std::isfinite(v)
-                        ? static_cast<unsigned char>(std::lround(std::clamp(v * 127.5f + 127.5f, 0.0f, 255.0f)))
-                        : 0;
+                pipeline.reset();
+                loaded.reset();
+                std::lock_guard guard(mutex);
+                status = std::string("Error: ") + error.what();
+                failed = true;
             }
-        glGenTextures(1, &result.texture);
-        glBindTexture(GL_TEXTURE_2D, result.texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.width, img.height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+            std::lock_guard guard(mutex);
+            busy = false;
+        }
+        // Destroy sessions, streams and GPU allocations on their owning thread.
     }
 
+    std::condition_variable cv_;
+    bool closing_ = false;
+    std::optional<Request> request_;
+    std::thread worker_;
+};
 
-    int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit_after)
-    {
-        Generator generator;
-        Flux2Config config = initial;
-        std::array<char, 2048> model{}, output{}, cache{};
-        bool cache_changed = false;
-        const auto cache_utf8 = initial.ep_cache_dir.parent_path().u8string();
-        std::snprintf(cache.data(), cache.size(), "%s", reinterpret_cast<const char*>(cache_utf8.c_str()));
-        std::array<char, 8192> prompt{};
-        const auto model_utf8 = config.model_dir.u8string();
-        std::snprintf(model.data(), model.size(), "%s", reinterpret_cast<const char*>(model_utf8.c_str()));
-        std::snprintf(output.data(), output.size(), "%s", config.output_path.string().c_str());
-        std::snprintf(prompt.data(), prompt.size(), "%s", config.prompt.c_str());
-        int streaming_mode = 0; // Auto / Manual / Off; independent of session configuration.
-        int budget = 50;
-        int count = static_cast<int>(config.num_images);
-        int encoder = config.text_encoder == Flux2TextEncoder::Qwen3_4B ? 0 : 1;
-        int precision = config.precision == "bf16"
-                            ? 0
-                            : config.precision == "fp16"
-                            ? 1
-                            : config.precision == "fp8"
-                            ? 2
-                            : 3;
-        const char* precisions[] = {"bf16", "fp16", "fp8", "nvfp4"};
-        const char* backends[] = {"CPU", "CUDA", "DirectX", "DirectX CIG", "Vulkan", "Vulkan CIG"};
-        int backend = static_cast<int>(config.processing);
-        int provider = config.provider == Flux2ExecutionProvider::Cpu ? 0 : 1;
-        std::vector<Result> results;
-        int selected = -1, frames = 0;
-        bool launched = false;
-        int exit_code = 0;
-        GLFWwindow* window = glfwGetCurrentContext();
-        while (!glfwWindowShouldClose(window))
+void Upload(Result& result)
+{
+    const auto& img = result.image;
+    const size_t pixels = static_cast<size_t>(img.width) * img.height;
+    if (!pixels || img.data.size() != pixels * 3)
+        throw std::runtime_error("Invalid image returned by pipeline");
+    std::vector<unsigned char> rgb(pixels * 3);
+    for (size_t p = 0; p < pixels; ++p)
+        for (size_t c = 0; c < 3; ++c)
         {
-            glfwPollEvents();
-            ImGui_ImplOpenGL3_NewFrame();
-            ImGui_ImplGlfw_NewFrame();
-            ImGui::NewFrame();
-            ImGui::SetNextWindowPos({0, 0});
-            ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-            ImGui::Begin("Flux2 Studio", nullptr,
-                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
-            ImGui::TextUnformatted("DIN Deploy - FLUX.2-klein Interactive Studio");
-            ImGui::Separator();
-            bool busy, failed;
-            int completed, total;
-            std::string status;
-            size_t used_mb, total_mb;
-            {
-                std::lock_guard lock(generator.mutex);
-                busy = generator.busy;
-                failed = generator.failed;
-                status = generator.status;
-                completed = generator.completed;
-                total = generator.total;
-                used_mb = generator.used_mb;
-                total_mb = generator.total_mb;
-                for (auto& result : generator.ready)
-                {
-                    results.push_back(std::move(result));
-                    selected = static_cast<int>(results.size()) - 1;
-                }
-                generator.ready.clear();
-            }
-            if (launched && !busy && exit_after)
-            {
-                exit_code = failed ? 1 : 0;
-                glfwSetWindowShouldClose(window, true);
-            }
-            ImGui::BeginChild("controls", ImVec2(430, 0), true);
-            ImGui::BeginDisabled(busy);
-            ImGui::InputText("Model root", model.data(), model.size());
-            cache_changed |= ImGui::InputText("Cache root", cache.data(), cache.size());
-            ImGui::InputText("Save directory", output.data(), output.size());
-            ImGui::TextUnformatted("Prompt");
-            ImGui::InputTextMultiline("##prompt", prompt.data(), prompt.size(), ImVec2(-1, 100));
-            ImGui::RadioButton("Qwen3-4B", &encoder, 0);
-            const bool translator_exists = model[0] && std::filesystem::is_regular_file(
-                std::filesystem::u8path(model.data()) /
-                "text_encoder_translator/model.onnx");
-            ImGui::BeginDisabled(!translator_exists);
-            ImGui::RadioButton("Qwen3-0.6B + translator", &encoder, 1);
-            ImGui::EndDisabled();
-            if (!translator_exists)
-                ImGui::TextWrapped("Translator ONNX is missing from this model root.");
-            ImGui::Combo("Precision", &precision, precisions, IM_ARRAYSIZE(precisions));
-            ImGui::Combo("Provider", &provider, "CPU\0TensorRT RTX\0");
-            if (provider == 0)
-            {
-                backend = 0;
-                streaming_mode = 0;
-            }
-            if (ImGui::BeginCombo("Processing", backends[backend]))
-            {
-                for (int i = 0; i < 6; ++i)
-                {
-                    if (!IsFlux2BackendAvailable(static_cast<Flux2ProcessingBackend>(i)) || (provider == 0 && i != 0))
-                        continue;
-                    if (ImGui::Selectable(backends[i], backend == i))
-                        backend = i;
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::BeginDisabled(provider == 0);
-            ImGui::Combo("Weight streaming", &streaming_mode, "Auto\0Manual\0Off\0");
-            if (streaming_mode == 1)
-                ImGui::SliderInt("Resident weights %", &budget, 10, 100);
-            ImGui::EndDisabled();
-            ImGui::InputScalar("Seed", ImGuiDataType_U32, &config.seed);
-            ImGui::SliderInt("Denoise steps", &config.steps, 1, 50);
-            ImGui::SliderInt("Images", &count, 1, 16);
-            const bool paths_valid = model[0] && (!cache_changed || cache[0]);
-            ImGui::BeginDisabled(!paths_valid);
-            bool generate = ImGui::Button("Generate", ImVec2(-1, 35));
-            bool random = ImGui::Button("Random sweep", ImVec2(-1, 30));
-            ImGui::EndDisabled();
-            ImGui::EndDisabled();
-            if (!busy && paths_valid && (generate || random || (auto_generate && !launched)))
-            {
-                for (auto& result : results)
-                    if (result.texture)
-                        glDeleteTextures(1, &result.texture);
-                results.clear();
-                selected = -1;
-                config.model_dir = std::filesystem::u8path(model.data());
-                config.output_path = output.data();
-                config.prompt = prompt.data();
-                const auto cache_namespace = CacheNamespace(config.model_dir);
-                config.ep_cache_dir = (cache_changed
-                                           ? std::filesystem::u8path(cache.data()) / "runtime"
-                                           : initial.ep_cache_dir) / cache_namespace;
-                config.ep_context_dir = (cache_changed
-                                             ? std::filesystem::u8path(cache.data()) / "ep_context"
-                                             : initial.ep_context_dir) / cache_namespace;
-                config.text_encoder = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
-                config.precision = precisions[precision];
-                config.num_images = static_cast<unsigned int>(count);
-                config.processing = static_cast<Flux2ProcessingBackend>(backend);
-                config.provider = provider == 0 ? Flux2ExecutionProvider::Cpu : Flux2ExecutionProvider::TrtRtx;
-                config.weight_streaming_budget = provider == 0 ? "" : "-1";
-                Flux2GenerationOptions generation;
-                if (provider != 0 && streaming_mode != 0)
-                    generation.weight_streaming_budget = streaming_mode == 1 ? std::to_string(budget) + "%" : "0";
-                generator.Submit({config, generation, random});
-                launched = true;
-            }
-            ImGui::ProgressBar(static_cast<float>(completed) / std::max(total, 1), ImVec2(-1, 0));
-            ImGui::TextWrapped("%s", status.c_str());
-            if (provider != 0 && total_mb)
-                ImGui::Text("Device memory: %zu / %zu MiB", used_mb, total_mb);
-            if (selected >= 0)
-            {
-                const auto& t = results[selected].image.timings;
-                ImGui::Separator();
-                ImGui::Text("Encode %.0f ms | RNG %.0f ms", t.encode_ms, t.rng_ms);
-                ImGui::Text("Denoise %.0f ms (%.0f ms/step)", t.denoise_ms, t.per_step_ms);
-                ImGui::Text("Decode %.0f ms | Total %.2f s", t.decode_ms, t.total_ms / 1000);
-            }
-            ImGui::EndChild();
-            ImGui::SameLine();
-            ImGui::BeginChild("images", ImVec2(0, 0), true);
-            for (auto& result : results)
-                if (!result.texture)
-                    Upload(result);
-            ImGui::BeginChild("preview", ImVec2(0, -115), false);
-            if (selected >= 0)
-            {
-                const auto available = ImGui::GetContentRegionAvail();
-                const float side = std::max(1.0f, std::min(available.x, available.y));
-                ImGui::Image(static_cast<ImTextureID>(results[selected].texture), ImVec2(side, side));
-            }
-            else
-                ImGui::TextDisabled("Generated images will appear here.");
-            ImGui::EndChild();
-            ImGui::BeginChild("thumbnails", ImVec2(0, 110), false, ImGuiWindowFlags_HorizontalScrollbar);
-            for (int i = 0; i < static_cast<int>(results.size()); ++i)
-            {
-                if (i)
-                    ImGui::SameLine();
-                ImGui::PushID(i);
-                ImGui::BeginGroup();
-                if (ImGui::ImageButton("image", static_cast<ImTextureID>(results[i].texture), ImVec2(72, 72)))
-                    selected = i;
-                ImGui::Text("%u", results[i].seed);
-                ImGui::EndGroup();
-                ImGui::PopID();
-            }
-            ImGui::EndChild();
-            ImGui::EndChild();
-            ImGui::End();
-            ImGui::Render();
-            int width, height;
-            glfwGetFramebufferSize(window, &width, &height);
-            glViewport(0, 0, width, height);
-            glClearColor(0.09f, 0.09f, 0.10f, 1);
-            glClear(GL_COLOR_BUFFER_BIT);
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            glfwSwapBuffers(window);
-            if (smoke && ++frames >= 3)
-                break;
+            const float v = img.data[c * pixels + p];
+            rgb[p * 3 + c] =
+                std::isfinite(v)
+                    ? static_cast<unsigned char>(std::lround(std::clamp(v * 127.5f + 127.5f, 0.0f, 255.0f)))
+                    : 0;
         }
+    glGenTextures(1, &result.texture);
+    glBindTexture(GL_TEXTURE_2D, result.texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.width, img.height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+}
+
+int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit_after)
+{
+    Generator generator;
+    Flux2Config config = initial;
+    std::array<char, 2048> model{}, output{}, cache{};
+    bool cache_changed = false;
+    const auto cache_utf8 = initial.ep_cache_dir.parent_path().u8string();
+    std::snprintf(cache.data(), cache.size(), "%s", reinterpret_cast<const char*>(cache_utf8.c_str()));
+    std::array<char, 8192> prompt{};
+    const auto model_utf8 = config.model_dir.u8string();
+    std::snprintf(model.data(), model.size(), "%s", reinterpret_cast<const char*>(model_utf8.c_str()));
+    std::snprintf(output.data(), output.size(), "%s", config.output_path.string().c_str());
+    std::snprintf(prompt.data(), prompt.size(), "%s", config.prompt.c_str());
+    int streaming_mode = 0;  // Auto / Manual / Off; independent of session configuration.
+    int budget = 50;
+    int count = static_cast<int>(config.num_images);
+    int encoder = config.text_encoder == Flux2TextEncoder::Qwen3_4B ? 0 : 1;
+    int precision = config.precision == "bf16" ? 0 : config.precision == "fp16" ? 1 : config.precision == "fp8" ? 2 : 3;
+    const char* precisions[] = {"bf16", "fp16", "fp8", "nvfp4"};
+    const char* backends[] = {"CPU", "CUDA", "DirectX", "DirectX CIG", "Vulkan", "Vulkan CIG"};
+    int backend = static_cast<int>(config.processing);
+    int provider = config.provider == Flux2ExecutionProvider::Cpu ? 0 : 1;
+    std::vector<Result> results;
+    int selected = -1, frames = 0;
+    bool launched = false;
+    int exit_code = 0;
+    GLFWwindow* window = glfwGetCurrentContext();
+    while (!glfwWindowShouldClose(window))
+    {
+        glfwPollEvents();
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos({0, 0});
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        ImGui::Begin("Flux2 Studio", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
+        ImGui::TextUnformatted("DIN Deploy - FLUX.2-klein Interactive Studio");
+        ImGui::Separator();
+        bool busy, failed;
+        int completed, total;
+        std::string status;
+        size_t used_mb, total_mb;
+        {
+            std::lock_guard lock(generator.mutex);
+            busy = generator.busy;
+            failed = generator.failed;
+            status = generator.status;
+            completed = generator.completed;
+            total = generator.total;
+            used_mb = generator.used_mb;
+            total_mb = generator.total_mb;
+            for (auto& result : generator.ready)
+            {
+                results.push_back(std::move(result));
+                selected = static_cast<int>(results.size()) - 1;
+            }
+            generator.ready.clear();
+        }
+        if (launched && !busy && exit_after)
+        {
+            exit_code = failed ? 1 : 0;
+            glfwSetWindowShouldClose(window, true);
+        }
+        ImGui::BeginChild("controls", ImVec2(430, 0), true);
+        ImGui::BeginDisabled(busy);
+        ImGui::InputText("Model root", model.data(), model.size());
+        cache_changed |= ImGui::InputText("Cache root", cache.data(), cache.size());
+        ImGui::InputText("Save directory", output.data(), output.size());
+        ImGui::TextUnformatted("Prompt");
+        ImGui::InputTextMultiline("##prompt", prompt.data(), prompt.size(), ImVec2(-1, 100));
+        ImGui::RadioButton("Qwen3-4B", &encoder, 0);
+        const bool translator_exists =
+            model[0] && std::filesystem::is_regular_file(std::filesystem::u8path(model.data()) /
+                                                         "text_encoder_translator/model.onnx");
+        ImGui::BeginDisabled(!translator_exists);
+        ImGui::RadioButton("Qwen3-0.6B + translator", &encoder, 1);
+        ImGui::EndDisabled();
+        if (!translator_exists)
+            ImGui::TextWrapped("Translator ONNX is missing from this model root.");
+        ImGui::Combo("Precision", &precision, precisions, IM_ARRAYSIZE(precisions));
+        ImGui::Combo("Provider", &provider, "CPU\0TensorRT RTX\0");
+        if (provider == 0)
+        {
+            backend = 0;
+            streaming_mode = 0;
+        }
+        if (ImGui::BeginCombo("Processing", backends[backend]))
+        {
+            for (int i = 0; i < 6; ++i)
+            {
+                if (!IsFlux2BackendAvailable(static_cast<Flux2ProcessingBackend>(i)) || (provider == 0 && i != 0))
+                    continue;
+                if (ImGui::Selectable(backends[i], backend == i))
+                    backend = i;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::BeginDisabled(provider == 0);
+        ImGui::Combo("Weight streaming", &streaming_mode, "Auto\0Manual\0Off\0");
+        if (streaming_mode == 1)
+            ImGui::SliderInt("Resident weights %", &budget, 10, 100);
+        ImGui::EndDisabled();
+        ImGui::InputScalar("Seed", ImGuiDataType_U32, &config.seed);
+        ImGui::SliderInt("Denoise steps", &config.steps, 1, 50);
+        ImGui::SliderInt("Images", &count, 1, 16);
+        const bool paths_valid = model[0] && (!cache_changed || cache[0]);
+        ImGui::BeginDisabled(!paths_valid);
+        bool generate = ImGui::Button("Generate", ImVec2(-1, 35));
+        bool random = ImGui::Button("Random sweep", ImVec2(-1, 30));
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if (!busy && paths_valid && (generate || random || (auto_generate && !launched)))
+        {
+            for (auto& result : results)
+                if (result.texture)
+                    glDeleteTextures(1, &result.texture);
+            results.clear();
+            selected = -1;
+            config.model_dir = std::filesystem::u8path(model.data());
+            config.output_path = output.data();
+            config.prompt = prompt.data();
+            const auto cache_namespace = CacheNamespace(config.model_dir);
+            config.ep_cache_dir =
+                (cache_changed ? std::filesystem::u8path(cache.data()) / "runtime" : initial.ep_cache_dir) /
+                cache_namespace;
+            config.ep_context_dir =
+                (cache_changed ? std::filesystem::u8path(cache.data()) / "ep_context" : initial.ep_context_dir) /
+                cache_namespace;
+            config.text_encoder = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+            config.precision = precisions[precision];
+            config.num_images = static_cast<unsigned int>(count);
+            config.processing = static_cast<Flux2ProcessingBackend>(backend);
+            config.provider = provider == 0 ? Flux2ExecutionProvider::Cpu : Flux2ExecutionProvider::TrtRtx;
+            config.weight_streaming_budget = provider == 0 ? "" : "-1";
+            Flux2GenerationOptions generation;
+            if (provider != 0 && streaming_mode != 0)
+                generation.weight_streaming_budget = streaming_mode == 1 ? std::to_string(budget) + "%" : "0";
+            generator.Submit({config, generation, random});
+            launched = true;
+        }
+        ImGui::ProgressBar(static_cast<float>(completed) / std::max(total, 1), ImVec2(-1, 0));
+        ImGui::TextWrapped("%s", status.c_str());
+        if (provider != 0 && total_mb)
+            ImGui::Text("Device memory: %zu / %zu MiB", used_mb, total_mb);
+        if (selected >= 0)
+        {
+            const auto& t = results[selected].image.timings;
+            ImGui::Separator();
+            ImGui::Text("Encode %.0f ms | RNG %.0f ms", t.encode_ms, t.rng_ms);
+            ImGui::Text("Denoise %.0f ms (%.0f ms/step)", t.denoise_ms, t.per_step_ms);
+            ImGui::Text("Decode %.0f ms | Total %.2f s", t.decode_ms, t.total_ms / 1000);
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("images", ImVec2(0, 0), true);
         for (auto& result : results)
-            if (result.texture)
-                glDeleteTextures(1, &result.texture);
-        return exit_code;
+            if (!result.texture)
+                Upload(result);
+        ImGui::BeginChild("preview", ImVec2(0, -115), false);
+        if (selected >= 0)
+        {
+            const auto available = ImGui::GetContentRegionAvail();
+            const float side = std::max(1.0f, std::min(available.x, available.y));
+            ImGui::Image(static_cast<ImTextureID>(results[selected].texture), ImVec2(side, side));
+        }
+        else
+            ImGui::TextDisabled("Generated images will appear here.");
+        ImGui::EndChild();
+        ImGui::BeginChild("thumbnails", ImVec2(0, 110), false, ImGuiWindowFlags_HorizontalScrollbar);
+        for (int i = 0; i < static_cast<int>(results.size()); ++i)
+        {
+            if (i)
+                ImGui::SameLine();
+            ImGui::PushID(i);
+            ImGui::BeginGroup();
+            if (ImGui::ImageButton("image", static_cast<ImTextureID>(results[i].texture), ImVec2(72, 72)))
+                selected = i;
+            ImGui::Text("%u", results[i].seed);
+            ImGui::EndGroup();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::EndChild();
+        ImGui::End();
+        ImGui::Render();
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        glViewport(0, 0, width, height);
+        glClearColor(0.09f, 0.09f, 0.10f, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+        if (smoke && ++frames >= 3)
+            break;
     }
-} // namespace
+    for (auto& result : results)
+        if (result.texture)
+            glDeleteTextures(1, &result.texture);
+    return exit_code;
+}
+}  // namespace
 
 int main(int argc, char** argv)
 {
@@ -466,10 +457,10 @@ int main(int argc, char** argv)
         args.add_argument("--output").default_value(std::string{});
         const auto runtime_cache_utf8 = (cache_root / "runtime").u8string();
         const auto context_cache_utf8 = (cache_root / "ep_context").u8string();
-        args.add_argument("--ep-cache").default_value(std::string(
-            reinterpret_cast<const char*>(runtime_cache_utf8.c_str())));
-        args.add_argument("--ep-context-dir").default_value(std::string(
-            reinterpret_cast<const char*>(context_cache_utf8.c_str())));
+        args.add_argument("--ep-cache")
+            .default_value(std::string(reinterpret_cast<const char*>(runtime_cache_utf8.c_str())));
+        args.add_argument("--ep-context-dir")
+            .default_value(std::string(reinterpret_cast<const char*>(context_cache_utf8.c_str())));
         args.add_argument("--prompt").default_value(std::string(DEFAULT_PROMPT));
         args.add_argument("--encoder").default_value(std::string("auto")).choices("auto", "4b", "translator");
         args.add_argument("--precision").default_value(std::string("bf16")).choices("bf16", "fp16", "fp8", "nvfp4");
@@ -490,9 +481,10 @@ int main(int argc, char** argv)
         config.precision = args.get<std::string>("--precision");
         config.num_images = 1;
         const auto encoder = args.get<std::string>("--encoder");
-        const bool translator = encoder == "translator" ||
-        (encoder == "auto" && !config.model_dir.empty() && std::filesystem::is_regular_file(
-            config.model_dir / "text_encoder_translator/model.onnx"));
+        const bool translator =
+            encoder == "translator" ||
+            (encoder == "auto" && !config.model_dir.empty() &&
+             std::filesystem::is_regular_file(config.model_dir / "text_encoder_translator/model.onnx"));
         config.text_encoder = translator ? Flux2TextEncoder::Qwen3_06BTranslator : Flux2TextEncoder::Qwen3_4B;
         config.weight_streaming_budget = "-1";
         if (!glfwInit())

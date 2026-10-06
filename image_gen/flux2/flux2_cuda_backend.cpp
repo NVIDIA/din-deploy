@@ -478,8 +478,8 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
                    ExecutionProviderMode provider_mode, SamplingBackend sampling_backend)
 {
     const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision, config.text_encoder);
-    const auto latent_stats = LoadFlux2LatentStats(
-        model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
+    const auto latent_stats =
+        LoadFlux2LatentStats(model_paths.vae_decoder_model.parent_path() / "latent_stats.json", LATENT_CHANNELS);
     const Flux2ModelCachePaths cache_paths =
         MakeFlux2ModelCachePaths(config.precision, "", config.text_encoder, !config.weight_streaming_budget.empty());
     const bool trt_rtx_device = is_trt_rtx_device(ep_device);

@@ -14,10 +14,10 @@ class Flux2Telemetry
 public:
     Flux2Telemetry(int steps, Flux2Progress progress, std::function<void()> synchronize)
         : steps_(steps)
-          , progress_(std::move(progress))
-          , synchronize_(std::move(synchronize))
-          , start_(Clock::now())
-          , stage_start_(start_)
+        , progress_(std::move(progress))
+        , synchronize_(std::move(synchronize))
+        , start_(Clock::now())
+        , stage_start_(start_)
     {
         Report("rng", 0);
     }
