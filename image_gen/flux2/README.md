@@ -23,8 +23,8 @@ available.
 Run from the repository root:
 
 ```powershell
-python ./model_export/export_flux2.py --model_name black-forest-labs/FLUX.2-klein-4b --output models/flux_full --model all --transformer-precision bf16
-python ./model_export/quantize_onnx.py --input models/flux_full/transformer_bf16 --quant fp8 --output models/flux_full/transformer_fp8
+python image_gen/flux2/model_export/export_flux2.py --model_name black-forest-labs/FLUX.2-klein-4b --output models/flux_full --model all --transformer-precision bf16
+python image_gen/flux2/model_export/quantize_onnx.py --input models/flux_full/transformer_bf16 --quant fp8 --output models/flux_full/transformer_fp8
 ```
 
 Use `--quant nvfp4` with an output directory of `transformer_nvfp4` for NVFP4.
@@ -64,7 +64,7 @@ Use `-DDIN_BUILD_FLUX2_UI=OFF` for headless builds.
 For pure CLI you can use:
 
 ```powershell
-out/build/windows-x64/bin/Debug/din_flux2_cli.exe --model-dir models/flux_full --precision fp8 --provider trt-rtx --processing cuda --prompt "a red fox" --output out
+out/build/windows-x64/bin/Release/din_flux2_cli.exe --model-dir models/flux_full --precision fp8 --provider trt-rtx --processing cuda --prompt "a red fox" --output out
 ```
 
 Use `--help` for available processing backends and options, including `--encoder`,
