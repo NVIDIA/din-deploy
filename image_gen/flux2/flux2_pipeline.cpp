@@ -8,7 +8,6 @@
 
 namespace
 {
-
 Flux2RuntimeContext& GetProcessRuntime(Flux2ExecutionProvider provider)
 {
     static Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "Flux2"};
@@ -25,7 +24,6 @@ Flux2RuntimeContext& GetProcessRuntime(Flux2ExecutionProvider provider)
     }
     return runtime;
 }
-
 }  // namespace
 
 std::unique_ptr<Flux2ProcessingPipeline> CreateFlux2Pipeline(const Flux2Config& config)
@@ -46,7 +44,7 @@ std::unique_ptr<Flux2ProcessingPipeline> CreateFlux2Pipeline(const Flux2Config& 
 #endif
     }
 
-    if (config.processing == Flux2ProcessingBackend::Vk)
+    if (config.processing == Flux2ProcessingBackend::Vk || config.processing == Flux2ProcessingBackend::VkCig)
     {
 #if defined(DIN_FLUX2_BUILD_VK)
         return CreateFlux2VkPipeline(config, runtime);

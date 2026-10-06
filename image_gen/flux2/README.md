@@ -27,20 +27,19 @@ CiG is useful when inference must share the graphics GPU with rendering. It can 
 
 ## Export
 
-```bash
+```powershell
 cd model_export
-python export_flux2.py --model_name black-forest-labs/FLUX.2-klein-4b --output ./models/FLUX.2-klein-4B-onnx --model all
-python quantize_onnx.py --input ./models/FLUX.2-klein-4B-onnx/transformer --quant fp8 --output ./models/FLUX.2-klein-4B-fp8-onnx/transformer
-python quantize_onnx.py --input ./models/FLUX.2-klein-4B-onnx/transformer --quant nvfp4 --output ./models/FLUX.2-klein-4B-nvfp4-onnx/transformer
+python export_flux2.py --model_name black-forest-labs/FLUX.2-klein-4b --output D:\models\flux_full --model all --transformer-precision bf16
+python quantize_onnx.py --input D:\models\flux_full\transformer_bf16 --quant fp8 --output D:\models\flux_full\transformer_fp8
+python quantize_onnx.py --input D:\models\flux_full\transformer_bf16 --quant nvfp4 --output D:\models\flux_full\transformer_nvfp4
 ```
 
-Ensure to copy other required models to the quantized ONNX model directory. 
-An export contains `text_encoder/model.onnx`, `transformer/model.onnx`, `vae_decoder/model.onnx`, and `tokenizer/tokenizer.json`.
+All precisions share one root directory. The export contains `text_encoder/model.onnx`, `vae_decoder/model.onnx`, and `tokenizer/tokenizer.json` once, plus one transformer per precision: `transformer_bf16/model.onnx`, `transformer_fp8/model.onnx`, and `transformer_nvfp4/model.onnx`.
 
 ## Verify
 
-```bash
-python verify_flux2.py --model_name black-forest-labs/FLUX.2-klein-4b --onnx_dir ./models/FLUX.2-klein-4B-fp8-onnx --output_dir flux2-fp8 --provider trt-rtx
+```powershell
+python verify_flux2.py --model_name black-forest-labs/FLUX.2-klein-4b --onnx_dir D:\models\flux_full --precision fp8 --output_dir flux2-fp8 --provider trt-rtx
 ```
 
 ## Build
@@ -53,5 +52,7 @@ cmake --build --preset windows-x64-debug --target din_flux2_cli
 ## Run
 
 ```powershell
-out\build\windows-x64\bin\Debug\din_flux2_cli.exe --model-dir D:\models\FLUX.2-klein-4B-onnx --provider trt-rtx --processing cuda --prompt "a red fox" --output out
+out\build\windows-x64\bin\Debug\din_flux2_cli.exe --model-dir D:\models\flux_full --precision nvfp4 --provider trt-rtx --processing cuda --prompt "a red fox" --output out
 ```
+
+`--precision` selects `transformer_<precision>` and defaults to `bf16`. Only the transformer TensorRT RTX runtime-cache and EP-context paths are precision-qualified, so switching precisions never reuses an incompatible compiled transformer engine while the shared text encoder and VAE reuse their existing caches.

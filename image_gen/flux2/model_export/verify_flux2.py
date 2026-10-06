@@ -274,11 +274,15 @@ def _dummy_numpy(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     return np.random.default_rng(0).standard_normal(shape).astype(dtype)
 
 
-def validate_onnx_dir(onnx_dir: Path, provider: str, args) -> None:
+def transformer_model_path(onnx_dir: Path, precision: str) -> Path:
+    return onnx_dir / f"transformer_{precision}" / "model.onnx"
+
+
+def validate_onnx_dir(onnx_dir: Path, precision: str, provider: str, args) -> None:
     print(f"\n[Validate] {onnx_dir}")
     model_paths = [
         onnx_dir / "text_encoder" / "model.onnx",
-        onnx_dir / "transformer" / "model.onnx",
+        transformer_model_path(onnx_dir, precision),
         onnx_dir / "vae_encoder" / "model.onnx",
         onnx_dir / "vae_decoder" / "model.onnx",
     ]
@@ -368,7 +372,7 @@ def run_ort_pipeline(
         print(f"  [ORT] {te_path} not found - using PyTorch text encoder.")
 
     original_transformer = None
-    tr_path = onnx_dir / "transformer" / "model.onnx"
+    tr_path = transformer_model_path(onnx_dir, args.precision)
     if tr_path.exists():
         original_transformer = pipe.transformer
         original_config = original_transformer.config
@@ -440,6 +444,7 @@ def main():
     p.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME, help="Hugging Face model repo ID, or a local snapshot directory")
     p.add_argument("--local_files_only", action="store_true", help="Resolve --model_name from the local Hugging Face cache only")
     p.add_argument("--onnx_dir", type=str, default="./flux2_klein_onnx")
+    p.add_argument("--precision", choices=["bf16", "fp8", "nvfp4"], default="bf16", help="Transformer precision to verify from transformer_<precision>.")
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     p.add_argument("--seed", type=int, default=42)
@@ -459,7 +464,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.validate_only:
-        validate_onnx_dir(onnx_dir, args.provider, args)
+        validate_onnx_dir(onnx_dir, args.precision, args.provider, args)
         return
 
     io_dtype = IO_PRECISION_MAP[args.io_precision]

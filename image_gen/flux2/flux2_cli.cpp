@@ -19,7 +19,6 @@
 
 namespace
 {
-
 unsigned int parse_uint(const std::string& value, const char* flag_name)
 {
     size_t parsed_chars = 0;
@@ -45,6 +44,8 @@ std::string to_string(Flux2ProcessingBackend backend)
         return "dx-cig";
     case Flux2ProcessingBackend::Vk:
         return "vk";
+    case Flux2ProcessingBackend::VkCig:
+        return "vk-cig";
     }
     return "unknown";
 }
@@ -87,7 +88,11 @@ Flux2ProcessingBackend parse_processing_backend(std::string value)
     {
         return Flux2ProcessingBackend::Vk;
     }
-    throw std::invalid_argument("Processing must be one of: cpu, cuda, dx, dx-cig, vk");
+    if (value == "vk-cig")
+    {
+        return Flux2ProcessingBackend::VkCig;
+    }
+    throw std::invalid_argument("Processing must be one of: cpu, cuda, dx, dx-cig, vk, vk-cig");
 }
 
 Flux2ExecutionProvider parse_execution_provider(std::string value)
@@ -105,6 +110,19 @@ Flux2ExecutionProvider parse_execution_provider(std::string value)
         return Flux2ExecutionProvider::TrtRtx;
     }
     throw std::invalid_argument("Provider must be one of: cpu, trt-rtx");
+}
+
+std::string parse_precision(std::string value)
+{
+    for (char& c : value)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (value == "bf16" || value == "fp8" || value == "nvfp4")
+    {
+        return value;
+    }
+    throw std::invalid_argument("Precision must be one of: bf16, fp8, nvfp4");
 }
 
 void validate_config(const Flux2Config& config)
@@ -126,7 +144,7 @@ Flux2Config parse_args(int argc, char* argv[])
     parser.add_argument("--processing")
         .default_value(to_string(config.processing))
         .nargs(1)
-        .metavar("cpu|cuda|dx|dx-cig|vk")
+        .metavar("cpu|cuda|dx|dx-cig|vk|vk-cig")
         .help("Select the processing backend.");
     parser.add_argument("--provider")
         .default_value(to_string(config.provider))
@@ -137,7 +155,12 @@ Flux2Config parse_args(int argc, char* argv[])
         .default_value(config.model_dir.string())
         .nargs(1)
         .metavar("PATH")
-        .help("Directory with exported Flux2 ONNX artifacts.");
+        .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
+    parser.add_argument("--precision")
+        .default_value(config.precision)
+        .nargs(1)
+        .metavar("bf16|fp8|nvfp4")
+        .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
         .default_value(config.ep_cache_dir.string())
         .nargs(1)
@@ -178,6 +201,7 @@ Flux2Config parse_args(int argc, char* argv[])
     config.processing = parse_processing_backend(parser.get<std::string>("--processing"));
     config.provider = parse_execution_provider(parser.get<std::string>("--provider"));
     config.model_dir = parser.get<std::string>("--model-dir");
+    config.precision = parse_precision(parser.get<std::string>("--precision"));
     config.ep_cache_dir = parser.get<std::string>("--ep-cache");
     config.ep_context_dir = parser.get<std::string>("--ep-context-dir");
     config.prompt = parser.get<std::string>("--prompt");
@@ -212,7 +236,6 @@ void save_image(const std::filesystem::path& output_path, const Flux2Image& imag
     }
     std::cout << "Image saved to " << output_path.string() << std::endl;
 }
-
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -224,6 +247,7 @@ int main(int argc, char* argv[])
     {
         const Flux2Config config = parse_args(argc, argv);
         std::cout << "Model dir: " << config.model_dir.string() << "\n"
+                  << "Precision: " << config.precision << "\n"
                   << "Output: " << config.output_path.string() << "\n"
                   << "Prompt: " << config.prompt << "\n"
                   << "Seed:   " << config.seed << "\n"

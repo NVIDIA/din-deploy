@@ -355,8 +355,9 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
 
 struct DxPipelineState
 {
-    explicit DxPipelineState(Ort::Env& environment)
-        : env(environment)
+    DxPipelineState(Ort::Env& environment, uint64_t ort_luid)
+        : dx(ort_luid)
+        , env(environment)
     {
     }
 
@@ -448,7 +449,9 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     {
         throw std::runtime_error("DirectX processing requires --provider trt-rtx");
     }
-    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
+    const Flux2ModelCachePaths cache_paths =
+        MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "dx_cig" : "dx");
 
     std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
               << "CIG:    " << (state.use_cig ? "enabled" : "disabled") << "\n"
@@ -501,13 +504,13 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
 
     state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(state.use_cig ? "dx_cig_text_encoder" : "dx_text_encoder"), &*state.sync_stream);
+        make_profile(cache_paths.text_encoder), &*state.sync_stream);
     state.transformer_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(state.use_cig ? "dx_cig_transformer" : "dx_transformer"), &*state.sync_stream);
+        make_profile(cache_paths.transformer), &*state.sync_stream);
     state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
         state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(state.use_cig ? "dx_cig_vae_decoder" : "dx_vae_decoder"), &*state.sync_stream);
+        make_profile(cache_paths.vae_decoder), &*state.sync_stream);
 
     std::vector<int64_t> token_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
     std::vector<int64_t> attn_mask_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
@@ -697,7 +700,8 @@ public:
             return;
         }
         std::cout << "Initializing Flux2 DirectX pipeline" << std::endl;
-        state_ = std::make_unique<DxPipelineState>(runtime_.env);
+        const auto identity = din::common::ResolveOrtGraphicsDeviceIdentity(runtime_.trt_device);
+        state_ = std::make_unique<DxPipelineState>(runtime_.env, identity.luid);
         initialize_dx_state(*state_, config_, runtime_.trt_device);
     }
 
@@ -710,7 +714,7 @@ public:
         }
         state_->prompt_embeds_valid = false;
 
-        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir);
+        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir, config_.precision);
         const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config_.prompt);
         std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
         std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);

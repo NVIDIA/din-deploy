@@ -10,7 +10,6 @@
 
 namespace
 {
-
 constexpr unsigned int kThreadsPerBlock = 256;
 
 __global__ void flux_euler_kernel(float t_curr, float t_next, size_t total_elements, float* hidden_states,
@@ -66,7 +65,6 @@ dim3 grid_for(size_t total_elements)
     }
     return dim3(static_cast<unsigned int>(blocks), 1, 1);
 }
-
 }  // namespace
 
 void launch_flux_euler_kernel(cudaStream_t stream, float t_curr, float t_next, size_t total_elements,
