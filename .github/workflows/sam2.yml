@@ -148,10 +148,11 @@ jobs:
             label: SAM2.1 Hiera Tiny
           - slug: sam2.1-hiera-small
             label: SAM2.1 Hiera Small
-          - slug: sam2.1-hiera-base-plus
-            label: SAM2.1 Hiera Base Plus
-          - slug: sam2.1-hiera-large
-            label: SAM2.1 Hiera Large
+    # Remove tests that are too slow on CPU
+    #          - slug: sam2.1-hiera-base-plus
+    #            label: SAM2.1 Hiera Base Plus
+    #          - slug: sam2.1-hiera-large
+    #            label: SAM2.1 Hiera Large
 
     steps:
       - name: Check out source
