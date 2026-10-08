@@ -35,7 +35,7 @@ std::unique_ptr<PixelDiTProcessingPipeline> CreatePixelDiTPipeline(const PixelDi
     }
     PixelDiTRuntimeContext& runtime = GetProcessRuntime();
 
-    if (config.processing == PixelDiTProcessingBackend::Cpu)
+    if (config.processing == PixelDiTProcessingBackend::Cpu || config.processing == PixelDiTProcessingBackend::Cuda)
     {
         return CreatePixelDiTTrtPipeline(config, runtime);
     }

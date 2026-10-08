@@ -15,6 +15,7 @@ namespace din::image_gen
 enum class PixelDiTProcessingBackend
 {
     Cpu,
+    Cuda,
 };
 
 enum class PixelDiTExecutionProvider

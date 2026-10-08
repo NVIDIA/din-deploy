@@ -58,6 +58,8 @@ std::string to_string(PixelDiTProcessingBackend backend)
     {
     case PixelDiTProcessingBackend::Cpu:
         return "cpu";
+    case PixelDiTProcessingBackend::Cuda:
+        return "cuda";
     }
     return "unknown";
 }
@@ -79,11 +81,15 @@ PixelDiTProcessingBackend parse_processing_backend(const std::string& value)
     {
         return PixelDiTProcessingBackend::Cpu;
     }
-    if (lower == "cuda" || lower == "dx" || lower == "dx-cig" || lower == "vk")
+    if (lower == "cuda")
     {
-        throw std::invalid_argument("--processing " + lower + " is not implemented for PixelDiT yet; use cpu");
+        return PixelDiTProcessingBackend::Cuda;
     }
-    throw std::invalid_argument("Processing must be: cpu");
+    if (lower == "dx" || lower == "dx-cig" || lower == "vk")
+    {
+        throw std::invalid_argument("--processing " + lower + " is not implemented for PixelDiT yet; use cpu or cuda");
+    }
+    throw std::invalid_argument("Processing must be one of: cpu, cuda");
 }
 
 PixelDiTExecutionProvider parse_execution_provider(const std::string& value)
@@ -111,7 +117,7 @@ PixelDiTConfig parse_args(int argc, char* argv[])
     parser.add_argument("--processing")
         .default_value(to_string(config.processing))
         .nargs(1)
-        .metavar("cpu")
+        .metavar("cpu|cuda")
         .help("Select the processing backend.");
     parser.add_argument("--provider")
         .default_value(to_string(config.provider))

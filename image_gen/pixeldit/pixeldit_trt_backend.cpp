@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // PixelDiT pipeline on TensorRT RTX (GPU). The text encoder and DiT always run in TensorRT RTX; --processing selects
-// where the sampling math (CFG + flow DPM-Solver++ update) runs. "cpu": on the host. "cuda" (kernels on the same
-// buffers, like image_gen/flux2/flux2_cuda_backend.cpp) can be added here later.
+// where the sampling math (CFG + flow DPM-Solver++ update) runs. "cpu": on the host, with the velocity downloaded and
+// the sample uploaded around every DiT call. "cuda": kernels (cuda_kernels.cu) on the device buffers, all on the
+// TensorRT RTX compute stream, with one host sync per image (like image_gen/flux2/flux2_cuda_backend.cpp).
 
 #include <cuda_runtime.h>
 
@@ -22,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "cuda_kernels.h"
 #include "nvtx_helper.h"
 #include "ort_session.h"
 #include "pixeldit.h"
@@ -47,6 +49,7 @@ namespace
 enum class SamplingBackend
 {
     Cpu,
+    Cuda,
 };
 
 const char* to_string(SamplingBackend backend)
@@ -55,6 +58,8 @@ const char* to_string(SamplingBackend backend)
     {
     case SamplingBackend::Cpu:
         return "cpu";
+    case SamplingBackend::Cuda:
+        return "cuda";
     }
     return "unknown";
 }
@@ -66,6 +71,18 @@ template <typename T>
 size_t element_count(din::common::TensorBuffer<T>& buffer)
 {
     return buffer.BindingValue().GetTensorTypeAndShapeInfo().GetElementCount();
+}
+
+// Pointer to the bound tensor of a device-backed buffer: device memory, or pinned host memory on unified-memory GPUs.
+float* device_data(FloatBuffer& buffer)
+{
+    return buffer.BindingValue().GetTensorMutableData<float>();
+}
+
+// cudaMemcpyDefault so the copy also works when the bound tensors are pinned host memory (unified memory).
+void copy_device_async(float* dst, const float* src, size_t count, cudaStream_t stream)
+{
+    PIXELDIT_CUDA_CHECK(cudaMemcpyAsync(dst, src, count * sizeof(float), cudaMemcpyDefault, stream));
 }
 
 template <typename T>
@@ -147,19 +164,20 @@ public:
         }
     }
 
-    void Run(SamplingBackend backend, bool device_is_cuda, float t, float cfg_scale, FloatBuffer& x0)
+    // cpu: the velocity must already be on the host. cuda: everything stays on the device, ordered on `stream`.
+    void Run(cudaStream_t stream, SamplingBackend backend, float t, float cfg_scale, FloatBuffer& x0)
     {
         if (velocity_ == nullptr || sample_ == nullptr)
         {
             throw std::runtime_error("CfgDataPredictionStage bindings are incomplete");
         }
-        (void)backend;  // only SamplingBackend::Cpu exists so far
-        if (device_is_cuda)
-        {
-            auto velocity_ready = velocity_->CopyAsyncToHostWithNotification();
-            velocity_ready.Sync();
-        }
         const size_t n = element_count(*sample_);
+        if (backend == SamplingBackend::Cuda)
+        {
+            launch_pixeldit_cfg_x0_kernel(stream, device_data(*velocity_), device_data(*sample_), t, cfg_scale,
+                                          device_data(x0), n);
+            return;
+        }
         cfg_data_prediction(velocity_->HostData(), sample_->HostData(), t, cfg_scale, x0.HostData(), n);
     }
 
@@ -181,15 +199,35 @@ public:
         sample_ = &tensor;
     }
 
-    void Run(SamplingBackend backend, int order, FloatBuffer* model_prev_1, FloatBuffer& model_prev_0, float t_prev_1,
-             float t_prev_0, float t)
+    void Run(cudaStream_t stream, SamplingBackend backend, int order, FloatBuffer* model_prev_1,
+             FloatBuffer& model_prev_0, float t_prev_1, float t_prev_0, float t)
     {
         if (sample_ == nullptr)
         {
             throw std::runtime_error("DpmSolverStage bindings are incomplete");
         }
-        (void)backend;
         const size_t n = element_count(*sample_);
+        if (backend == SamplingBackend::Cuda)
+        {
+            if (order == 1 && t == 0.0f)
+            {
+                // Final step: the update is exactly x0 (see dpm_first_order_update).
+                copy_device_async(device_data(*sample_), device_data(model_prev_0), n, stream);
+            }
+            else if (order == 1)
+            {
+                const DpmFirstOrderCoeffs k = dpm_first_order_coeffs(t_prev_0, t);
+                launch_pixeldit_dpm1_kernel(stream, device_data(*sample_), device_data(model_prev_0), k.ratio, k.coeff,
+                                            n);
+            }
+            else
+            {
+                const DpmSecondOrderCoeffs k = dpm_second_order_coeffs(t_prev_1, t_prev_0, t);
+                launch_pixeldit_dpm2_kernel(stream, device_data(*sample_), device_data(*model_prev_1),
+                                            device_data(model_prev_0), k.ratio, k.coeff, k.half_coeff, k.inv_r0, n);
+            }
+            return;
+        }
         if (order == 1)
         {
             dpm_first_order_update(sample_->HostData(), model_prev_0.HostData(), t_prev_0, t, n);
@@ -213,7 +251,8 @@ struct SamplerSettings
     std::string negative_prompt;
 };
 
-// Per-image wall time of each sampling stage (host view; GPU work is inside `dit`).
+// Per-image wall time of each sampling stage with --processing cpu (host view; GPU work is inside `dit`). With
+// --processing cuda the host only enqueues work, so only the total sampling time is reported.
 struct StageTiming
 {
     std::chrono::duration<double> upload{};  // host packing + host->device copies
@@ -254,10 +293,15 @@ struct PipelineState
     std::unique_ptr<FloatBuffer> dit_timestep;
     std::unique_ptr<FloatBuffer> dit_encoder_hidden_states;
     std::unique_ptr<FloatBuffer> dit_velocity;
-    // Host-side sampling state: current sample and the two most recent x0 estimates.
+    // Sampling state: current sample and the two most recent x0 estimates. Host-only with --processing cpu,
+    // device-backed with --processing cuda.
     std::unique_ptr<FloatBuffer> sample;
     std::unique_ptr<FloatBuffer> model_a;
     std::unique_ptr<FloatBuffer> model_b;
+    // --processing cuda only: DiT timestep for every model evaluation, [steps, dit_batch], uploaded once per image
+    // and copied into dit_timestep on the device (rewriting the pinned dit_timestep mirror each step would race the
+    // still-queued copies of earlier steps).
+    std::unique_ptr<FloatBuffer> timestep_table;
 
     std::unique_ptr<Ort::IoBinding> text_encoder_io;
     std::unique_ptr<Ort::IoBinding> transformer_io;
@@ -379,9 +423,15 @@ void initialize_state(PipelineState& state, Ort::ConstEpDevice trt_device, const
     state.dit_timestep = std::make_unique<FloatBuffer>(dit_runner, timestep_shape, true);
     state.dit_encoder_hidden_states = std::make_unique<FloatBuffer>(dit_runner, dit_text_shape, true);
     state.dit_velocity = std::make_unique<FloatBuffer>(dit_runner, image_shape, true);
-    state.sample = std::make_unique<FloatBuffer>(dit_runner, sample_shape, false);
-    state.model_a = std::make_unique<FloatBuffer>(dit_runner, sample_shape, false);
-    state.model_b = std::make_unique<FloatBuffer>(dit_runner, sample_shape, false);
+    const bool sample_on_device = state.sampling_backend == SamplingBackend::Cuda;
+    state.sample = std::make_unique<FloatBuffer>(dit_runner, sample_shape, sample_on_device);
+    state.model_a = std::make_unique<FloatBuffer>(dit_runner, sample_shape, sample_on_device);
+    state.model_b = std::make_unique<FloatBuffer>(dit_runner, sample_shape, sample_on_device);
+    if (sample_on_device)
+    {
+        const std::vector<int64_t> table_shape = {state.sampler.steps, pc.dit_batch};
+        state.timestep_table = std::make_unique<FloatBuffer>(dit_runner, table_shape, true);
+    }
 
     state.text_encoder_io = std::make_unique<Ort::IoBinding>(te);
     state.text_encoder_io->BindInput("input_ids", state.input_ids->BindingValue());
@@ -458,9 +508,44 @@ void encode_prompts(PipelineState& state, const PixelDiTConfig& config)
     std::cout << "Text encoding (negative + positive): " << elapsed.count() << " s" << std::endl;
 }
 
-// One model evaluation: DiT on [sample, sample] at time t, then CFG -> x0 estimate.
-void data_prediction(PipelineState& state, float t, din::common::TensorBuffer<float>& x0)
+cudaStream_t compute_stream(PipelineState& state)
 {
+    return reinterpret_cast<cudaStream_t>(state.compute_stream->GetHandle());
+}
+
+// --processing cuda: one model evaluation, enqueued on the compute stream without any host sync.
+// `eval_index` selects the row of timestep_table (timestep t * timestep_scale).
+void data_prediction_cuda(PipelineState& state, float t, int eval_index, FloatBuffer& x0)
+{
+    const PixelDiTPipelineConfig& pc = state.pipeline_config;
+    const size_t n = element_count(*state.sample);
+    const cudaStream_t stream = compute_stream(state);
+    float* hidden = device_data(*state.dit_hidden_states);
+    copy_device_async(hidden, device_data(*state.sample), n, stream);
+    copy_device_async(hidden + n, device_data(*state.sample), n, stream);
+    const size_t batch = static_cast<size_t>(pc.dit_batch);
+    copy_device_async(device_data(*state.dit_timestep),
+                      device_data(*state.timestep_table) + static_cast<size_t>(eval_index) * batch, batch, stream);
+    {
+        din::common::nvtx_scoped_range nvtx("transformer");
+        Ort::RunOptions run_options = make_run_options(state);
+        state.transformer_runner->session.Run(run_options, *state.transformer_io);
+    }
+    {
+        din::common::nvtx_scoped_range nvtx("cfg_data_prediction");
+        state.cfg.Run(stream, SamplingBackend::Cuda, t, state.sampler.cfg_scale, x0);
+    }
+    ++state.timing.evaluations;
+}
+
+// One model evaluation: DiT on [sample, sample] at time t, then CFG -> x0 estimate.
+void data_prediction(PipelineState& state, float t, int eval_index, din::common::TensorBuffer<float>& x0)
+{
+    if (state.sampling_backend == SamplingBackend::Cuda)
+    {
+        data_prediction_cuda(state, t, eval_index, x0);
+        return;
+    }
     const PixelDiTPipelineConfig& pc = state.pipeline_config;
     const size_t n = element_count(*state.sample);
     const auto start = std::chrono::steady_clock::now();
@@ -487,7 +572,7 @@ void data_prediction(PipelineState& state, float t, din::common::TensorBuffer<fl
     {
         din::common::nvtx_scoped_range nvtx("cfg_data_prediction");
         // Velocity is already on the host.
-        state.cfg.Run(state.sampling_backend, false, t, state.sampler.cfg_scale, x0);
+        state.cfg.Run(compute_stream(state), SamplingBackend::Cpu, t, state.sampler.cfg_scale, x0);
     }
     const auto cfg_done = std::chrono::steady_clock::now();
     state.timing.upload += uploaded - start;
@@ -523,15 +608,31 @@ PixelDiTImage run_pipeline(PipelineState& state, const PixelDiTConfig& config, u
         write_raw(config.dump_dir / "timesteps.bin", timesteps.data(), timesteps.size());
     }
 
-    // FlowDPMSolver.sample (model_export/pixeldit/pipeline.py): 1st order first, 2nd order in the middle,
-    // 1st order last (lower_order_final), and no model evaluation after the final step.
+    const bool cuda = state.sampling_backend == SamplingBackend::Cuda;
     state.timing = {};
     const auto start = std::chrono::steady_clock::now();
+    if (cuda)
+    {
+        // Model evaluations happen at timesteps[0 .. steps-1].
+        float* table = state.timestep_table->HostData();
+        const size_t batch = static_cast<size_t>(pc.dit_batch);
+        for (size_t i = 0; i < static_cast<size_t>(steps); ++i)
+        {
+            std::fill_n(table + i * batch, batch, timesteps[i] * pc.timestep_scale);
+        }
+        auto sample_uploaded = state.sample->CopyAsyncToDeviceWithNotification();
+        auto table_uploaded = state.timestep_table->CopyAsyncToDeviceWithNotification();
+        sample_uploaded.Sync();
+        table_uploaded.Sync();
+    }
+
+    // FlowDPMSolver.sample (model_export/pixeldit/pipeline.py): 1st order first, 2nd order in the middle,
+    // 1st order last (lower_order_final), and no model evaluation after the final step.
     din::common::TensorBuffer<float>* prev = state.model_a.get();  // x0 at t_prev_1
     din::common::TensorBuffer<float>* curr = state.model_b.get();  // x0 at t_prev_0
     float t_prev_1 = 0.0f;
     float t_prev_0 = timesteps[0];
-    data_prediction(state, timesteps[0], *curr);
+    data_prediction(state, timesteps[0], 0, *curr);
     int history = 1;
     for (int step = 1; step <= steps; ++step)
     {
@@ -543,7 +644,8 @@ PixelDiTImage run_pipeline(PipelineState& state, const PixelDiTConfig& config, u
             throw std::logic_error("2nd-order update without two x0 estimates");
         }
         const auto solver_start = std::chrono::steady_clock::now();
-        state.solver.Run(state.sampling_backend, step_order, prev, *curr, t_prev_1, t_prev_0, t);
+        state.solver.Run(compute_stream(state), state.sampling_backend, step_order, prev, *curr, t_prev_1, t_prev_0,
+                         t);
         state.timing.solver += std::chrono::steady_clock::now() - solver_start;
         std::swap(prev, curr);
         t_prev_1 = t_prev_0;
@@ -551,20 +653,30 @@ PixelDiTImage run_pipeline(PipelineState& state, const PixelDiTConfig& config, u
         history = std::min(history + 1, 2);
         if (step < steps)
         {
-            data_prediction(state, t, *curr);
+            data_prediction(state, t, step, *curr);
         }
+        // With --processing cuda this reports enqueued steps; the GPU may still be behind.
         if (step % 10 == 0 || step == steps)
         {
             std::cout << "  step " << step << "/" << steps << std::endl;
         }
     }
+    if (cuda)
+    {
+        auto sample_ready = state.sample->CopyAsyncToHostWithNotification();
+        sample_ready.Sync();
+    }
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
     std::cout << "Sampling: " << elapsed.count() << " s (" << elapsed.count() / steps * 1000.0 << " ms/step)"
               << std::endl;
-    const double evals = std::max(state.timing.evaluations, 1);
-    std::cout << "  per DiT evaluation: upload " << state.timing.upload.count() / evals * 1000.0 << " ms, DiT + download "
-              << state.timing.dit.count() / evals * 1000.0 << " ms, CFG " << state.timing.cfg.count() / evals * 1000.0
-              << " ms; solver " << state.timing.solver.count() / steps * 1000.0 << " ms/step" << std::endl;
+    if (!cuda)
+    {
+        const double evals = std::max(state.timing.evaluations, 1);
+        std::cout << "  per DiT evaluation: upload " << state.timing.upload.count() / evals * 1000.0
+                  << " ms, DiT + download " << state.timing.dit.count() / evals * 1000.0 << " ms, CFG "
+                  << state.timing.cfg.count() / evals * 1000.0 << " ms; solver "
+                  << state.timing.solver.count() / steps * 1000.0 << " ms/step" << std::endl;
+    }
 
     if (dump)
     {
@@ -601,6 +713,8 @@ public:
             std::filesystem::create_directories(config_.dump_dir);
         }
         auto state = std::make_unique<PipelineState>(runtime_.env);
+        state->sampling_backend =
+            config_.processing == PixelDiTProcessingBackend::Cuda ? SamplingBackend::Cuda : SamplingBackend::Cpu;
         std::cout << "Sampling backend: " << to_string(state->sampling_backend) << std::endl;
         initialize_state(*state, runtime_.trt_device, config_);
         state->prompt = config_.prompt;

@@ -216,15 +216,18 @@ if(DIN_BUILD_TESTING)
         )
     endif ()
 
-    add_din_cli_test(din_pixeldit_bf16_trt-rtx_cpu din_pixeldit_cli
-            --model-dir "${DIN_DEPLOY_ARTIFACTS_ROOT}/PixelDiT-1300M-1024px-onnx"
-            --provider trt-rtx
-            --processing cpu
-            --ep-cache "${DIN_CLI_TEST_EP_CACHE_DIR}"
-            --ep-context-dir "${DIN_CLI_TEST_EP_CONTEXT_DIR}"
-            --num-images 2
-            --output "${PROJECT_SOURCE_DIR}/din_pixeldit_bf16_trt-rtx_cpu"
-    )
+    foreach (_din_pixeldit_processing cpu cuda)
+        add_din_cli_test(din_pixeldit_bf16_trt-rtx_${_din_pixeldit_processing} din_pixeldit_cli
+                --model-dir "${DIN_DEPLOY_ARTIFACTS_ROOT}/PixelDiT-1300M-1024px-onnx"
+                --provider trt-rtx
+                --processing ${_din_pixeldit_processing}
+                --ep-cache "${DIN_CLI_TEST_EP_CACHE_DIR}"
+                --ep-context-dir "${DIN_CLI_TEST_EP_CONTEXT_DIR}"
+                --num-images 2
+                --output "${PROJECT_SOURCE_DIR}/din_pixeldit_bf16_trt-rtx_${_din_pixeldit_processing}"
+        )
+    endforeach ()
+    unset(_din_pixeldit_processing)
 
     unset(_din_cli_test_audio)
 endif()

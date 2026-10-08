@@ -18,7 +18,7 @@ PixelDiT generates pixels directly, so there is no VAE. The model code is vendor
 | Tokenize | Host | Gemma tokenizer. The positive prompt is prefixed with a fixed instruction prompt and padded to 506 tokens; the negative prompt is padded to 506 too. |
 | Text encoder | `text_encoder/model.onnx` | Gemma-2 decoder, then `select_index` picks the 300 rows the DiT uses. |
 | DiT | `transformer/model.onnx` | Batch of 2: negative and positive prompt for classifier-free guidance. Returns velocity. |
-| Sampling | Host | CFG and flow DPM-Solver++ (2nd order), 50 steps, CFG scale 2.75, flow shift 4.0 by default. |
+| Sampling | Host or CUDA (`--processing`) | CFG and flow DPM-Solver++ (2nd order), 50 steps, CFG scale 2.75, flow shift 4.0 by default. |
 
 Sampling defaults and the token layout are written to `pipeline_config.json`. The C++ runtime reads it at startup and falls back to built-in defaults (matching the 1024x1024 export) for missing fields.
 
@@ -27,8 +27,11 @@ Sampling defaults and the token layout are written to `pipeline_config.json`. Th
 | Mode | CLI | Inference and sampling |
 | --- | --- | --- |
 | Direct TensorRT RTX | `--provider trt-rtx --processing cpu` | TensorRT RTX inference with CPU sampling. |
+| TensorRT RTX with CUDA sampling | `--provider trt-rtx --processing cuda` | TensorRT RTX inference with CUDA sampling. |
 
-CUDA, DirectX, and Vulkan processing are not implemented yet. `--provider cpu` is not supported.
+CUDA sampling keeps the sample on the GPU, so the DiT calls run back to back with one host sync per image (about 48 ms instead of 54 ms per step at 1024x1024 on an RTX PRO 6000). Both modes produce identical images for the same seed.
+
+DirectX and Vulkan processing are not implemented yet. `--provider cpu` is not supported.
 
 ## Export
 
@@ -61,7 +64,7 @@ cmake --build --preset windows-x64-release --target din_pixeldit_cli
 ## Run
 
 ```powershell
-out\build\windows-x64\bin\Release\din_pixeldit_cli.exe --model-dir D:\models\PixelDiT-1300M-1024px-onnx --provider trt-rtx --processing cpu --prompt "a red fox" --output out
+out\build\windows-x64\bin\Release\din_pixeldit_cli.exe --model-dir D:\models\PixelDiT-1300M-1024px-onnx --provider trt-rtx --processing cuda --prompt "a red fox" --output out
 ```
 
 Optional: `--negative-prompt`, `--seed`, `--num-images`, `--steps`, `--cfg-scale`, `--flow-shift` (defaults come from `pipeline_config.json`). The C++ noise generator differs from PyTorch's, so the same seed gives a different image than the Python scripts.

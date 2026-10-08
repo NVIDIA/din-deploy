@@ -282,35 +282,37 @@ inline void cfg_data_prediction(const float* velocity, const float* x, float t, 
                 });
 }
 
-// DPM-Solver-1 (dpmsolver++) from s to t: x_t = (t / s) * x - (alpha_t * phi_1) * x0_s, phi_1 = expm1(-h).
-// At t == 0 (sigma_t = 0, alpha_t = 1, expm1(-inf) = -1) the update is exactly x0_s.
-inline void dpm_first_order_update(float* x, const float* model_s, float s, float t, size_t n)
+// Per-step scalars of the solver updates, computed on the host for both the CPU loops below and the CUDA kernels
+// (cuda_kernels.cu), so log/exp never run on the device and both paths see the same coefficients.
+struct DpmFirstOrderCoeffs
 {
-    if (t == 0.0f)
-    {
-        std::copy_n(model_s, n, x);
-        return;
-    }
+    float ratio = 0.0f;
+    float coeff = 0.0f;
+};
+
+struct DpmSecondOrderCoeffs
+{
+    float ratio = 0.0f;
+    float coeff = 0.0f;
+    float half_coeff = 0.0f;
+    float inv_r0 = 0.0f;
+};
+
+// DPM-Solver-1 (dpmsolver++) from s to t: x_t = (t / s) * x - (alpha_t * phi_1) * x0_s, phi_1 = expm1(-h).
+// Only for t > 0; at t == 0 the update is exactly x0_s (see dpm_first_order_update).
+inline DpmFirstOrderCoeffs dpm_first_order_coeffs(float s, float t)
+{
     const float h = flow_lambda(t) - flow_lambda(s);
     const float alpha_t = std::exp(flow_log_alpha(t));
     const float phi_1 = std::expm1(-h);
-    const float ratio = t / s;
-    const float coeff = alpha_t * phi_1;
-    ParallelFor(n,
-                [=](size_t begin, size_t end)
-                {
-                    for (size_t i = begin; i < end; ++i)
-                    {
-                        const float a = ratio * x[i];
-                        const float b = coeff * model_s[i];
-                        x[i] = a - b;
-                    }
-                });
+    DpmFirstOrderCoeffs coeffs;
+    coeffs.ratio = t / s;
+    coeffs.coeff = alpha_t * phi_1;
+    return coeffs;
 }
 
-// Multistep DPM-Solver-2 (dpmsolver++): uses x0 at t_prev_1 and t_prev_0.
-inline void dpm_second_order_update(float* x, const float* model_prev_1, const float* model_prev_0, float t_prev_1,
-                                    float t_prev_0, float t, size_t n)
+// Multistep DPM-Solver-2 (dpmsolver++) from t_prev_0 to t, using x0 at t_prev_1 and t_prev_0.
+inline DpmSecondOrderCoeffs dpm_second_order_coeffs(float t_prev_1, float t_prev_0, float t)
 {
     const float lambda_prev_1 = flow_lambda(t_prev_1);
     const float lambda_prev_0 = flow_lambda(t_prev_0);
@@ -319,21 +321,50 @@ inline void dpm_second_order_update(float* x, const float* model_prev_1, const f
     const float h_0 = lambda_prev_0 - lambda_prev_1;
     const float h = lambda_t - lambda_prev_0;
     const float r0 = h_0 / h;
-    const float inv_r0 = 1.0f / r0;
     const float phi_1 = std::expm1(-h);
-    const float ratio = t / t_prev_0;
-    const float coeff = alpha_t * phi_1;
-    const float half_coeff = 0.5f * coeff;
+    DpmSecondOrderCoeffs coeffs;
+    coeffs.inv_r0 = 1.0f / r0;
+    coeffs.ratio = t / t_prev_0;
+    coeffs.coeff = alpha_t * phi_1;
+    coeffs.half_coeff = 0.5f * coeffs.coeff;
+    return coeffs;
+}
+
+// At t == 0 (sigma_t = 0, alpha_t = 1, expm1(-inf) = -1) the update is exactly x0_s.
+inline void dpm_first_order_update(float* x, const float* model_s, float s, float t, size_t n)
+{
+    if (t == 0.0f)
+    {
+        std::copy_n(model_s, n, x);
+        return;
+    }
+    const DpmFirstOrderCoeffs k = dpm_first_order_coeffs(s, t);
+    ParallelFor(n,
+                [=](size_t begin, size_t end)
+                {
+                    for (size_t i = begin; i < end; ++i)
+                    {
+                        const float a = k.ratio * x[i];
+                        const float b = k.coeff * model_s[i];
+                        x[i] = a - b;
+                    }
+                });
+}
+
+inline void dpm_second_order_update(float* x, const float* model_prev_1, const float* model_prev_0, float t_prev_1,
+                                    float t_prev_0, float t, size_t n)
+{
+    const DpmSecondOrderCoeffs k = dpm_second_order_coeffs(t_prev_1, t_prev_0, t);
     ParallelFor(n,
                 [=](size_t begin, size_t end)
                 {
                     for (size_t i = begin; i < end; ++i)
                     {
                         const float delta = model_prev_0[i] - model_prev_1[i];
-                        const float d1 = inv_r0 * delta;
-                        const float a = ratio * x[i];
-                        const float b = coeff * model_prev_0[i];
-                        const float c = half_coeff * d1;
+                        const float d1 = k.inv_r0 * delta;
+                        const float a = k.ratio * x[i];
+                        const float b = k.coeff * model_prev_0[i];
+                        const float c = k.half_coeff * d1;
                         const float ab = a - b;
                         x[i] = ab - c;
                     }
