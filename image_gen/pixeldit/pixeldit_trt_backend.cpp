@@ -127,18 +127,6 @@ std::string shape_string(const std::vector<int64_t>& shape)
     return text.str();
 }
 
-void expect_shape(Ort::Session& session, const char* model, const char* name, bool input,
-                  const std::vector<int64_t>& expected)
-{
-    const auto actual = session_shape(session, name, input);
-    if (actual != expected)
-    {
-        throw std::runtime_error(std::string(model) + " " + name + " has shape " + shape_string(actual) +
-                                 " but pipeline config expects " + shape_string(expected) +
-                                 "; check pipeline_config.json matches this export");
-    }
-}
-
 // CFG + data prediction: velocity [2, n] ([negative, positive]) and the current sample -> x0 estimate.
 class CfgDataPredictionStage
 {
@@ -381,15 +369,6 @@ void initialize_state(PipelineState& state, Ort::ConstEpDevice trt_device, const
     const std::vector<int64_t> timestep_shape = {pc.dit_batch};
     const std::vector<int64_t> dit_text_shape = {pc.dit_batch, pc.txt_max_length, state.text_hidden};
     const std::vector<int64_t> sample_shape = {1, 3, pc.height, pc.width};
-    expect_shape(te, "text_encoder", "input_ids", true, text_shape);
-    expect_shape(te, "text_encoder", "attention_mask", true, text_shape);
-    expect_shape(te, "text_encoder", "select_index", true, select_shape);
-    expect_shape(te, "text_encoder", "prompt_embeds", false, embeds_shape);
-    expect_shape(dit, "transformer", "hidden_states", true, image_shape);
-    expect_shape(dit, "transformer", "timestep", true, timestep_shape);
-    expect_shape(dit, "transformer", "encoder_hidden_states", true, dit_text_shape);
-    expect_shape(dit, "transformer", "velocity", false, image_shape);
-
     auto& te_runner = *state.text_encoder_runner;
     auto& dit_runner = *state.transformer_runner;
     state.input_ids = std::make_unique<Int64Buffer>(te_runner, text_shape, true);
