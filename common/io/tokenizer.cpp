@@ -97,13 +97,85 @@ std::array<std::string, 256> BuildByteEncoder()
     return byte_to_code;
 }
 
+constexpr std::string_view kSentencePieceSpace = "\xE2\x96\x81";  // U+2581
+
+struct JsonNormalizerStep
+{
+    bool prepend = false;  // otherwise Replace
+    std::string pattern;
+    std::string content;
+};
+
 struct JsonTokenizerData
 {
     std::vector<std::string> id_to_token;
     std::unordered_map<std::string, int64_t> token_to_id;
     std::unordered_map<std::string, int32_t> bpe_ranks;
     std::vector<std::string> special_tokens;
+    std::vector<std::string> added_tokens;
+    std::vector<JsonNormalizerStep> normalizer;
+    bool byte_fallback = false;
+    std::string unk_token;
+    std::vector<std::string> prefix_special_tokens;
+    std::vector<std::string> suffix_special_tokens;
 };
+
+// Collects Prepend / Replace(String) steps from a normalizer (or a Sequence of them). Other
+// normalizer types are not supported by the SentencePiece encode path and are reported to the caller.
+bool CollectNormalizerSteps(const nlohmann::json& normalizer, std::vector<JsonNormalizerStep>& steps)
+{
+    if (normalizer.is_null())
+    {
+        return true;
+    }
+    const auto type = normalizer.value("type", std::string{});
+    if (type == "Sequence")
+    {
+        for (const auto& step : normalizer["normalizers"])
+        {
+            if (!CollectNormalizerSteps(step, steps))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (type == "Prepend")
+    {
+        steps.push_back({true, {}, normalizer["prepend"].get<std::string>()});
+        return true;
+    }
+    if (type == "Replace" && normalizer.contains("pattern") && normalizer["pattern"].contains("String"))
+    {
+        steps.push_back({false, normalizer["pattern"]["String"].get<std::string>(),
+                         normalizer["content"].get<std::string>()});
+        return true;
+    }
+    return false;
+}
+
+// TemplateProcessing "single": special tokens before and after the "A" sequence.
+void CollectTemplateSpecialTokens(const nlohmann::json& post_processor, std::vector<std::string>& prefix,
+                                  std::vector<std::string>& suffix)
+{
+    if (post_processor.is_null() || post_processor.value("type", std::string{}) != "TemplateProcessing" ||
+        !post_processor.contains("single"))
+    {
+        return;
+    }
+    bool after_sequence = false;
+    for (const auto& piece : post_processor["single"])
+    {
+        if (piece.contains("Sequence"))
+        {
+            after_sequence = true;
+        }
+        else if (piece.contains("SpecialToken"))
+        {
+            (after_sequence ? suffix : prefix).push_back(piece["SpecialToken"]["id"].get<std::string>());
+        }
+    }
+}
 
 void AddToken(JsonTokenizerData& data, const std::string& token, int64_t id)
 {
@@ -150,11 +222,33 @@ JsonTokenizerData LoadJsonTokenizerData(const std::string& path)
             }
             const auto content = token["content"].get<std::string>();
             AddToken(tokenizer_data, content, token["id"].get<int64_t>());
+            tokenizer_data.added_tokens.push_back(content);
             if (token.value("special", false))
             {
                 tokenizer_data.special_tokens.push_back(content);
             }
         }
+    }
+
+    const auto& model = data["model"];
+    tokenizer_data.byte_fallback = model.value("byte_fallback", false);
+    if (model.contains("unk_token") && model["unk_token"].is_string())
+    {
+        tokenizer_data.unk_token = model["unk_token"].get<std::string>();
+    }
+    if (data.contains("normalizer") && !CollectNormalizerSteps(data["normalizer"], tokenizer_data.normalizer))
+    {
+        if (tokenizer_data.byte_fallback)
+        {
+            throw std::runtime_error("tokenizer.json uses a normalizer that is not supported for SentencePiece BPE: " +
+                                     data["normalizer"].dump());
+        }
+        tokenizer_data.normalizer.clear();
+    }
+    if (data.contains("post_processor"))
+    {
+        CollectTemplateSpecialTokens(data["post_processor"], tokenizer_data.prefix_special_tokens,
+                                     tokenizer_data.suffix_special_tokens);
     }
 
     if (data["model"].contains("merges"))
@@ -189,12 +283,26 @@ JsonTokenizerData LoadJsonTokenizerData(const std::string& path)
         }
     }
 
-    std::sort(tokenizer_data.special_tokens.begin(), tokenizer_data.special_tokens.end(),
-              [](const auto& left, const auto& right)
-              {
-                  return left.size() > right.size();
-              });
+    const auto longest_first = [](const auto& left, const auto& right)
+    {
+        return left.size() > right.size();
+    };
+    std::sort(tokenizer_data.special_tokens.begin(), tokenizer_data.special_tokens.end(), longest_first);
+    std::stable_sort(tokenizer_data.added_tokens.begin(), tokenizer_data.added_tokens.end(), longest_first);
     return tokenizer_data;
+}
+
+bool IsSentencePieceBpe(const JsonTokenizerData& data)
+{
+    if (!data.byte_fallback)
+    {
+        return false;
+    }
+    return std::any_of(data.normalizer.begin(), data.normalizer.end(),
+                       [](const JsonNormalizerStep& step)
+                       {
+                           return !step.prepend && step.pattern == " " && step.content == kSentencePieceSpace;
+                       });
 }
 
 std::vector<std::string> LoadFlatVocab(const std::string& path)
@@ -349,12 +457,33 @@ Tokenizer::Tokenizer(const std::string& path, TokenizerFormat format)
     case TokenizerFormat::Json:
     {
         auto tokenizer_data = LoadJsonTokenizerData(path);
+        const bool sentencepiece_bpe = IsSentencePieceBpe(tokenizer_data);
         id_to_token_ = std::move(tokenizer_data.id_to_token);
         token_to_id_ = std::move(tokenizer_data.token_to_id);
         bpe_ranks_ = std::move(tokenizer_data.bpe_ranks);
         special_tokens_ = std::move(tokenizer_data.special_tokens);
         byte_encoder_ = BuildByteEncoder();
         decode_mode_ = DecodeMode::Pieces;
+        if (sentencepiece_bpe)
+        {
+            encode_mode_ = EncodeMode::SentencePieceBpe;
+            added_tokens_ = std::move(tokenizer_data.added_tokens);
+            for (const auto& step : tokenizer_data.normalizer)
+            {
+                normalizer_.push_back({step.prepend ? NormalizerStep::Kind::Prepend : NormalizerStep::Kind::Replace,
+                                       step.pattern, step.content});
+            }
+            byte_fallback_ = tokenizer_data.byte_fallback;
+            unk_id_ = TokenId(tokenizer_data.unk_token);
+            for (const auto& token : tokenizer_data.prefix_special_tokens)
+            {
+                prefix_special_ids_.push_back(token_to_id_.at(token));
+            }
+            for (const auto& token : tokenizer_data.suffix_special_tokens)
+            {
+                suffix_special_ids_.push_back(token_to_id_.at(token));
+            }
+        }
         break;
     }
     case TokenizerFormat::Vocab:
@@ -581,7 +710,169 @@ std::vector<std::string> ApplyByteLevelBpe(std::string_view piece, const std::ar
     return tokens;
 }
 
+std::string ReplaceAll(std::string text, std::string_view pattern, std::string_view content)
+{
+    if (pattern.empty())
+    {
+        return text;
+    }
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (true)
+    {
+        const size_t found = text.find(pattern, pos);
+        if (found == std::string::npos)
+        {
+            out.append(text, pos, std::string::npos);
+            return out;
+        }
+        out.append(text, pos, found - pos);
+        out.append(content);
+        pos = found + pattern.size();
+    }
+}
+
+size_t Utf8CharLength(uint8_t lead)
+{
+    if (lead < 0x80)
+        return 1;
+    if ((lead & 0xE0) == 0xC0)
+        return 2;
+    if ((lead & 0xF0) == 0xE0)
+        return 3;
+    if ((lead & 0xF8) == 0xF0)
+        return 4;
+    return 1;  // invalid lead byte: treat as a single byte
+}
+
+std::string ByteFallbackToken(uint8_t byte)
+{
+    constexpr char hex[] = "0123456789ABCDEF";
+    return std::string{"<0x"} + hex[byte >> 4] + hex[byte & 0x0F] + ">";
+}
+
+// BPE over UTF-8 characters, as HF tokenizers' BPE model: characters missing from the vocab become
+// <0xXX> byte tokens (byte_fallback), then the lowest-rank pair is merged, leftmost first.
+std::vector<std::string> ApplySentencePieceBpe(std::string_view piece,
+                                               const std::unordered_map<std::string, int64_t>& token_to_id,
+                                               const std::unordered_map<std::string, int32_t>& bpe_ranks,
+                                               bool byte_fallback, const std::string& unk_token)
+{
+    std::vector<std::string> symbols;
+    symbols.reserve(piece.size());
+    for (size_t pos = 0; pos < piece.size();)
+    {
+        const size_t length = std::min(Utf8CharLength(static_cast<uint8_t>(piece[pos])), piece.size() - pos);
+        std::string character(piece.substr(pos, length));
+        pos += length;
+        if (token_to_id.count(character) != 0)
+        {
+            symbols.push_back(std::move(character));
+        }
+        else if (byte_fallback)
+        {
+            for (const char byte : character)
+            {
+                symbols.push_back(ByteFallbackToken(static_cast<uint8_t>(byte)));
+            }
+        }
+        else
+        {
+            symbols.push_back(unk_token);
+        }
+    }
+
+    while (symbols.size() > 1)
+    {
+        auto best_rank = std::numeric_limits<int32_t>::max();
+        size_t best_index = symbols.size();
+        for (size_t i = 0; i + 1 < symbols.size(); ++i)
+        {
+            const auto rank = bpe_ranks.find(BpePairKey(symbols[i], symbols[i + 1]));
+            if (rank != bpe_ranks.end() && rank->second < best_rank)
+            {
+                best_rank = rank->second;
+                best_index = i;
+            }
+        }
+        if (best_index == symbols.size())
+        {
+            break;
+        }
+        symbols[best_index] += symbols[best_index + 1];
+        symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_index + 1));
+    }
+    return symbols;
+}
+
 }  // namespace
+
+std::vector<int64_t> Tokenizer::EncodeSentencePieceBpe(const std::string& text, bool add_special_tokens) const
+{
+    std::vector<int64_t> ids;
+    if (add_special_tokens)
+    {
+        ids.insert(ids.end(), prefix_special_ids_.begin(), prefix_special_ids_.end());
+    }
+
+    const std::string& unk_token = Token(unk_id_);
+    const auto encode_segment = [&](std::string_view segment)
+    {
+        if (segment.empty())
+        {
+            return;
+        }
+        std::string normalized(segment);
+        for (const auto& step : normalizer_)
+        {
+            normalized = step.kind == NormalizerStep::Kind::Prepend ? step.content + normalized
+                                                                    : ReplaceAll(std::move(normalized), step.pattern,
+                                                                                 step.content);
+        }
+        for (const auto& token : ApplySentencePieceBpe(normalized, token_to_id_, bpe_ranks_, byte_fallback_, unk_token))
+        {
+            const auto id = token_to_id_.find(token);
+            if (id == token_to_id_.end())
+            {
+                throw std::runtime_error("tokenizer vocab is missing BPE token: " + token);
+            }
+            ids.push_back(id->second);
+        }
+    };
+
+    // Added tokens (special or not) are matched on the raw text, leftmost-longest, before normalization.
+    size_t segment_start = 0;
+    size_t pos = 0;
+    while (pos < text.size())
+    {
+        const std::string* matched = nullptr;
+        for (const auto& added : added_tokens_)
+        {
+            if (StartsWith(std::string_view(text).substr(pos), added))
+            {
+                matched = &added;
+                break;
+            }
+        }
+        if (matched == nullptr)
+        {
+            ++pos;
+            continue;
+        }
+        encode_segment(std::string_view(text).substr(segment_start, pos - segment_start));
+        ids.push_back(token_to_id_.at(*matched));
+        pos += matched->size();
+        segment_start = pos;
+    }
+    encode_segment(std::string_view(text).substr(segment_start));
+
+    if (add_special_tokens)
+    {
+        ids.insert(ids.end(), suffix_special_ids_.begin(), suffix_special_ids_.end());
+    }
+    return ids;
+}
 
 int64_t Tokenizer::TokenId(const std::string& token) const
 {
@@ -595,6 +886,10 @@ int64_t Tokenizer::TokenId(const std::string& token) const
 
 std::vector<int64_t> Tokenizer::Encode(const std::string& text, bool add_special_tokens) const
 {
+    if (encode_mode_ == EncodeMode::SentencePieceBpe)
+    {
+        return EncodeSentencePieceBpe(text, add_special_tokens);
+    }
     if (bpe_ranks_.empty())
     {
         throw std::runtime_error("Tokenizer encoding is only available for byte-level BPE tokenizer.json format");
