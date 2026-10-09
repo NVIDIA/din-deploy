@@ -29,7 +29,7 @@ Sampling defaults and the token layout are written to `pipeline_config.json`. Th
 | Direct TensorRT RTX | `--provider trt-rtx --processing cpu` | TensorRT RTX inference with CPU sampling. |
 | TensorRT RTX with CUDA sampling | `--provider trt-rtx --processing cuda` | TensorRT RTX inference with CUDA sampling. |
 
-CUDA sampling keeps the sample on the GPU, so the DiT calls run back to back with one host sync per image (about 48 ms instead of 54 ms per step at 1024x1024 on an RTX PRO 6000). Both modes produce identical images for the same seed.
+CUDA sampling keeps the sample on the GPU, so the DiT calls run back to back with one host sync per image. Both modes produce identical images for the same seed.
 
 DirectX and Vulkan processing are not implemented yet. `--provider cpu` is not supported.
 
