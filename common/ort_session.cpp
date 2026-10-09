@@ -399,51 +399,43 @@ bool IsCudaUnifiedMemoryDevice(Ort::ConstEpDevice ep_device)
 
 bool RegisterTensorRTRTXExecutionProvider(Ort::Env& env)
 {
-    static std::once_flag registration_once;
-    static Ort::Env* registered_env = nullptr;
-    std::call_once(registration_once,
-                   [&env]
-                   {
-                       auto provider_library = std::filesystem::path{ONNXRUNTIME_TRT_RTX_EP_LIBRARY_PATH};
-                       if (!std::filesystem::is_regular_file(provider_library))
-                       {
-#ifdef _WIN32
-                           provider_library = ExecutableDirectory() / "onnxruntime_providers_nv_tensorrt_rtx.dll";
-#else
-                           provider_library = ExecutableDirectory() / "libonnxruntime_providers_nv_tensorrt_rtx.so";
-#endif
-                           if (!std::filesystem::is_regular_file(provider_library))
-                           {
-                               throw std::runtime_error("TensorRT RTX execution provider library not found: " +
-                                                        provider_library.string());
-                           }
-                       }
-
-#ifdef _WIN32
-                       const auto provider_directory = provider_library.parent_path().wstring();
-                       if (SetDllDirectoryW(provider_directory.c_str()) == 0)
-                       {
-                           throw std::runtime_error("Failed to add TensorRT RTX EP directory to the DLL search path.");
-                       }
-#endif
-
-                       const auto provider_library_path = ToOrtPathString(provider_library);
-                       env.RegisterExecutionProviderLibrary(kDinNvTensorRTRTXExecutionProvider,
-                                                            provider_library_path.c_str());
-
-                       const auto ep_devices = env.GetEpDevices();
-                       std::cout << "Execution provider devices after TRT RTX registration:\n";
-                       for (const auto& device : ep_devices)
-                       {
-                           std::cout << "  " << device.EpName() << " vendor=" << device.EpVendor()
-                                     << " device_id=" << device.Device().DeviceId() << '\n';
-                       }
-                       registered_env = &env;
-                   });
-
-    if (registered_env != &env)
+    static std::mutex registration_mutex;
+    const std::lock_guard lock(registration_mutex);
+    // Check the native environment, not the address of its C++ wrapper.
+    for (const auto& device : env.GetEpDevices())
+        if (std::string_view{device.EpName()} == kDinNvTensorRTRTXExecutionProvider)
+            return true;
+    auto provider_library = std::filesystem::path{ONNXRUNTIME_TRT_RTX_EP_LIBRARY_PATH};
+    if (!std::filesystem::is_regular_file(provider_library))
     {
-        throw std::logic_error("TensorRT RTX was already registered on a different Ort::Env in this process.");
+#ifdef _WIN32
+        provider_library = ExecutableDirectory() / "onnxruntime_providers_nv_tensorrt_rtx.dll";
+#else
+        provider_library = ExecutableDirectory() / "libonnxruntime_providers_nv_tensorrt_rtx.so";
+#endif
+        if (!std::filesystem::is_regular_file(provider_library))
+        {
+            throw std::runtime_error("TensorRT RTX execution provider library not found: " + provider_library.string());
+        }
+    }
+
+#ifdef _WIN32
+    const auto provider_directory = provider_library.parent_path().wstring();
+    if (SetDllDirectoryW(provider_directory.c_str()) == 0)
+    {
+        throw std::runtime_error("Failed to add TensorRT RTX EP directory to the DLL search path.");
+    }
+#endif
+
+    const auto provider_library_path = ToOrtPathString(provider_library);
+    env.RegisterExecutionProviderLibrary(kDinNvTensorRTRTXExecutionProvider, provider_library_path.c_str());
+
+    const auto ep_devices = env.GetEpDevices();
+    std::cerr << "Execution provider devices after TRT RTX registration:\n";
+    for (const auto& device : ep_devices)
+    {
+        std::cerr << "  " << device.EpName() << " vendor=" << device.EpVendor()
+                  << " device_id=" << device.Device().DeviceId() << '\n';
     }
     return true;
 }
@@ -564,7 +556,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     const auto output_model_path = CompiledModelPath(model_path, ep_context, profile);
     if (fs::exists(output_model_path))
     {
-        if (IsCompatibleEpContext(env, output_model_path))
+        if (fs::last_write_time(output_model_path) >= fs::last_write_time(model_path) &&
+            IsCompatibleEpContext(env, output_model_path))
         {
             return output_model_path;
         }
@@ -640,7 +633,7 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
     const auto ort_luid = luid_text != nullptr ? ParseUint64(*luid_text) : std::optional<uint64_t>{};
     if (luid_text != nullptr && !ort_luid.has_value())
     {
-        std::cout << "Ignoring unparsable ORT LUID metadata value: " << *luid_text << std::endl;
+        std::cerr << "Ignoring unparsable ORT LUID metadata value: " << *luid_text << std::endl;
     }
 #else
     const std::string* pci_bus_id_text = FindMetadataValue(metadata, "pci_bus_id");
@@ -648,7 +641,7 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
         pci_bus_id_text != nullptr ? ParsePciBusId(*pci_bus_id_text) : std::optional<PciBusId>{};
     if (pci_bus_id_text != nullptr && !ort_pci_bus_id.has_value())
     {
-        std::cout << "Ignoring unparsable ORT pci_bus_id metadata value: " << *pci_bus_id_text << std::endl;
+        std::cerr << "Ignoring unparsable ORT pci_bus_id metadata value: " << *pci_bus_id_text << std::endl;
     }
 #endif
 
@@ -700,24 +693,24 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
 
     if (metadata_matches.size() > 1)
     {
-        std::cout << "Multiple CUDA devices match ORT device metadata";
+        std::cerr << "Multiple CUDA devices match ORT device metadata";
     }
     else
     {
-        std::cout << "No CUDA device matches ORT device metadata";
+        std::cerr << "No CUDA device matches ORT device metadata";
     }
 #ifdef _WIN32
     if (luid_text != nullptr)
     {
-        std::cout << " LUID=" << *luid_text;
+        std::cerr << " LUID=" << *luid_text;
     }
 #else
     if (pci_bus_id_text != nullptr)
     {
-        std::cout << " pci_bus_id=" << *pci_bus_id_text;
+        std::cerr << " pci_bus_id=" << *pci_bus_id_text;
     }
 #endif
-    std::cout << " for ORT hardware device_id=" << ort_hardware_device_id << "; defaulting to CUDA ordinal 0. Set "
+    std::cerr << " for ORT hardware device_id=" << ort_hardware_device_id << "; defaulting to CUDA ordinal 0. Set "
               << (override_env_var != nullptr ? override_env_var : "FLUX_CUDA_DEVICE_ID") << " to override."
               << std::endl;
 

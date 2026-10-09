@@ -19,6 +19,8 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 | OpenAI Whisper | `openai/whisper-tiny`<br>`openai/whisper-base`<br>`openai/whisper-small`<br>`openai/whisper-medium`<br>`openai/whisper-large-v3`<br>`openai/whisper-large-v3-turbo` | [Whisper](asr/whisper/README.md) |
 | NVIDIA Parakeet TDT 0.6B v3 | `nvidia/parakeet-tdt-0.6b-v3` | [RNNT](asr/rnnt/README.md) |
 | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | `nvidia/nemotron-3.5-asr-streaming-0.6b` | [RNNT](asr/rnnt/README.md) |
+| Qwen3 ASR | `Qwen/Qwen3-ASR-0.6B-hf`<br>`Qwen/Qwen3-ASR-1.7B-hf` | [Qwen3](asr/qwen3/README.md) |
+| Qwen3 Forced Aligner | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | [Qwen3](asr/qwen3/README.md) |
 
 ### Computer Vision
 

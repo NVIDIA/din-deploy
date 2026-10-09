@@ -7,15 +7,19 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 
+#include "unicode_regex.h"
 #include <nlohmann/json.hpp>
+#include <utf8proc.h>
 
 namespace din::io
 {
@@ -103,6 +107,8 @@ struct JsonTokenizerData
     std::unordered_map<std::string, int64_t> token_to_id;
     std::unordered_map<std::string, int32_t> bpe_ranks;
     std::vector<std::string> special_tokens;
+    std::vector<std::string> added_tokens;
+    bool normalize_nfc = false;
 };
 
 void AddToken(JsonTokenizerData& data, const std::string& token, int64_t id)
@@ -133,6 +139,8 @@ JsonTokenizerData LoadJsonTokenizerData(const std::string& path)
     }
 
     JsonTokenizerData tokenizer_data;
+    tokenizer_data.normalize_nfc =
+        data.contains("normalizer") && data["normalizer"].is_object() && data["normalizer"].value("type", "") == "NFC";
 
     const auto& vocab = data["model"]["vocab"];
     for (const auto& [token, id_val] : vocab.items())
@@ -150,6 +158,7 @@ JsonTokenizerData LoadJsonTokenizerData(const std::string& path)
             }
             const auto content = token["content"].get<std::string>();
             AddToken(tokenizer_data, content, token["id"].get<int64_t>());
+            tokenizer_data.added_tokens.push_back(content);
             if (token.value("special", false))
             {
                 tokenizer_data.special_tokens.push_back(content);
@@ -190,6 +199,11 @@ JsonTokenizerData LoadJsonTokenizerData(const std::string& path)
     }
 
     std::sort(tokenizer_data.special_tokens.begin(), tokenizer_data.special_tokens.end(),
+              [](const auto& left, const auto& right)
+              {
+                  return left.size() > right.size();
+              });
+    std::sort(tokenizer_data.added_tokens.begin(), tokenizer_data.added_tokens.end(),
               [](const auto& left, const auto& right)
               {
                   return left.size() > right.size();
@@ -347,14 +361,17 @@ Tokenizer::Tokenizer(const std::string& path, TokenizerFormat format)
     switch (format)
     {
     case TokenizerFormat::Json:
+    case TokenizerFormat::ByteBpeJson:
     {
         auto tokenizer_data = LoadJsonTokenizerData(path);
         id_to_token_ = std::move(tokenizer_data.id_to_token);
         token_to_id_ = std::move(tokenizer_data.token_to_id);
         bpe_ranks_ = std::move(tokenizer_data.bpe_ranks);
         special_tokens_ = std::move(tokenizer_data.special_tokens);
+        added_tokens_ = std::move(tokenizer_data.added_tokens);
+        normalize_nfc_ = format == TokenizerFormat::ByteBpeJson && tokenizer_data.normalize_nfc;
         byte_encoder_ = BuildByteEncoder();
-        decode_mode_ = DecodeMode::Pieces;
+        decode_mode_ = format == TokenizerFormat::ByteBpeJson ? DecodeMode::ByteBpe : DecodeMode::Pieces;
         break;
     }
     case TokenizerFormat::Vocab:
@@ -434,8 +451,14 @@ bool IsContractionAt(std::string_view text, size_t pos, size_t* length)
     return false;
 }
 
-std::vector<std::string> SplitForByteLevelBpe(std::string_view text)
+std::vector<std::string> SplitForByteLevelBpe(std::string_view text, bool qwen = false)
 {
+    if (qwen)
+    {
+        static const UnicodeRegex pattern(
+            R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)");
+        return pattern.FindAll(text);
+    }
     std::vector<std::string> pieces;
     size_t pos = 0;
     while (pos < text.size())
@@ -593,7 +616,7 @@ int64_t Tokenizer::TokenId(const std::string& token) const
     return it->second;
 }
 
-std::vector<int64_t> Tokenizer::Encode(const std::string& text, bool add_special_tokens) const
+std::vector<int64_t> Tokenizer::Encode(const std::string& input, bool add_special_tokens) const
 {
     if (bpe_ranks_.empty())
     {
@@ -601,10 +624,23 @@ std::vector<int64_t> Tokenizer::Encode(const std::string& text, bool add_special
     }
     (void)add_special_tokens;
 
+    std::string normalized;
+    if (normalize_nfc_)
+    {
+        utf8proc_uint8_t* data = nullptr;
+        const auto length = utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(input.data()), input.size(), &data,
+                                         static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
+        const std::unique_ptr<utf8proc_uint8_t, decltype(&std::free)> owner(data, std::free);
+        if (length < 0)
+            throw std::invalid_argument(utf8proc_errmsg(length));
+        normalized.assign(reinterpret_cast<const char*>(data), static_cast<size_t>(length));
+    }
+    const auto& text = normalize_nfc_ ? normalized : input;
+
     std::vector<int64_t> ids;
     const auto encode_segment = [&](std::string_view segment)
     {
-        for (const auto& piece : SplitForByteLevelBpe(segment))
+        for (const auto& piece : SplitForByteLevelBpe(segment, decode_mode_ == DecodeMode::ByteBpe))
         {
             for (const auto& token : ApplyByteLevelBpe(piece, byte_encoder_, bpe_ranks_))
             {
@@ -623,7 +659,7 @@ std::vector<int64_t> Tokenizer::Encode(const std::string& text, bool add_special
     while (pos < text.size())
     {
         const std::string* matched_special = nullptr;
-        for (const auto& special : special_tokens_)
+        for (const auto& special : decode_mode_ == DecodeMode::ByteBpe ? added_tokens_ : special_tokens_)
         {
             if (StartsWith(std::string_view(text).substr(pos), special))
             {
@@ -667,6 +703,27 @@ std::string Tokenizer::CleanToken(int64_t id) const
 
 std::string Tokenizer::Decode(const std::vector<int64_t>& ids, bool skip_special_tokens, bool strip_lang_tags) const
 {
+    if (decode_mode_ == DecodeMode::ByteBpe)
+    {
+        static const auto byte_decoder = BuildByteDecoder();
+        std::string text;
+        for (auto id : ids)
+        {
+            const auto& token = Token(id);
+            if (skip_special_tokens &&
+                std::find(special_tokens_.begin(), special_tokens_.end(), token) != special_tokens_.end())
+                continue;
+            for (size_t i = 0; i < token.size();)
+            {
+                const auto code = NextCodePoint(token, i);
+                const auto byte = byte_decoder.find(code);
+                if (byte == byte_decoder.end())
+                    throw std::runtime_error("Invalid byte-level vocabulary entry");
+                text.push_back(static_cast<char>(byte->second));
+            }
+        }
+        return text;
+    }
     if (decode_mode_ == DecodeMode::WhisperByteBpe)
     {
         std::string text;
