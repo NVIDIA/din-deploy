@@ -26,9 +26,9 @@ import numpy as np
 import onnx
 import torch
 import torch.nn as nn
-from diffusers import Flux2KleinPipeline as FluxPipeline
 from huggingface_hub import snapshot_download
 from PIL import Image as PILImage
+from translator import add_translator_arguments, load_translator_encoder
 
 EP_NAME = "nv_tensorrt_rtx"
 _REGISTERED_EP_NAME: str | None = None
@@ -281,7 +281,7 @@ def transformer_model_path(onnx_dir: Path, precision: str) -> Path:
 def validate_onnx_dir(onnx_dir: Path, precision: str, provider: str, args) -> None:
     print(f"\n[Validate] {onnx_dir}")
     model_paths = [
-        onnx_dir / "text_encoder" / "model.onnx",
+        onnx_dir / ("text_encoder_translator" if args.encoder == "translator" else "text_encoder") / "model.onnx",
         transformer_model_path(onnx_dir, precision),
         onnx_dir / "vae_encoder" / "model.onnx",
         onnx_dir / "vae_decoder" / "model.onnx",
@@ -310,11 +310,13 @@ def validate_onnx_dir(onnx_dir: Path, precision: str, provider: str, args) -> No
         raise RuntimeError(f"No model.onnx files found under {onnx_dir}")
 
 
-def run_pytorch_pipeline(pipe, prompt: str, seed: int, image_size: int, num_steps: int) -> PILImage.Image:
+def run_pytorch_pipeline(pipe, prompt: str, seed: int, image_size: int, num_steps: int,
+                         prompt_embeds=None) -> PILImage.Image:
     print("\n[PyTorch] Running pipeline...")
     generator = torch.Generator(device="cuda").manual_seed(seed)
     result = pipe(
-        prompt=prompt,
+        prompt=prompt if prompt_embeds is None else None,
+        prompt_embeds=prompt_embeds,
         height=image_size,
         width=image_size,
         num_inference_steps=num_steps,
@@ -339,7 +341,7 @@ def run_ort_pipeline(
 
     prompt_embeds = None
     original_text_encoder = None
-    te_path = onnx_dir / "text_encoder" / "model.onnx"
+    te_path = onnx_dir / ("text_encoder_translator" if args.encoder == "translator" else "text_encoder") / "model.onnx"
     if te_path.exists():
         original_text_encoder = pipe.text_encoder
         original_text_dtype = original_text_encoder.dtype
@@ -439,12 +441,46 @@ def compare_images(ref: PILImage.Image, ort: PILImage.Image, output_dir: Path) -
     print(f"[Comparison] Side-by-side saved -> {cmp_path}")
 
 
+def verify_translator_encoder(onnx_dir, args):
+    from transformers import AutoTokenizer
+
+    if args.encoder != "translator":
+        raise ValueError("--encoder-only requires --encoder translator")
+    tokenizer = AutoTokenizer.from_pretrained(str(onnx_dir / "tokenizer"))
+    reference = load_translator_encoder(args, "cuda")
+    runner = OrtSessionRunner.from_path(onnx_dir / "text_encoder_translator/model.onnx", args.provider, args)
+    _assert_fp32_float_io(runner, onnx_dir / "text_encoder_translator/model.onnx")
+    if set(runner.input_names) != {"input_ids", "attention_mask"} or runner.output_names != ["prompt_embeds"]:
+        raise RuntimeError("Translator ONNX graph IO names do not match the C++ contract")
+    prompts = [args.prompt, "", "A café in Zürich, 日本の庭", "a detailed landscape " * 600]
+    for index, prompt in enumerate(prompts):
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=False)
+        expected_text = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        if text != expected_text:
+            raise RuntimeError("Tokenizer chat template differs from the C++ runtime")
+        tokens = tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to("cuda")
+        with torch.no_grad():
+            expected = reference(tokens["input_ids"], tokens["attention_mask"]).float().cpu().numpy()
+        actual = runner.run({key: _to_numpy(tokens[key], np.int64) for key in ("input_ids", "attention_mask")})[0]
+        if actual.shape != (1, 512, 7680) or actual.dtype != np.float32 or not np.isfinite(actual).all():
+            raise RuntimeError("Translator output must be finite fp32 [1,512,7680]")
+        cosine = float(np.mean(np.sum(expected * actual, axis=-1) / np.maximum(
+            np.linalg.norm(expected, axis=-1) * np.linalg.norm(actual, axis=-1), 1e-12)))
+        nrmse = float(np.sqrt(np.mean((expected - actual) ** 2)) / max(float(np.sqrt(np.mean(expected ** 2))), 1e-12))
+        print(f"[Translator prompt {index}] cosine={cosine:.6f}, NRMSE={nrmse:.6f}", flush=True)
+        if not np.isfinite(cosine + nrmse) or cosine < args.embedding_cosine_min or nrmse > args.embedding_nrmse_max:
+            raise RuntimeError("Translator embedding parity failed")
+
+
 def main():
     p = argparse.ArgumentParser(description="Verify FLUX.2-klein ONNX graphs with PyTorch and ONNX Runtime.")
     p.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME, help="Hugging Face model repo ID, or a local snapshot directory")
     p.add_argument("--local_files_only", action="store_true", help="Resolve --model_name from the local Hugging Face cache only")
     p.add_argument("--onnx_dir", type=str, default="./flux2_klein_onnx")
-    p.add_argument("--precision", choices=["bf16", "fp8", "nvfp4"], default="bf16", help="Transformer precision to verify from transformer_<precision>.")
+    p.add_argument("--precision", choices=["bf16", "fp16", "fp8", "nvfp4"], default="bf16",
+                   help="Transformer precision to verify from transformer_<precision>.")
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     p.add_argument("--seed", type=int, default=42)
@@ -456,6 +492,12 @@ def main():
     p.add_argument("--ep_dll_dir", default=None, help="Dir with the plugin EP's bundled runtime DLLs")
     p.add_argument("--trt_bin", default=None, help="TensorRT-RTX bin dir, used as a DLL search path")
     p.add_argument("--validate_only", action="store_true", help="Only run ONNX Runtime validation; do not generate images")
+    p.add_argument("--encoder", choices=["4b", "translator"], default="4b")
+    p.add_argument("--encoder-only", action="store_true",
+                   help="Compare fused translator PyTorch and ONNX embeddings without loading the diffusion pipeline")
+    p.add_argument("--embedding-cosine-min", type=float, default=0.99)
+    p.add_argument("--embedding-nrmse-max", type=float, default=0.10)
+    add_translator_arguments(p)
     args = p.parse_args()
     configure_stdio()
 
@@ -463,6 +505,12 @@ def main():
     output_dir = Path(args.output_dir).resolve() if args.output_dir else onnx_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.encoder_only:
+        verify_translator_encoder(onnx_dir, args)
+        return
+
+    if args.encoder == "translator" and not (onnx_dir / "text_encoder_translator/model.onnx").is_file():
+        raise FileNotFoundError("Selected translator ONNX is missing")
     if args.validate_only:
         validate_onnx_dir(onnx_dir, args.precision, args.provider, args)
         return
@@ -472,15 +520,55 @@ def main():
     device = "cuda"
 
     model_snapshot = resolve_model_snapshot(args.model_name, args.local_files_only)
+    from diffusers import Flux2KleinPipeline as FluxPipeline
     print(f"Loading pipeline from {args.model_name} ({model_snapshot})...")
-    pipe = FluxPipeline.from_pretrained(str(model_snapshot), torch_dtype=dtype).to(device)
+    pipe = FluxPipeline.from_pretrained(str(model_snapshot), torch_dtype=dtype)
+    if args.encoder == "translator":
+        # Avoid loading the unused 4B encoder on the GPU.
+        pipe.transformer.to(device)
+        pipe.vae.to(device)
+    else:
+        pipe.to(device)
 
+    reference_embeds = None
+    if args.encoder == "translator":
+        # Use the same fused student/translator for numerical parity, not the 4B teacher.
+        pipe.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+        reference = load_translator_encoder(args, device)
+        text = pipe.tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=False)
+        tokens = pipe.tokenizer(text, return_tensors="pt", padding="max_length",
+                                truncation=True, max_length=512).to(device)
+        with torch.no_grad():
+            reference_embeds = reference(tokens["input_ids"], tokens["attention_mask"]).detach()
+        del reference
+        torch.cuda.empty_cache()
+        path = onnx_dir / "text_encoder_translator/model.onnx"
+        runner = OrtSessionRunner.from_path(path, args.provider, args)
+        expected = reference_embeds.float().cpu().numpy()
+        actual = runner.run({k: _to_numpy(tokens[k], np.int64)
+                             for k in ("input_ids", "attention_mask")})[0]
+        if actual.shape != (1, 512, 7680) or actual.dtype != np.float32 or not np.isfinite(actual).all():
+            raise RuntimeError("Translator output must be finite fp32 [1,512,7680]")
+        cosine = float(np.mean(np.sum(expected * actual, axis=-1) /
+                               np.maximum(np.linalg.norm(expected, axis=-1) * np.linalg.norm(actual, axis=-1), 1e-12)))
+        nrmse = float(np.sqrt(np.mean((expected - actual) ** 2)) / max(float(np.sqrt(np.mean(expected ** 2))), 1e-12))
+        print(f"[Translator embeddings] cosine={cosine:.6f}, NRMSE={nrmse:.6f}")
+        if cosine < args.embedding_cosine_min or nrmse > args.embedding_nrmse_max:
+            raise RuntimeError("Translator embedding parity failed")
+        del runner
+        reference_embeds = reference_embeds.to(dtype=dtype)
+        # Precomputed embeddings bypass the teacher; keep pipeline device discovery on CUDA.
+        pipe.text_encoder = _DeviceAnchor(device, dtype)
     pytorch_image = run_pytorch_pipeline(
         pipe,
         prompt=args.prompt,
         seed=args.seed,
         image_size=args.image_size,
         num_steps=args.num_steps,
+        prompt_embeds=reference_embeds,
     )
     pt_path = output_dir / "pytorch_output.png"
     pytorch_image.save(str(pt_path))
