@@ -155,14 +155,53 @@ if(_onnxruntime_trt_rtx_ep_runtime_dependencies)
 endif()
 
 
+# Resolve at build time, after ExternalProject has produced the library.
+# Keep the compatibility logic inline; generate its executable script in the build tree.
+set(_onnxruntime_trt_rtx_ep_copy_script "${CMAKE_CURRENT_BINARY_DIR}/copy_onnxruntime_trt_rtx_ep.cmake")
+file(GENERATE OUTPUT "${_onnxruntime_trt_rtx_ep_copy_script}" CONTENT [=[
+if(EP_MULTI_CONFIG)
+    set(_ep_candidates
+        "${EP_BINARY_DIR}/bin/${EP_CONFIGURATION}/${EP_LIBRARY_NAME}"
+        "${EP_BINARY_DIR}/${EP_CONFIGURATION}/${EP_LIBRARY_NAME}"
+    )
+else()
+    set(_ep_candidates
+        "${EP_BINARY_DIR}/bin/${EP_LIBRARY_NAME}"
+        "${EP_BINARY_DIR}/${EP_LIBRARY_NAME}"
+    )
+endif()
+
+foreach(_ep_candidate IN LISTS _ep_candidates)
+    if(EXISTS "${_ep_candidate}")
+        file(MAKE_DIRECTORY "${EP_RUNTIME_DIR}")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${_ep_candidate}" "${EP_RUNTIME_DIR}"
+            RESULT_VARIABLE _ep_copy_result
+            ERROR_VARIABLE _ep_copy_error
+        )
+        if(NOT _ep_copy_result STREQUAL "0")
+            message(FATAL_ERROR "Failed to copy TensorRT RTX EP: ${_ep_copy_error}")
+        endif()
+        return()
+    endif()
+endforeach()
+
+message(FATAL_ERROR "TensorRT RTX EP library was not found. Checked: ${_ep_candidates}")
+]=])
+
 set(_onnxruntime_trt_rtx_ep_runtime_commands
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${ONNXRUNTIME_TRT_RTX_EP_RUNTIME_DIR}"
 )
 
 list(APPEND _onnxruntime_trt_rtx_ep_runtime_commands
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${_onnxruntime_trt_rtx_ep_binary_dir}/$<CONFIG>/${_onnxruntime_trt_rtx_ep_runtime_library_name}"
-        "${ONNXRUNTIME_TRT_RTX_EP_RUNTIME_DIR}"
+        COMMAND "${CMAKE_COMMAND}"
+        "-DEP_BINARY_DIR=${_onnxruntime_trt_rtx_ep_binary_dir}"
+        "-DEP_CONFIGURATION=$<CONFIG>"
+        "-DEP_MULTI_CONFIG=$<BOOL:${CMAKE_CONFIGURATION_TYPES}>"
+        "-DEP_LIBRARY_NAME=${_onnxruntime_trt_rtx_ep_runtime_library_name}"
+        "-DEP_RUNTIME_DIR=${ONNXRUNTIME_TRT_RTX_EP_RUNTIME_DIR}"
+        -P "${_onnxruntime_trt_rtx_ep_copy_script}"
 )
 
 foreach(_onnxruntime_trt_rtx_ep_runtime_dependency IN LISTS _onnxruntime_trt_rtx_ep_runtime_dependencies)
