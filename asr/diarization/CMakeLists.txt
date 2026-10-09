@@ -1,0 +1,6 @@
+add_din_shared_library(din_diarization STATIC diarization.cpp)
+target_include_directories(din_diarization PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(din_diarization PUBLIC din_common_ort din_common_io nlohmann_json::nlohmann_json)
+
+add_din_executable(din_diarization_cli main.cpp)
+target_link_libraries(din_diarization_cli PRIVATE din_diarization din_asr_qwen3 argparse)
