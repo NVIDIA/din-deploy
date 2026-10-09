@@ -120,9 +120,11 @@ def _register_trt_rtx(args) -> str:
         if not args.ep_lib:
             raise SystemExit("trt-rtx needs onnxruntime-ep-nv-tensorrt-rtx or --ep_lib")
         name, lib = EP_NAME, str(args.ep_lib)
-        for d in (args.ep_dll_dir, args.trt_bin):
-            if d and os.path.isdir(d):
-                os.add_dll_directory(os.path.abspath(d))
+        # Windows only; on Linux the loader uses LD_LIBRARY_PATH.
+        if hasattr(os, "add_dll_directory"):
+            for d in (args.ep_dll_dir, args.trt_bin):
+                if d and os.path.isdir(d):
+                    os.add_dll_directory(os.path.abspath(d))
     import onnxruntime as ort
 
     ort.register_execution_provider_library(name, lib)

@@ -238,6 +238,11 @@ JsonTokenizerData LoadJsonTokenizerData(const std::string& path)
     }
     if (data.contains("normalizer") && !CollectNormalizerSteps(data["normalizer"], tokenizer_data.normalizer))
     {
+        if (tokenizer_data.byte_fallback)
+        {
+            throw std::runtime_error("tokenizer.json uses a normalizer that is not supported for SentencePiece BPE: " +
+                                     data["normalizer"].dump());
+        }
         tokenizer_data.normalizer.clear();
     }
     if (data.contains("post_processor"))

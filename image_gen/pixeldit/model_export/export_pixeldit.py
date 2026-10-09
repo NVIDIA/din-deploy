@@ -357,7 +357,6 @@ def main():
             break
         if m not in to_export:
             to_export.append(m)
-    export_all = (args.model is None) or ("all" in raw)
 
     device = "cuda"
     io_dtype = IO_PRECISION_MAP[args.io_precision]
@@ -391,7 +390,7 @@ def main():
             torch.cuda.empty_cache()
         exported_model_paths.append(output_path / name / "model.onnx")
 
-    if export_all:
+    if "transformer" in to_export:
         tokenizer.save_pretrained(str(output_path / "tokenizer"))
         print("  Saved tokenizer/")
         write_pipeline_config(output_path, args, tokenizer, layout, pixeldit_pipeline.SamplerConfig())

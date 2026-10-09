@@ -7,6 +7,7 @@
 //   * Llama style: the same with a Prepend("▁") normalizer.
 //   * GPT-2 / Qwen style byte-level BPE (regression for the existing path).
 // The expected ids were produced by Hugging Face `tokenizers` 0.23.2 from identical tokenizer.json content.
+// It also checks that a Gemma-style tokenizer with an unsupported normalizer step fails to load.
 
 #include <algorithm>
 #include <cstdint>
@@ -283,6 +284,27 @@ int run_cases(const std::filesystem::path& dir, const char* name, const json& to
     return failures;
 }
 
+// A SentencePiece-style tokenizer with an unsupported normalizer step must fail to load, not fall back to
+// byte-level BPE.
+int check_unsupported_normalizer_rejected(const std::filesystem::path& dir)
+{
+    json tokenizer_json = sentencepiece_tokenizer(false);
+    tokenizer_json["normalizer"] = {{"type", "Sequence"}, {"normalizers", {{{"type", "NFKC"}}, tokenizer_json["normalizer"]}}};
+    const auto path = dir / "unsupported_normalizer.json";
+    std::ofstream(path, std::ios::binary) << tokenizer_json.dump();
+    try
+    {
+        const din::io::Tokenizer tokenizer(path.string(), din::io::TokenizerFormat::Json);
+    }
+    catch (const std::runtime_error&)
+    {
+        std::cout << "unsupported_normalizer.json: rejected" << std::endl;
+        return 0;
+    }
+    std::cerr << "FAIL unsupported_normalizer.json: loaded a SentencePiece tokenizer with an NFKC normalizer" << std::endl;
+    return 1;
+}
+
 }  // namespace
 
 int main()
@@ -295,6 +317,7 @@ int main()
         failures += run_cases(dir, "gemma_style.json", sentencepiece_tokenizer(false), kGemmaStyleCases);
         failures += run_cases(dir, "llama_style.json", sentencepiece_tokenizer(true), kLlamaStyleCases);
         failures += run_cases(dir, "byte_level.json", byte_level_tokenizer(), kByteLevelCases);
+        failures += check_unsupported_normalizer_rejected(dir);
         std::filesystem::remove_all(dir);
         return failures == 0 ? 0 : 1;
     }
