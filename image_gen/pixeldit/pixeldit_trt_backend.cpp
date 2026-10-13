@@ -81,8 +81,6 @@ float* device_data(FloatBuffer& buffer)
     return buffer.BindingValue().GetTensorMutableData<float>();
 }
 
-// ORT's CopyTensors only copies whole OrtValues, so a partial copy goes through a view: an OrtValue of `shape` over
-// the bound tensor's memory starting `offset` elements in, with the same memory info as the bound tensor.
 Ort::Value make_view(FloatBuffer& buffer, size_t offset, const std::vector<int64_t>& shape)
 {
     size_t count = 1;
@@ -97,12 +95,6 @@ Ort::Value make_view(FloatBuffer& buffer, size_t offset, const std::vector<int64
     const Ort::ConstMemoryInfo memory_info = buffer.BindingValue().GetTensorMemoryInfo();
     return Ort::Value::CreateTensor<float>(memory_info, device_data(buffer) + offset, count, shape.data(),
                                            shape.size());
-}
-
-// Asynchronous copy through the execution provider's data transfer (OrtApi::CopyTensors), ordered on `stream`.
-void copy_tensor(Ort::Env& env, Ort::SyncStream& stream, const Ort::Value& src, Ort::Value& dst)
-{
-    Ort::ThrowOnError(env.CopyTensor(src, dst, stream));
 }
 
 template <typename T>
@@ -236,8 +228,7 @@ public:
             const auto stream = reinterpret_cast<cudaStream_t>(sync_stream.GetHandle());
             if (order == 1 && t == 0.0f)
             {
-                // Final step: the update is exactly x0 (see dpm_first_order_update).
-                copy_tensor(env, sync_stream, model_prev_0.BindingValue(), sample_->BindingValue());
+                Ort::ThrowOnError(env.CopyTensor(model_prev_0.BindingValue(), sample_->BindingValue(), sync_stream));
             }
             else if (order == 1)
             {
@@ -560,10 +551,10 @@ void data_prediction_cuda(PipelineState& state, float t, int eval_index, FloatBu
     Ort::SyncStream& sync_stream = *state.compute_stream;
     for (Ort::Value& half : state.hidden_state_halves)
     {
-        copy_tensor(state.env, sync_stream, state.sample->BindingValue(), half);
+        Ort::ThrowOnError(state.env.CopyTensor(state.sample->BindingValue(), half, sync_stream));
     }
-    copy_tensor(state.env, sync_stream, state.timestep_rows[static_cast<size_t>(eval_index)],
-                state.dit_timestep->BindingValue());
+    Ort::ThrowOnError(state.env.CopyTensor(state.timestep_rows[static_cast<size_t>(eval_index)],
+                                           state.dit_timestep->BindingValue(), sync_stream));
     const cudaStream_t stream = compute_stream(state);
     {
         din::common::nvtx_scoped_range nvtx("transformer");
