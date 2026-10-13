@@ -206,15 +206,12 @@ if(DIN_BUILD_TESTING)
                 dx-cig
         )
     endif ()
-    if (NOT WIN32)
-        # TODO this test should be cross platform but experiences a device lost error on windows
-        add_din_flux2_cli_test(
-                din_flux2_bf16
-                "${DIN_DEPLOY_ARTIFACTS_ROOT}/FLUX.2-klein-4B-onnx"
-                trt-rtx
-                vk
-        )
-    endif ()
+    add_din_flux2_cli_test(
+            din_flux2_bf16
+            "${DIN_DEPLOY_ARTIFACTS_ROOT}/FLUX.2-klein-4B-onnx"
+            trt-rtx
+            vk
+    )
 
     foreach (_din_pixeldit_processing cpu cuda)
         add_din_cli_test(din_pixeldit_bf16_trt-rtx_${_din_pixeldit_processing} din_pixeldit_cli

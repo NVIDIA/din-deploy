@@ -57,10 +57,19 @@ struct CudaGraphicsInteropSharedMemoryInfo
     int max_shared_memory_bytes = 0;
 };
 
+struct OrtGraphicsDeviceIdentity
+{
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
+    uint64_t luid = 0;
+};
+
 [[nodiscard]] const char* ToString(CudaDeviceGeneration generation);
 
 [[nodiscard]] int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device,
                                           const char* override_env_var = "FLUX_CUDA_DEVICE_ID");
+
+[[nodiscard]] OrtGraphicsDeviceIdentity ResolveOrtGraphicsDeviceIdentity(Ort::ConstEpDevice ep_device);
 
 [[nodiscard]] CudaGraphicsInteropSharedMemoryInfo
 QueryCudaGraphicsInteropSharedMemoryInfo(int cuda_device_ordinal, bool high_priority_compute_queue);

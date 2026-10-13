@@ -8,7 +8,7 @@
       "binaryDir": "${sourceDir}/out/build/${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "ONNXRUNTIME_VERSION": "1.27.0",
+        "ONNXRUNTIME_VERSION": "1.29.0",
         "DIN_BUILD_TESTING": "ON",
         "DIN_ENABLE_NVTX": "ON"
       }

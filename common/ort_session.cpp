@@ -724,6 +724,30 @@ int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device, const char* override_e
     return 0;
 }
 
+OrtGraphicsDeviceIdentity ResolveOrtGraphicsDeviceIdentity(Ort::ConstEpDevice ep_device)
+{
+    OrtGraphicsDeviceIdentity identity{};
+    identity.vendor_id = ep_device.Device().VendorId();
+    identity.device_id = ep_device.Device().DeviceId();
+
+#ifdef _WIN32
+    const auto metadata = ep_device.Device().Metadata().GetKeyValuePairs();
+    const std::string* luid_text = FindMetadataValue(metadata, "LUID");
+    if (luid_text == nullptr)
+    {
+        throw std::runtime_error("ORT TRT-RTX device does not expose Windows LUID metadata");
+    }
+    const auto luid = ParseUint64(*luid_text);
+    if (!luid.has_value())
+    {
+        throw std::runtime_error("ORT TRT-RTX device exposes an invalid Windows LUID: " + *luid_text);
+    }
+    identity.luid = *luid;
+#endif
+
+    return identity;
+}
+
 CudaGraphicsInteropSharedMemoryInfo QueryCudaGraphicsInteropSharedMemoryInfo(int cuda_device_ordinal,
                                                                              bool high_priority_compute_queue)
 {
