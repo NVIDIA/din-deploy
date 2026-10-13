@@ -61,16 +61,17 @@ std::string utf8(uint32_t code)
 
 json added_token(int64_t id, const std::string& content, bool special)
 {
-    return {{"id", id},          {"content", content}, {"single_word", false}, {"lstrip", false},
-            {"rstrip", false},   {"normalized", false}, {"special", special}};
+    return {{"id", id},        {"content", content},  {"single_word", false}, {"lstrip", false},
+            {"rstrip", false}, {"normalized", false}, {"special", special}};
 }
 
 // Vocab ids: <pad> <eos> <bos> <unk> \n \n\n <i> a b c d e . ▁ ab bc abc ▁a ▁ab aa, then <0x00>..<0xFF> from 20.
 json sentencepiece_tokenizer(bool prepend)
 {
     const std::string sp = kSpace;
-    std::vector<std::string> tokens = {"<pad>", "<eos>", "<bos>", "<unk>", "\n", "\n\n", "<i>", "a", "b", "c", "d",
-                                       "e",     ".",     sp,      "ab",    "bc", "abc",  sp + "a", sp + "ab", "aa"};
+    std::vector<std::string> tokens = {"<pad>", "<eos>", "<bos>", "<unk>",  "\n",      "\n\n", "<i>",
+                                       "a",     "b",     "c",     "d",      "e",       ".",    sp,
+                                       "ab",    "bc",    "abc",   sp + "a", sp + "ab", "aa"};
     for (int b = 0; b < 256; ++b)
     {
         char name[8];
@@ -87,7 +88,8 @@ json sentencepiece_tokenizer(bool prepend)
 
     const json replace = {{"type", "Replace"}, {"pattern", {{"String", " "}}}, {"content", sp}};
     const json normalizer =
-        prepend ? json{{"type", "Sequence"}, {"normalizers", {{{"type", "Prepend"}, {"prepend", sp}}, replace}}} : replace;
+        prepend ? json{{"type", "Sequence"}, {"normalizers", {{{"type", "Prepend"}, {"prepend", sp}}, replace}}}
+                : replace;
 
     return {
         {"version", "1.0"},
@@ -96,17 +98,24 @@ json sentencepiece_tokenizer(bool prepend)
           added_token(3, "<unk>", true), added_token(4, "\n", false), added_token(5, "\n\n", false),
           added_token(6, "<i>", false)}},
         {"normalizer", normalizer},
-        {"pre_tokenizer",
-         prepend ? json(nullptr)
-                 : json{{"type", "Split"}, {"pattern", {{"String", " "}}}, {"behavior", "MergedWithPrevious"},
-                        {"invert", false}}},
+        {"pre_tokenizer", prepend ? json(nullptr)
+                                  : json{{"type", "Split"},
+                                         {"pattern", {{"String", " "}}},
+                                         {"behavior", "MergedWithPrevious"},
+                                         {"invert", false}}},
         {"post_processor",
          {{"type", "TemplateProcessing"},
-          {"single", {{{"SpecialToken", {{"id", "<bos>"}, {"type_id", 0}}}}, {{"Sequence", {{"id", "A"}, {"type_id", 0}}}}}},
+          {"single",
+           {{{"SpecialToken", {{"id", "<bos>"}, {"type_id", 0}}}}, {{"Sequence", {{"id", "A"}, {"type_id", 0}}}}}},
           {"special_tokens", {{"<bos>", {{"id", "<bos>"}, {"ids", {2}}, {"tokens", {"<bos>"}}}}}}}},
         {"model",
-         {{"type", "BPE"}, {"unk_token", "<unk>"}, {"fuse_unk", true}, {"byte_fallback", true}, {"ignore_merges", false},
-          {"vocab", vocab}, {"merges", merges}}},
+         {{"type", "BPE"},
+          {"unk_token", "<unk>"},
+          {"fuse_unk", true},
+          {"byte_fallback", true},
+          {"ignore_merges", false},
+          {"vocab", vocab},
+          {"merges", merges}}},
     };
 }
 
@@ -123,8 +132,8 @@ json byte_level_tokenizer()
     std::sort(alphabet.begin(), alphabet.end());
     const std::string g = utf8(0x120);  // byte-level space
     const std::vector<std::pair<std::string, std::string>> merge_list = {
-        {"h", "e"}, {"l", "l"}, {"he", "ll"}, {"hell", "o"}, {g, "w"}, {g + "w", "o"},
-        {"a", "b"}, {"ab", "c"}, {g, "a"},    {g + "a", "b"}, {g + "ab", "c"}};
+        {"h", "e"}, {"l", "l"},  {"he", "ll"}, {"hell", "o"},  {g, "w"},       {g + "w", "o"},
+        {"a", "b"}, {"ab", "c"}, {g, "a"},     {g + "a", "b"}, {g + "ab", "c"}};
     json vocab = json::object();
     int64_t id = 0;
     for (const uint32_t code : alphabet)
@@ -144,7 +153,8 @@ json byte_level_tokenizer()
         {"version", "1.0"},
         {"added_tokens", json::array()},
         {"normalizer", nullptr},
-        {"pre_tokenizer", {{"type", "ByteLevel"}, {"add_prefix_space", false}, {"trim_offsets", true}, {"use_regex", true}}},
+        {"pre_tokenizer",
+         {{"type", "ByteLevel"}, {"add_prefix_space", false}, {"trim_offsets", true}, {"use_regex", true}}},
         {"post_processor", nullptr},
         {"model", {{"type", "BPE"}, {"byte_fallback", false}, {"vocab", vocab}, {"merges", merges}}},
     };
@@ -289,7 +299,8 @@ int run_cases(const std::filesystem::path& dir, const char* name, const json& to
 int check_unsupported_normalizer_rejected(const std::filesystem::path& dir)
 {
     json tokenizer_json = sentencepiece_tokenizer(false);
-    tokenizer_json["normalizer"] = {{"type", "Sequence"}, {"normalizers", {{{"type", "NFKC"}}, tokenizer_json["normalizer"]}}};
+    tokenizer_json["normalizer"] = {{"type", "Sequence"},
+                                    {"normalizers", {{{"type", "NFKC"}}, tokenizer_json["normalizer"]}}};
     const auto path = dir / "unsupported_normalizer.json";
     std::ofstream(path, std::ios::binary) << tokenizer_json.dump();
     try
@@ -301,7 +312,8 @@ int check_unsupported_normalizer_rejected(const std::filesystem::path& dir)
         std::cout << "unsupported_normalizer.json: rejected" << std::endl;
         return 0;
     }
-    std::cerr << "FAIL unsupported_normalizer.json: loaded a SentencePiece tokenizer with an NFKC normalizer" << std::endl;
+    std::cerr << "FAIL unsupported_normalizer.json: loaded a SentencePiece tokenizer with an NFKC normalizer"
+              << std::endl;
     return 1;
 }
 

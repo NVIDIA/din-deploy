@@ -103,8 +103,8 @@ void launch_pixeldit_dpm2_kernel(cudaStream_t stream, float* sample, const float
                                  const float* model_prev_0, float ratio, float coeff, float half_coeff, float inv_r0,
                                  size_t n)
 {
-    pixeldit_dpm2_kernel<<<grid_for(n), kThreadsPerBlock, 0, stream>>>(sample, model_prev_1, model_prev_0, ratio,
-                                                                        coeff, half_coeff, inv_r0, n);
+    pixeldit_dpm2_kernel<<<grid_for(n), kThreadsPerBlock, 0, stream>>>(sample, model_prev_1, model_prev_0, ratio, coeff,
+                                                                       half_coeff, inv_r0, n);
     check_launch();
 }
 

@@ -147,8 +147,8 @@ bool CollectNormalizerSteps(const nlohmann::json& normalizer, std::vector<JsonNo
     }
     if (type == "Replace" && normalizer.contains("pattern") && normalizer["pattern"].contains("String"))
     {
-        steps.push_back({false, normalizer["pattern"]["String"].get<std::string>(),
-                         normalizer["content"].get<std::string>()});
+        steps.push_back(
+            {false, normalizer["pattern"]["String"].get<std::string>(), normalizer["content"].get<std::string>()});
         return true;
     }
     return false;
@@ -826,9 +826,9 @@ std::vector<int64_t> Tokenizer::EncodeSentencePieceBpe(const std::string& text, 
         std::string normalized(segment);
         for (const auto& step : normalizer_)
         {
-            normalized = step.kind == NormalizerStep::Kind::Prepend ? step.content + normalized
-                                                                    : ReplaceAll(std::move(normalized), step.pattern,
-                                                                                 step.content);
+            normalized = step.kind == NormalizerStep::Kind::Prepend
+                             ? step.content + normalized
+                             : ReplaceAll(std::move(normalized), step.pattern, step.content);
         }
         for (const auto& token : ApplySentencePieceBpe(normalized, token_to_id_, bpe_ranks_, byte_fallback_, unk_token))
         {

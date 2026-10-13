@@ -194,8 +194,8 @@ template <typename Fn>
 void ParallelFor(size_t n, Fn&& fn)
 {
     constexpr size_t min_chunk = size_t{1} << 16;
-    const size_t threads =
-        std::min<size_t>({std::max(1u, std::thread::hardware_concurrency()), size_t{16}, (n + min_chunk - 1) / min_chunk});
+    const size_t threads = std::min<size_t>(
+        {std::max(1u, std::thread::hardware_concurrency()), size_t{16}, (n + min_chunk - 1) / min_chunk});
     if (threads <= 1)
     {
         fn(size_t{0}, n);
@@ -208,7 +208,11 @@ void ParallelFor(size_t n, Fn&& fn)
     {
         const size_t begin = k * chunk;
         const size_t end = std::min(n, begin + chunk);
-        workers.emplace_back([&fn, begin, end] { fn(begin, end); });
+        workers.emplace_back(
+            [&fn, begin, end]
+            {
+                fn(begin, end);
+            });
     }
     fn(size_t{0}, std::min(n, chunk));
     for (auto& worker : workers)

@@ -37,14 +37,14 @@ namespace din::image_gen
 namespace
 {
 
-#define PIXELDIT_CUDA_CHECK(call)                                                                              \
-    do                                                                                                         \
-    {                                                                                                          \
-        const cudaError_t _err = (call);                                                                       \
-        if (_err != cudaSuccess)                                                                               \
-        {                                                                                                      \
+#define PIXELDIT_CUDA_CHECK(call)                                                                            \
+    do                                                                                                       \
+    {                                                                                                        \
+        const cudaError_t _err = (call);                                                                     \
+        if (_err != cudaSuccess)                                                                             \
+        {                                                                                                    \
             throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(_err) + " at " #call); \
-        }                                                                                                      \
+        }                                                                                                    \
     } while (0)
 
 enum class SamplingBackend
@@ -81,11 +81,28 @@ float* device_data(FloatBuffer& buffer)
     return buffer.BindingValue().GetTensorMutableData<float>();
 }
 
-// cudaMemcpyDefault lets CUDA infer the copy direction from the pointers, so this works for either kind of bound
-// tensor described above.
-void copy_device_async(float* dst, const float* src, size_t count, cudaStream_t stream)
+// ORT's CopyTensors only copies whole OrtValues, so a partial copy goes through a view: an OrtValue of `shape` over
+// the bound tensor's memory starting `offset` elements in, with the same memory info as the bound tensor.
+Ort::Value make_view(FloatBuffer& buffer, size_t offset, const std::vector<int64_t>& shape)
 {
-    PIXELDIT_CUDA_CHECK(cudaMemcpyAsync(dst, src, count * sizeof(float), cudaMemcpyDefault, stream));
+    size_t count = 1;
+    for (const int64_t dim : shape)
+    {
+        count *= static_cast<size_t>(dim);
+    }
+    if (offset + count > element_count(buffer))
+    {
+        throw std::logic_error("view is outside the tensor");
+    }
+    const Ort::ConstMemoryInfo memory_info = buffer.BindingValue().GetTensorMemoryInfo();
+    return Ort::Value::CreateTensor<float>(memory_info, device_data(buffer) + offset, count, shape.data(),
+                                           shape.size());
+}
+
+// Asynchronous copy through the execution provider's data transfer (OrtApi::CopyTensors), ordered on `stream`.
+void copy_tensor(Ort::Env& env, Ort::SyncStream& stream, const Ort::Value& src, Ort::Value& dst)
+{
+    Ort::ThrowOnError(env.CopyTensor(src, dst, stream));
 }
 
 template <typename T>
@@ -125,7 +142,8 @@ std::vector<int64_t> session_shape(Ort::Session& session, const char* name, bool
     Ort::AllocatorWithDefaultOptions allocator;
     for (size_t i = 0; i < count; ++i)
     {
-        const auto io_name = input ? session.GetInputNameAllocated(i, allocator) : session.GetOutputNameAllocated(i, allocator);
+        const auto io_name =
+            input ? session.GetInputNameAllocated(i, allocator) : session.GetOutputNameAllocated(i, allocator);
         if (std::string_view{io_name.get()} == name)
         {
             const auto type_info = input ? session.GetInputTypeInfo(i) : session.GetOutputTypeInfo(i);
@@ -205,7 +223,7 @@ public:
         sample_ = &tensor;
     }
 
-    void Run(cudaStream_t stream, SamplingBackend backend, int order, FloatBuffer* model_prev_1,
+    void Run(Ort::Env& env, Ort::SyncStream& sync_stream, SamplingBackend backend, int order, FloatBuffer* model_prev_1,
              FloatBuffer& model_prev_0, float t_prev_1, float t_prev_0, float t)
     {
         if (sample_ == nullptr)
@@ -215,10 +233,11 @@ public:
         const size_t n = element_count(*sample_);
         if (backend == SamplingBackend::Cuda)
         {
+            const auto stream = reinterpret_cast<cudaStream_t>(sync_stream.GetHandle());
             if (order == 1 && t == 0.0f)
             {
                 // Final step: the update is exactly x0 (see dpm_first_order_update).
-                copy_device_async(device_data(*sample_), device_data(model_prev_0), n, stream);
+                copy_tensor(env, sync_stream, model_prev_0.BindingValue(), sample_->BindingValue());
             }
             else if (order == 1)
             {
@@ -308,6 +327,10 @@ struct PipelineState
     // and copied into dit_timestep on the device (rewriting the pinned dit_timestep mirror each step would race the
     // still-queued copies of earlier steps).
     std::unique_ptr<FloatBuffer> timestep_table;
+    // --processing cuda only: views for the partial device copies, created once (the buffers never move).
+    // hidden_state_halves[b] is batch row b of dit_hidden_states; timestep_rows[i] is row i of timestep_table.
+    std::vector<Ort::Value> hidden_state_halves;
+    std::vector<Ort::Value> timestep_rows;
 
     std::unique_ptr<Ort::IoBinding> text_encoder_io;
     std::unique_ptr<Ort::IoBinding> transformer_io;
@@ -362,8 +385,8 @@ void initialize_state(PipelineState& state, Ort::ConstEpDevice trt_device, const
               << "Negative prompt: " << state.sampler.negative_prompt << std::endl;
 
     std::cout << "Loading tokenizer " << state.model_paths.tokenizer_json.string() << std::endl;
-    state.tokenizer = std::make_unique<din::io::Tokenizer>(state.model_paths.tokenizer_json.string(),
-                                                           din::io::TokenizerFormat::Json);
+    state.tokenizer =
+        std::make_unique<din::io::Tokenizer>(state.model_paths.tokenizer_json.string(), din::io::TokenizerFormat::Json);
     const size_t chi_tokens = state.tokenizer->Encode(pc.chi_prompt, true).size();
     if (static_cast<int64_t>(chi_tokens) + pc.txt_max_length - 2 != pc.text_seq_len)
     {
@@ -376,8 +399,8 @@ void initialize_state(PipelineState& state, Ort::ConstEpDevice trt_device, const
     PIXELDIT_CUDA_CHECK(cudaSetDevice(cuda_device_ordinal));
     cudaDeviceProp cuda_device_prop{};
     PIXELDIT_CUDA_CHECK(cudaGetDeviceProperties(&cuda_device_prop, cuda_device_ordinal));
-    std::cout << "TensorRT RTX GPU: " << cuda_device_prop.name << " (CUDA device ordinal " << cuda_device_ordinal
-              << ")" << std::endl;
+    std::cout << "TensorRT RTX GPU: " << cuda_device_prop.name << " (CUDA device ordinal " << cuda_device_ordinal << ")"
+              << std::endl;
     state.compute_stream.emplace(din::common::CreateTensorRTRTXComputeStream(state.env));
 
     std::cout << "=== Loading ONNX Models ===" << std::endl;
@@ -395,13 +418,13 @@ void initialize_state(PipelineState& state, Ort::ConstEpDevice trt_device, const
         return profile;
     };
     Ort::SyncStream* stream = &*state.compute_stream;
-    state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, state.model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile("text_encoder"), stream);
+    state.text_encoder_runner =
+        std::make_unique<din::common::OrtRunner>(state.env, state.model_paths.text_encoder_model.string(), "trt-rtx",
+                                                 cache_dir, ep_context, make_profile("text_encoder"), stream);
     std::cout << "  Text encoder loaded" << std::endl;
-    state.transformer_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, state.model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile("transformer"), stream);
+    state.transformer_runner =
+        std::make_unique<din::common::OrtRunner>(state.env, state.model_paths.transformer_model.string(), "trt-rtx",
+                                                 cache_dir, ep_context, make_profile("transformer"), stream);
     std::cout << "  Transformer loaded" << std::endl;
 
     Ort::Session& te = state.text_encoder_runner->session;
@@ -437,6 +460,17 @@ void initialize_state(PipelineState& state, Ort::ConstEpDevice trt_device, const
     {
         const std::vector<int64_t> table_shape = {state.sampler.steps, pc.dit_batch};
         state.timestep_table = std::make_unique<FloatBuffer>(dit_runner, table_shape, true);
+        const size_t n = element_count(*state.sample);
+        for (int64_t b = 0; b < pc.dit_batch; ++b)
+        {
+            state.hidden_state_halves.push_back(
+                make_view(*state.dit_hidden_states, static_cast<size_t>(b) * n, sample_shape));
+        }
+        for (int64_t i = 0; i < state.sampler.steps; ++i)
+        {
+            state.timestep_rows.push_back(
+                make_view(*state.timestep_table, static_cast<size_t>(i * pc.dit_batch), timestep_shape));
+        }
     }
 
     state.text_encoder_io = std::make_unique<Ort::IoBinding>(te);
@@ -523,15 +557,14 @@ cudaStream_t compute_stream(PipelineState& state)
 // `eval_index` selects the row of timestep_table (timestep t * timestep_scale).
 void data_prediction_cuda(PipelineState& state, float t, int eval_index, FloatBuffer& x0)
 {
-    const PixelDiTPipelineConfig& pc = state.pipeline_config;
-    const size_t n = element_count(*state.sample);
+    Ort::SyncStream& sync_stream = *state.compute_stream;
+    for (Ort::Value& half : state.hidden_state_halves)
+    {
+        copy_tensor(state.env, sync_stream, state.sample->BindingValue(), half);
+    }
+    copy_tensor(state.env, sync_stream, state.timestep_rows[static_cast<size_t>(eval_index)],
+                state.dit_timestep->BindingValue());
     const cudaStream_t stream = compute_stream(state);
-    float* hidden = device_data(*state.dit_hidden_states);
-    copy_device_async(hidden, device_data(*state.sample), n, stream);
-    copy_device_async(hidden + n, device_data(*state.sample), n, stream);
-    const size_t batch = static_cast<size_t>(pc.dit_batch);
-    copy_device_async(device_data(*state.dit_timestep),
-                      device_data(*state.timestep_table) + static_cast<size_t>(eval_index) * batch, batch, stream);
     {
         din::common::nvtx_scoped_range nvtx("transformer");
         Ort::RunOptions run_options = make_run_options(state);
@@ -650,8 +683,8 @@ PixelDiTImage run_pipeline(PipelineState& state, const PixelDiTConfig& config, u
             throw std::logic_error("2nd-order update without two x0 estimates");
         }
         const auto solver_start = std::chrono::steady_clock::now();
-        state.solver.Run(compute_stream(state), state.sampling_backend, step_order, prev, *curr, t_prev_1, t_prev_0,
-                         t);
+        state.solver.Run(state.env, *state.compute_stream, state.sampling_backend, step_order, prev, *curr, t_prev_1,
+                         t_prev_0, t);
         state.timing.solver += std::chrono::steady_clock::now() - solver_start;
         std::swap(prev, curr);
         t_prev_1 = t_prev_0;
