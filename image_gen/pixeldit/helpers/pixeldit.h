@@ -22,11 +22,8 @@ namespace din::image_gen
 // Configuration
 // ============================================================================
 
-#ifdef _WIN32
-static const std::filesystem::path DEFAULT_PIXELDIT_MODEL_DIR = "S:/din_deploy_artifacts/PixelDiT-1300M-1024px-onnx";
-#else
-static const std::filesystem::path DEFAULT_PIXELDIT_MODEL_DIR = "/mnt/share/onnx/PixelDiT-1300M-1024px-onnx/";
-#endif
+// Relative to the working directory; pass --model-dir to use an export elsewhere.
+static const std::filesystem::path DEFAULT_PIXELDIT_MODEL_DIR = "./models/PixelDiT-1300M-1024px-onnx";
 
 struct PixelDiTModelPaths
 {

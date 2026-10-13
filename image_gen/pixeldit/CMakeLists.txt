@@ -50,15 +50,6 @@ target_link_libraries(din_pixeldit_trt
         CUDA::cudart
 )
 
-add_library(din_pixeldit_runtime STATIC
-    pixeldit_pipeline.cpp
-)
-set_target_properties(din_pixeldit_runtime PROPERTIES
-    CXX_STANDARD 20
-    CXX_EXTENSIONS OFF
-)
-target_link_libraries(din_pixeldit_runtime PUBLIC din_pixeldit_trt)
-
 add_din_executable(din_pixeldit_cli
     pixeldit_cli.cpp
 )
@@ -66,4 +57,4 @@ set_target_properties(din_pixeldit_cli PROPERTIES
     CXX_STANDARD 20
     CXX_EXTENSIONS OFF
 )
-target_link_libraries(din_pixeldit_cli PRIVATE argparse din_pixeldit_runtime)
+target_link_libraries(din_pixeldit_cli PRIVATE argparse din_pixeldit_trt)

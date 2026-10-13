@@ -26,8 +26,10 @@ Sampling defaults and the token layout are written to `pipeline_config.json`. Th
 
 | Mode | CLI | Inference and sampling |
 | --- | --- | --- |
-| Direct TensorRT RTX | `--provider trt-rtx --processing cpu` | TensorRT RTX inference with CPU sampling. |
-| TensorRT RTX with CUDA sampling | `--provider trt-rtx --processing cuda` | TensorRT RTX inference with CUDA sampling. |
+| TensorRT RTX + CPU | `--provider trt-rtx --processing cpu` | TensorRT RTX inference, sampling on the CPU. |
+| TensorRT RTX + CUDA | `--provider trt-rtx --processing cuda` | TensorRT RTX inference, sampling in CUDA kernels. |
+
+Both modes run the models through ONNX Runtime with the TensorRT RTX execution provider.
 
 CUDA sampling keeps the sample on the GPU, so the DiT calls run back to back with one host sync per image. Both modes produce identical images for the same seed.
 
@@ -66,5 +68,7 @@ cmake --build --preset windows-x64-release --target din_pixeldit_cli
 ```powershell
 out\build\windows-x64\bin\Release\din_pixeldit_cli.exe --model-dir D:\models\PixelDiT-1300M-1024px-onnx --provider trt-rtx --processing cuda --prompt "a red fox" --output out
 ```
+
+`--model-dir` defaults to `./models/PixelDiT-1300M-1024px-onnx`, relative to the working directory.
 
 Optional: `--negative-prompt`, `--seed`, `--num-images`, `--steps`, `--cfg-scale`, `--flow-shift` (defaults come from `pipeline_config.json`). The C++ noise generator differs from PyTorch's, so the same seed gives a different image than the Python scripts.

@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -27,7 +28,7 @@
 #include "nvtx_helper.h"
 #include "ort_session.h"
 #include "pixeldit.h"
-#include "pixeldit_runtime_context.h"
+#include "pixeldit_cli.h"
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_run_options_config_keys.h>
 
@@ -73,13 +74,15 @@ size_t element_count(din::common::TensorBuffer<T>& buffer)
     return buffer.BindingValue().GetTensorTypeAndShapeInfo().GetElementCount();
 }
 
-// Pointer to the bound tensor of a device-backed buffer: device memory, or pinned host memory on unified-memory GPUs.
+// Pointer to the tensor a device-backed buffer binds to the session. That is its device allocation, except when the
+// runner uses unified memory (TensorBuffer then binds its host-accessible tensor and has no separate device copy).
 float* device_data(FloatBuffer& buffer)
 {
     return buffer.BindingValue().GetTensorMutableData<float>();
 }
 
-// cudaMemcpyDefault so the copy also works when the bound tensors are pinned host memory (unified memory).
+// cudaMemcpyDefault lets CUDA infer the copy direction from the pointers, so this works for either kind of bound
+// tensor described above.
 void copy_device_async(float* dst, const float* src, size_t count, cudaStream_t stream)
 {
     PIXELDIT_CUDA_CHECK(cudaMemcpyAsync(dst, src, count * sizeof(float), cudaMemcpyDefault, stream));
@@ -126,7 +129,10 @@ std::vector<int64_t> session_shape(Ort::Session& session, const char* name, bool
         if (std::string_view{io_name.get()} == name)
         {
             const auto type_info = input ? session.GetInputTypeInfo(i) : session.GetOutputTypeInfo(i);
-            return type_info.GetTensorTypeAndShapeInfo().GetShape();
+            // Keep the shape info in a named variable: calling GetShape() on the temporary has lifetime issues on
+            // Linux (https://github.com/microsoft/onnxruntime/issues/24300).
+            const auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+            return tensor_info.GetShape();
         }
     }
     throw std::runtime_error(std::string("ONNX model has no ") + (input ? "input " : "output ") + name);
@@ -689,10 +695,36 @@ PixelDiTImage run_pipeline(PipelineState& state, const PixelDiTConfig& config, u
     return image;
 }
 
+// One ORT environment per process, with the TensorRT RTX EP registered once.
+struct ProcessRuntime
+{
+    explicit ProcessRuntime(Ort::Env& environment)
+        : env(environment)
+    {
+    }
+
+    Ort::Env& env;
+    Ort::ConstEpDevice trt_device{};
+};
+
+ProcessRuntime& GetProcessRuntime()
+{
+    static Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "PixelDiT"};
+    static ProcessRuntime runtime{env};
+    static std::once_flag register_trt_once;
+
+    std::call_once(register_trt_once,
+                   []
+                   {
+                       runtime.trt_device = din::common::RegisterTensorRTRTXProvider(runtime.env);
+                   });
+    return runtime;
+}
+
 class TrtPixelDiTProcessingPipeline final : public PixelDiTProcessingPipeline
 {
 public:
-    TrtPixelDiTProcessingPipeline(PixelDiTConfig config, PixelDiTRuntimeContext& runtime)
+    TrtPixelDiTProcessingPipeline(PixelDiTConfig config, ProcessRuntime& runtime)
         : config_(std::move(config))
         , runtime_(runtime)
     {
@@ -746,18 +778,19 @@ public:
 
 private:
     PixelDiTConfig config_;
-    PixelDiTRuntimeContext& runtime_;
+    ProcessRuntime& runtime_;
     std::unique_ptr<PipelineState> state_;
 };
 
 }  // namespace
 
-std::unique_ptr<PixelDiTProcessingPipeline> CreatePixelDiTTrtPipeline(const PixelDiTConfig& config,
-                                                                       PixelDiTRuntimeContext& runtime)
+// TensorRT RTX is the only execution provider for PixelDiT; config.processing (cpu or cuda) only selects where the
+// sampling math runs, inside this pipeline.
+std::unique_ptr<PixelDiTProcessingPipeline> CreatePixelDiTPipeline(const PixelDiTConfig& config)
 {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
-    return std::make_unique<TrtPixelDiTProcessingPipeline>(config, runtime);
+    return std::make_unique<TrtPixelDiTProcessingPipeline>(config, GetProcessRuntime());
 }
 
 }  // namespace din::image_gen
