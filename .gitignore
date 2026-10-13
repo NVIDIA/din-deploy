@@ -94,6 +94,3 @@ audio/
 TODO
 frames/
 .run/
-
-models/
-*.png
