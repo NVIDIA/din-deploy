@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "flux2_runtime_context.h"
+#include "rng.h"
 
 namespace
 {
@@ -91,14 +92,15 @@ void ValidateFlux2Config(const Flux2Config& config)
         throw std::invalid_argument("Denoise steps must be in [1, 50]");
     if (config.num_images == 0)
         throw std::invalid_argument("Image count must be positive");
-    if (config.precision != "bf16" && config.precision != "fp16" && config.precision != "fp8" &&
-        config.precision != "nvfp4")
+    ValidateFlux2Rng(config.rng, config.processing);
+    if (config.transformer.precision != "bf16" && config.transformer.precision != "fp16" && config.transformer.precision != "fp8" &&
+        config.transformer.precision != "nvfp4")
         throw std::invalid_argument("Precision must be bf16, fp16, fp8, or nvfp4");
-    if (!config.weight_streaming_budget.empty())
+    if (!config.transformer.initial_weight_streaming_budget.empty())
     {
         if (config.provider != Flux2ExecutionProvider::TrtRtx)
             throw std::invalid_argument("Weight streaming requires TensorRT RTX");
-        const auto& budget = config.weight_streaming_budget;
+        const auto& budget = config.transformer.initial_weight_streaming_budget;
         if (budget == "-1")
             return;
         size_t parsed = 0;

@@ -199,6 +199,8 @@ class TensorBuffer
 {
 public:
     TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma = false);
+    TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream,
+                 const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma = false);
 
     Ort::Value& BindingValue();
 
@@ -228,7 +230,10 @@ private:
 
     [[nodiscard]] size_t ElementCount() const;
 
-    OrtRunner* runner_ = nullptr;
+    // Allocators belong to the environment. External streams must outlive this
+    // buffer, allowing a model session to be replaced without moving its tensors.
+    Ort::Env* env_ = nullptr;
+    Ort::SyncStream* compute_stream_ = nullptr;
     bool use_device_io_ = false;
     bool use_unified_memory_ = false;
     std::vector<int64_t> shape_;

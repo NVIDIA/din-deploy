@@ -158,17 +158,17 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("PATH")
         .help("Root directory with shared Flux2 ONNX artifacts and transformer_<precision> directories.");
     parser.add_argument("--precision")
-        .default_value(config.precision)
+        .default_value(config.transformer.precision)
         .nargs(1)
         .metavar("bf16|fp16|fp8|nvfp4")
         .help("Transformer precision to load from transformer_<precision>.");
     parser.add_argument("--ep-cache")
-        .default_value(config.ep_cache_dir.string())
+        .default_value(config.text_encoder.ep_cache_dir.string())
         .nargs(1)
         .metavar("PATH")
         .help("TensorRT RTX runtime cache directory.");
     parser.add_argument("--ep-context-dir")
-        .default_value(config.ep_context_dir.string())
+        .default_value(config.text_encoder.ep_context_dir.string())
         .nargs(1)
         .metavar("PATH")
         .help("Directory for ONNX Runtime EP-context models.");
@@ -183,6 +183,11 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("TEXT")
         .help("Prompt text to encode with the Flux2 tokenizer.");
     parser.add_argument("--seed").default_value(std::to_string(config.seed)).nargs(1).metavar("N").help("Random seed.");
+    parser.add_argument("--rng")
+        .default_value(std::string{"cpu-std"})
+        .nargs(1)
+        .metavar("cpu-std|cuda-philox|cpu-philox")
+        .help("Noise generator: cpu-std (default), cuda-philox (CUDA only), or cpu-philox (fixed H100 SXM5 ordering).");
     parser.add_argument("--encoder").default_value(std::string("4b")).help("4b or translator.");
     parser.add_argument("--steps").default_value(std::string("4")).help("Denoise steps, 1 through 50.");
     parser.add_argument("--ws")
@@ -206,28 +211,38 @@ Flux2Config parse_args(int argc, char* argv[])
 
     config.processing = parse_processing_backend(parser.get<std::string>("--processing"));
     config.provider = parse_execution_provider(parser.get<std::string>("--provider"));
-    config.model_dir = parser.get<std::string>("--model-dir");
-    config.precision = parse_precision(parser.get<std::string>("--precision"));
-    config.ep_cache_dir = parser.get<std::string>("--ep-cache");
-    config.ep_context_dir = parser.get<std::string>("--ep-context-dir");
+    const std::filesystem::path model_root = parser.get<std::string>("--model-dir");
+    config.transformer.precision = parse_precision(parser.get<std::string>("--precision"));
+    config.text_encoder.ep_cache_dir = parser.get<std::string>("--ep-cache");
+    config.text_encoder.ep_context_dir = parser.get<std::string>("--ep-context-dir");
     config.prompt = parser.get<std::string>("--prompt");
     config.seed = parse_uint(parser.get<std::string>("--seed"), "--seed");
+    const auto rng = parser.get<std::string>("--rng");
+    if (rng == "cpu-std")
+        config.rng = din::common::Rng::CpuStd;
+    else if (rng == "cuda-philox")
+        config.rng = din::common::Rng::CudaPhilox;
+    else if (rng == "cpu-philox")
+        config.rng = din::common::Rng::CpuPhilox;
+    else
+        throw std::invalid_argument("--rng must be cpu-std, cuda-philox, or cpu-philox");
     const auto encoder = parser.get<std::string>("--encoder");
     if (encoder != "4b" && encoder != "translator")
         throw std::invalid_argument("--encoder must be 4b or translator");
-    config.text_encoder = encoder == "4b" ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+    config.text_encoder.variant = encoder == "4b" ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
     const auto steps = parse_uint(parser.get<std::string>("--steps"), "--steps");
     if (steps < 1 || steps > 50)
         throw std::invalid_argument("--steps must be 1 through 50");
     config.steps = static_cast<int>(steps);
-    config.weight_streaming_budget = parser.get<std::string>("--ws");
-    if (config.weight_streaming_budget == "off")
-        config.weight_streaming_budget.clear();
+    config.transformer.initial_weight_streaming_budget = parser.get<std::string>("--ws");
+    if (config.transformer.initial_weight_streaming_budget == "off")
+        config.transformer.initial_weight_streaming_budget.clear();
     config.num_images = parse_uint(parser.get<std::string>("--num-images"), "--num-images");
 
     const std::filesystem::path output_dir = parser.get<std::string>("--output");
     std::filesystem::create_directories(output_dir);
     config.output_path = output_dir / "flux2.png";
+    ConfigureFlux2Models(config, model_root, config.text_encoder.ep_cache_dir, config.text_encoder.ep_context_dir);
     validate_config(config);
     ValidateFlux2Config(config);
 
@@ -264,16 +279,18 @@ int main(int argc, char* argv[])
     try
     {
         const Flux2Config config = parse_args(argc, argv);
-        std::cout << "Model dir: " << config.model_dir.string() << "\n"
-                  << "Precision: " << config.precision << "\n"
+        std::cout << "Model dir: " << config.text_encoder.model_path.parent_path().parent_path().string() << "\n"
+                  << "Precision: " << config.transformer.precision << "\n"
                   << "Output: " << config.output_path.string() << "\n"
                   << "Prompt: " << config.prompt << "\n"
                   << "Seed:   " << config.seed << "\n"
+                  << "RNG: " << (config.rng == din::common::Rng::CpuStd ? "cpu-std" :
+                                  config.rng == din::common::Rng::CudaPhilox ? "cuda-philox" : "cpu-philox") << "\n"
                   << "Num images: " << config.num_images << "\n"
                   << "Processing: " << to_string(config.processing) << "\n"
                   << "Provider: " << to_string(config.provider) << "\n"
-                  << "EP cache: " << config.ep_cache_dir.string() << "\n"
-                  << "EP context dir: " << config.ep_context_dir.string() << "\n"
+                  << "EP cache: " << config.text_encoder.ep_cache_dir.string() << "\n"
+                  << "EP context dir: " << config.text_encoder.ep_context_dir.string() << "\n"
                   << std::endl;
 
         auto pipeline = CreateFlux2Pipeline(config);

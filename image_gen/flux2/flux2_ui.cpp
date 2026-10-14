@@ -98,12 +98,9 @@ public:
     std::vector<Result> ready;
 
 private:
-    static bool SameModels(const Flux2Config& a, const Flux2Config& b)
+    static bool SameBackend(const Flux2Config& a, const Flux2Config& b)
     {
-        return a.model_dir == b.model_dir && a.processing == b.processing && a.provider == b.provider &&
-               a.precision == b.precision && a.text_encoder == b.text_encoder && a.steps == b.steps &&
-               a.weight_streaming_budget == b.weight_streaming_budget && a.ep_cache_dir == b.ep_cache_dir &&
-               a.ep_context_dir == b.ep_context_dir;
+        return a.processing == b.processing && a.provider == b.provider;
     }
 
     void UpdateMemory()
@@ -148,14 +145,16 @@ private:
             {
                 const auto& config = request.config;
                 ValidateFlux2Config(config);
-                if (!loaded || !SameModels(*loaded, config))
+                if (!loaded || !SameBackend(*loaded, config))
                 {
                     pipeline.reset();  // Release old engines before allocating the replacement.
                     loaded.reset();
                     pipeline = CreateFlux2Pipeline(config);
-                    pipeline->Initialize();
                     loaded = config;
+                    pipeline->Initialize();
                 }
+                pipeline->UpdateModels(config);
+                loaded = config;
                 pipeline->SetPrompt(config.prompt);
                 for (unsigned int i = 0; i < config.num_images; ++i)
                 {
@@ -189,6 +188,12 @@ private:
                 std::lock_guard guard(mutex);
                 completed = total;
                 status = "Done";
+            }
+            catch (const Flux2StageLoadError& error)
+            {
+                std::lock_guard guard(mutex);
+                status = std::string("Error: ") + error.what();
+                failed = true;
             }
             catch (const std::exception& error)
             {
@@ -240,18 +245,18 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
     Flux2Config config = initial;
     std::array<char, 2048> model{}, output{}, cache{};
     bool cache_changed = false;
-    const auto cache_utf8 = initial.ep_cache_dir.parent_path().u8string();
+    const auto cache_utf8 = initial.text_encoder.ep_cache_dir.parent_path().u8string();
     std::snprintf(cache.data(), cache.size(), "%s", reinterpret_cast<const char*>(cache_utf8.c_str()));
     std::array<char, 8192> prompt{};
-    const auto model_utf8 = config.model_dir.u8string();
+    const auto model_utf8 = config.text_encoder.model_path.parent_path().parent_path().u8string();
     std::snprintf(model.data(), model.size(), "%s", reinterpret_cast<const char*>(model_utf8.c_str()));
     std::snprintf(output.data(), output.size(), "%s", config.output_path.string().c_str());
     std::snprintf(prompt.data(), prompt.size(), "%s", config.prompt.c_str());
     int streaming_mode = 0;  // Auto / Manual / Off; independent of session configuration.
     int budget = 50;
     int count = static_cast<int>(config.num_images);
-    int encoder = config.text_encoder == Flux2TextEncoder::Qwen3_4B ? 0 : 1;
-    int precision = config.precision == "bf16" ? 0 : config.precision == "fp16" ? 1 : config.precision == "fp8" ? 2 : 3;
+    int encoder = config.text_encoder.variant == Flux2TextEncoder::Qwen3_4B ? 0 : 1;
+    int precision = config.transformer.precision == "bf16" ? 0 : config.transformer.precision == "fp16" ? 1 : config.transformer.precision == "fp8" ? 2 : 3;
     const char* precisions[] = {"bf16", "fp16", "fp8", "nvfp4"};
     const char* backends[] = {"CPU", "CUDA", "DirectX", "DirectX CIG", "Vulkan", "Vulkan CIG"};
     int backend = static_cast<int>(config.processing);
@@ -332,6 +337,21 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
             }
             ImGui::EndCombo();
         }
+        if (backend != static_cast<int>(Flux2ProcessingBackend::Cuda) && config.rng == din::common::Rng::CudaPhilox)
+            config.rng = din::common::Rng::CpuPhilox;
+        const char* rng_names[] = {"cpu-std", "cuda-philox", "cpu-philox"};
+        if (ImGui::BeginCombo("RNG", rng_names[static_cast<int>(config.rng)]))
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                const bool disabled = i == 1 && backend != static_cast<int>(Flux2ProcessingBackend::Cuda);
+                ImGui::BeginDisabled(disabled);
+                if (ImGui::Selectable(rng_names[i], static_cast<int>(config.rng) == i))
+                    config.rng = static_cast<din::common::Rng>(i);
+                ImGui::EndDisabled();
+            }
+            ImGui::EndCombo();
+        }
         ImGui::BeginDisabled(provider == 0);
         ImGui::Combo("Weight streaming", &streaming_mode, "Auto\0Manual\0Off\0");
         if (streaming_mode == 1)
@@ -353,23 +373,26 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
                     glDeleteTextures(1, &result.texture);
             results.clear();
             selected = -1;
-            config.model_dir = std::filesystem::u8path(model.data());
+            const auto model_root = std::filesystem::u8path(model.data());
             config.output_path = output.data();
             config.prompt = prompt.data();
-            const auto cache_namespace = CacheNamespace(config.model_dir);
-            config.ep_cache_dir =
-                (cache_changed ? std::filesystem::u8path(cache.data()) / "runtime" : initial.ep_cache_dir) /
+            const auto cache_namespace = CacheNamespace(model_root);
+            const auto cache_root =
+                (cache_changed ? std::filesystem::u8path(cache.data()) / "runtime" : initial.text_encoder.ep_cache_dir) /
                 cache_namespace;
-            config.ep_context_dir =
-                (cache_changed ? std::filesystem::u8path(cache.data()) / "ep_context" : initial.ep_context_dir) /
+            const auto context_root =
+                (cache_changed ? std::filesystem::u8path(cache.data()) / "ep_context" : initial.text_encoder.ep_context_dir) /
                 cache_namespace;
-            config.text_encoder = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
-            config.precision = precisions[precision];
+            config.text_encoder.variant = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+            config.transformer.precision = precisions[precision];
             config.num_images = static_cast<unsigned int>(count);
             config.processing = static_cast<Flux2ProcessingBackend>(backend);
             config.provider = provider == 0 ? Flux2ExecutionProvider::Cpu : Flux2ExecutionProvider::TrtRtx;
-            config.weight_streaming_budget = provider == 0 ? "" : "-1";
+            config.transformer.initial_weight_streaming_budget = provider == 0 ? "" : "-1";
+            ConfigureFlux2Models(config, model_root, cache_root, context_root);
             Flux2GenerationOptions generation;
+            generation.steps = config.steps;
+            generation.rng = config.rng;
             if (provider != 0 && streaming_mode != 0)
                 generation.weight_streaming_budget = streaming_mode == 1 ? std::to_string(budget) + "%" : "0";
             generator.Submit({config, generation, random});
@@ -469,24 +492,25 @@ int main(int argc, char** argv)
         args.add_argument("--exit-after-generation").default_value(false).implicit_value(true);
         args.parse_args(argc, argv);
         Flux2Config config;
-        config.model_dir = args.get<std::string>("--model-dir");
-        if (config.model_dir.empty() && args.get<bool>("--auto-generate"))
+        const std::filesystem::path model_root = args.get<std::string>("--model-dir");
+        if (model_root.empty() && args.get<bool>("--auto-generate"))
             throw std::runtime_error("--auto-generate requires --model-dir");
         config.output_path = args.get<std::string>("--output");
-        config.ep_cache_dir = std::filesystem::u8path(args.get<std::string>("--ep-cache"));
-        config.ep_context_dir = std::filesystem::u8path(args.get<std::string>("--ep-context-dir"));
-        std::filesystem::create_directories(config.ep_cache_dir);
-        std::filesystem::create_directories(config.ep_context_dir);
+        config.text_encoder.ep_cache_dir = std::filesystem::u8path(args.get<std::string>("--ep-cache"));
+        config.text_encoder.ep_context_dir = std::filesystem::u8path(args.get<std::string>("--ep-context-dir"));
+        std::filesystem::create_directories(config.text_encoder.ep_cache_dir);
+        std::filesystem::create_directories(config.text_encoder.ep_context_dir);
         config.prompt = args.get<std::string>("--prompt");
-        config.precision = args.get<std::string>("--precision");
+        config.transformer.precision = args.get<std::string>("--precision");
         config.num_images = 1;
         const auto encoder = args.get<std::string>("--encoder");
         const bool translator =
             encoder == "translator" ||
-            (encoder == "auto" && !config.model_dir.empty() &&
-             std::filesystem::is_regular_file(config.model_dir / "text_encoder_translator/model.onnx"));
-        config.text_encoder = translator ? Flux2TextEncoder::Qwen3_06BTranslator : Flux2TextEncoder::Qwen3_4B;
-        config.weight_streaming_budget = "-1";
+            (encoder == "auto" && !model_root.empty() &&
+             std::filesystem::is_regular_file(model_root / "text_encoder_translator/model.onnx"));
+        config.text_encoder.variant = translator ? Flux2TextEncoder::Qwen3_06BTranslator : Flux2TextEncoder::Qwen3_4B;
+        config.transformer.initial_weight_streaming_budget = "-1";
+        ConfigureFlux2Models(config, model_root, config.text_encoder.ep_cache_dir, config.text_encoder.ep_context_dir);
         if (!glfwInit())
             throw std::runtime_error("GLFW initialization failed");
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);

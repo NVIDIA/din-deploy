@@ -56,6 +56,9 @@ The studio provides prompt editing, encoder/precision/backend selection, seed sw
 weight-streaming controls, and an image gallery with optional PNG output. It selects the
 translator when exported; override with `--encoder 4b|translator`.
 Runtime and compiled-model caching are always enabled; clear affected caches after re-exporting models in place.
+The has configuration checks per stage and does partial reload of impacted models upon changes.
+Changing RNG, denoising steps, or the runtime weight-streaming budget reuses all
+loaded model sessions. For a full execution backend change all models are reloaded.
 
 The UI uses GLFW, Dear ImGui, and OpenGL. For Debian/Ubuntu, install
 `libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev`.

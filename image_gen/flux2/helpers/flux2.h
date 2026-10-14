@@ -10,12 +10,13 @@
 #include <filesystem>
 #include <iostream>
 #include <numeric>
-#include <random>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "flux2_cli.h"
+#include "rng.h"
 #include "tokenizer.h"
 
 // ============================================================================
@@ -31,39 +32,11 @@ struct Flux2ModelPaths
     std::filesystem::path tokenizer_dir;
 };
 
-struct Flux2ModelCachePaths
+inline Flux2ModelPaths MakeFlux2ModelPaths(const Flux2Config& config)
 {
-    std::string text_encoder;
-    std::string transformer;
-    std::string vae_decoder;
-};
-
-inline Flux2ModelPaths MakeFlux2ModelPaths(std::filesystem::path model_dir, const std::string& precision,
-                                           Flux2TextEncoder encoder = Flux2TextEncoder::Qwen3_4B)
-{
-    if (model_dir.empty())
-    {
-        throw std::invalid_argument("Model directory must be specified");
-    }
-    return {
-        model_dir,
-        model_dir / (encoder == Flux2TextEncoder::Qwen3_4B ? "text_encoder" : "text_encoder_translator") / "model.onnx",
-        model_dir / ("transformer_" + precision) / "model.onnx",
-        model_dir / "vae_decoder/model.onnx",
-        model_dir / "tokenizer",
-    };
-}
-
-inline Flux2ModelCachePaths MakeFlux2ModelCachePaths(const std::string& precision, const std::string& prefix = {},
-                                                     Flux2TextEncoder encoder = Flux2TextEncoder::Qwen3_4B,
-                                                     bool weight_streaming = false)
-{
-    const std::string prefix_separator = prefix.empty() ? "" : prefix + "_";
-    return {
-        prefix_separator + (encoder == Flux2TextEncoder::Qwen3_4B ? "text_encoder" : "text_encoder_translator"),
-        prefix_separator + "transformer_" + precision + (weight_streaming ? "_ws" : ""),
-        prefix_separator + "vae_decoder",
-    };
+    return {config.text_encoder.model_path.parent_path().parent_path(),
+            config.text_encoder.model_path, config.transformer.model_path,
+            config.vae.model_path, config.text_encoder.tokenizer_dir};
 }
 
 static const std::filesystem::path TEXT_ENCODER_MODEL_CTX = "text_encoder_model_ctx.onnx";
@@ -177,12 +150,33 @@ inline void FillTextEncoderInputs(const std::vector<int64_t>& token_ids, int64_t
 // Random latent initialisation
 // ============================================================================
 
-inline void initialize_latent(float* latent, size_t num_elements, unsigned int seed = 42)
+inline void initialize_cpu_latent(float* output, size_t count, uint64_t seed, din::common::Rng rng,
+                                  unsigned int batch, unsigned int channels, unsigned int height, unsigned int width)
 {
-    std::default_random_engine rng(seed);
-    std::normal_distribution<float> dist(0.0f, 1.0f);
-    for (size_t i = 0; i < num_elements; ++i)
-        latent[i] = dist(rng);
+    size_t expected = 1;
+    for (unsigned int dimension : {batch, channels, height, width})
+    {
+        if (dimension == 0 || expected > std::numeric_limits<size_t>::max() / dimension)
+            throw std::invalid_argument("Latent dimensions must be nonempty and fit in size_t");
+        expected *= dimension;
+    }
+    if (output == nullptr || count != expected)
+        throw std::invalid_argument("Noise buffer must match the latent dimensions");
+    if (rng == din::common::Rng::CpuStd)
+    {
+        din::common::GenerateNormalCpu({output, count}, seed, rng);
+        return;
+    }
+    std::vector<float> noise(count);
+    din::common::GenerateNormalCpu(noise, seed, rng, {.round_to_bfloat16 = true});
+    const size_t spatial = static_cast<size_t>(height) * width;
+    for (size_t index = 0; index < count; ++index)
+    {
+        const size_t b = index / (channels * spatial);
+        const size_t c = (index / spatial) % channels;
+        const size_t pixel = index % spatial;
+        output[(b * spatial + pixel) * channels + c] = noise[index];
+    }
 }
 
 // ============================================================================

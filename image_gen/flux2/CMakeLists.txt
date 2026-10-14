@@ -8,6 +8,7 @@ option(DIN_BUILD_FLUX2_UI "Build the GLFW/OpenGL Flux2 desktop sample" ON)
 
 add_library(din_flux2_common STATIC
     utils.cpp
+    flux2_models.cpp
 )
 
 target_include_directories(din_flux2_common
@@ -19,6 +20,7 @@ target_include_directories(din_flux2_common
 target_link_libraries(din_flux2_common
     PUBLIC
         din_common_ort
+        din_common_rng
         PRIVATE
         nlohmann_json::nlohmann_json
 )
@@ -71,7 +73,7 @@ configure_flux2_backend_target(din_flux2_cuda)
 set_target_properties(din_flux2_cuda PROPERTIES
     CUDA_ARCHITECTURES "${CUDA_ARCHITECTURES}"
 )
-target_link_libraries(din_flux2_cuda PRIVATE CUDA::cudart CUDA::nvtx3)
+target_link_libraries(din_flux2_cuda PRIVATE din_common_rng_cuda CUDA::cudart CUDA::nvtx3)
 
 if(Vulkan_FOUND AND SLANGC)
     add_subdirectory(shaders)
