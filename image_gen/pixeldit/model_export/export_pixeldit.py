@@ -32,6 +32,7 @@ from pathlib import Path
 import torch
 
 from pixeldit import pipeline as pixeldit_pipeline
+from pixeldit.upstream_patch import export_patches
 from pixeldit.weights import DEFAULT_MODEL_NAME, DEFAULT_TEXT_ENCODER_NAME, load_gemma_text_encoder, load_pixeldit
 
 EXTERNAL_DATA_NAME = "model.onnx_data"
@@ -114,15 +115,18 @@ class TextEncoderExportWrapper(torch.nn.Module):
 
 
 class PixelDiTExportWrapper(torch.nn.Module):
-    """Inputs are cast to bf16 inside PixelDiT (as upstream PixDiTTrainer does), output to io_dtype."""
+    """Inputs are cast to the model dtype , output to io_dtype."""
 
     def __init__(self, model, io_dtype: torch.dtype):
         super().__init__()
         self.model = model
         self.io_dtype = io_dtype
+        self.model_dtype = next(model.parameters()).dtype
 
     def forward(self, hidden_states, timestep, encoder_hidden_states):
-        return self.model(hidden_states, timestep, encoder_hidden_states).to(self.io_dtype)
+        dtype = self.model_dtype
+        velocity = self.model(hidden_states.to(dtype), timestep.to(dtype), encoder_hidden_states.to(dtype))
+        return velocity.to(self.io_dtype)
 
 
 @torch.no_grad()
@@ -384,8 +388,8 @@ def main():
         elif name == "transformer":
             print(f"Loading PixelDiT from {args.model_name} (dtype=bf16, {args.height}x{args.width})...")
             model = load_pixeldit(args.model_name, device, torch.bfloat16, args.local_files_only)
-            model.set_image_size(args.height, args.width)
-            export_transformer(model, output_path, device, model_opset, args.height, args.width, io_dtype)
+            with export_patches(model, args.height, args.width, model.txt_max_length):
+                export_transformer(model, output_path, device, model_opset, args.height, args.width, io_dtype)
             del model
             torch.cuda.empty_cache()
         exported_model_paths.append(output_path / name / "model.onnx")
