@@ -30,3 +30,28 @@ absolute differences of 0.001953 at 32x32, 0.002045 at 128x128, and 0.003906
 at 512x512. At 512x512, 2 of 65,536 outputs exceeded
 `atol=0.002, rtol=0.002`. The export's 32x32 eager parity and ONNX structural
 validation passed. This experiment is not yet an exact numerical replacement.
+
+## Verify script accuracy check
+
+`verify_seedvr.py` was run on `out/seedvr/input.png` at scale 1, seed 0, and
+without color correction. Only the VAE encoder ONNX path differed between the
+two ONNX pipelines; both used the same DiT and decoder. The PyTorch reference
+images were byte-identical. The folded run repeated with the same result.
+
+| 128x128 final image vs. PyTorch | Unfolded | Folded |
+| --- | ---: | ---: |
+| MSE (8-bit RGB) | 32.0618 | 41.9898 |
+| MAE (8-bit RGB) | 2.4152 | 2.6635 |
+| PSNR | 33.07 dB | 31.90 dB |
+
+The verify script's encoder-only mode also compared latents directly with the
+ComfyUI VAE. The folded encoder was closer at both tested shapes:
+
+| Image shape | Unfolded latent MAE | Folded latent MAE |
+| --- | ---: | ---: |
+| 128x128 | 0.00420434 | 0.00135356 |
+| 512x512 | 0.00541649 | 0.00266245 |
+
+Thus, improved encoder latent MAE did not improve this final image's PSNR after
+denoising. The full pipeline test covers one small image; it does not establish
+accuracy across other images or resolutions.
