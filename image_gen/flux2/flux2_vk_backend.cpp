@@ -27,6 +27,8 @@
 
 #include "flux2.h"
 #include "flux2_runtime_context.h"
+#include "flux2_models.h"
+#include "flux2_telemetry.h"
 #include "ort_session.h"
 #include "utils.h"
 #include "vk_helper.h"
@@ -37,14 +39,6 @@ static const std::string POSTPROCESS_SHADER_PATH = std::string(SHADER_DIR) + "po
 // ============================================================================
 // Upload latent noise for a new seed  (CPU → staging → GPU via Vulkan copy)
 // ============================================================================
-
-void initialize_latents(unsigned int seed, size_t hidden_count, void* dest)
-{
-    nvtx3::scoped_range nvtx("initialize_latents");
-    std::cout << "\n=== Initializing Latent (seed=" << seed << ") ===" << std::endl;
-
-    initialize_latent(static_cast<float*>(dest), hidden_count, seed);
-}
 
 class OrtVulkanGraphicsInteropScope
 {
@@ -438,17 +432,23 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
                       VkCommandBuffer cmd_postprocess, ComputePipelineResources& euler_shader,
                       ComputePipelineResources& postprocess_shader, VulkanBuffer& hidden_states_buf,
                       VulkanBuffer& transformer_output_buf, VulkanBuffer& decoder_latent_buf, StagingBuffer& staging,
-                      bool encode_prompt)
+                      bool encode_prompt, Flux2Telemetry& telemetry)
 {
     nvtx3::scoped_range nvtx_pipeline("run_pipeline");
+
+    Ort::RunOptions transformer_options;
+    transformer_options.SetSyncStream(ort_stream);
+    transformer_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
 
     Ort::RunOptions run_options;
     run_options.SetSyncStream(ort_stream);
     run_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
 
     // --- Text Encoder ---
+    const int steps = static_cast<int>(time_schedule.size()) - 1;
     if (encode_prompt)
     {
+        telemetry.Begin("encode", &Flux2Timings::encode_ms);
         nvtx3::scoped_range nvtx("text_encoder");
         text_encoder_session.Run(run_options, text_encoder_io);
     }
@@ -482,7 +482,8 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
         sync_semaphore.wait_ort(ort_stream, timestep_done);
     }
 
-    for (int step = 0; step < FLOW_STEPS; ++step)
+    telemetry.Begin("denoise", &Flux2Timings::denoise_ms);
+    for (int step = 0; step < steps; ++step)
     {
         nvtx3::scoped_range nvtx_step("diffusion_step_" + std::to_string(step));
 
@@ -491,7 +492,7 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
 
         {
             nvtx3::scoped_range nvtx_transformer("transformer");
-            transformer_session.Run(run_options, transformer_io);
+            transformer_session.Run(transformer_options, transformer_io);
         }
 
         {
@@ -527,7 +528,7 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
-            if (step + 1 < FLOW_STEPS)
+            if (step + 1 < steps)
             {
                 vkCmdUpdateBuffer(cmd_euler[step], timestep_buf.buffer, 0, sizeof(float), &t_next);
             }
@@ -538,8 +539,10 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
             const uint64_t euler_done = sync_semaphore.submit_vulkan(vk, cmd_euler[step], transformer_done);
             sync_semaphore.wait_ort(ort_stream, euler_done);
         }
+        telemetry.Step(step + 1);
     }
 
+    telemetry.Begin("decode", &Flux2Timings::decode_ms);
     // --- Post-process Latents (Vulkan compute) ---
     {
         nvtx3::scoped_range nvtx_post("postprocess");
@@ -685,8 +688,8 @@ struct VkPipelineState
     Ort::Value decoded_image_tensor{nullptr};
 
     VkCommandPool command_pool = VK_NULL_HANDLE;
-    std::array<VkCommandBuffer, FLOW_STEPS> cmd_bufs_euler{};
-    std::array<VkCommandBuffer, FLOW_STEPS> cmd_bufs_time{};
+    std::vector<VkCommandBuffer> cmd_bufs_euler{};
+    std::vector<VkCommandBuffer> cmd_bufs_time{};
     VkCommandBuffer cmd_upload_lat = VK_NULL_HANDLE;
     VkCommandBuffer cmd_download = VK_NULL_HANDLE;
     VkCommandBuffer cmd_postprocess = VK_NULL_HANDLE;
@@ -697,6 +700,9 @@ struct VkPipelineState
     std::unique_ptr<Ort::IoBinding> transformer_io;
     std::unique_ptr<Ort::IoBinding> vae_decoder_io;
     std::vector<float> time_schedule;
+    Flux2LoadedModels loaded;
+    din::common::ModelProfile model_profile;
+    std::optional<std::string> applied_budget;
 };
 
 static void initialize_vk_state(VkPipelineState& state, const Flux2Config& config, Ort::ConstEpDevice trt_device)
@@ -705,14 +711,8 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
-    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config.model_dir, config.precision);
     state.use_cig = config.processing == Flux2ProcessingBackend::VkCig;
-    const Flux2ModelCachePaths cache_paths =
-        MakeFlux2ModelCachePaths(config.precision, state.use_cig ? "vk_cig" : "vk");
 
-    std::cout << "Model dir: " << model_paths.base_dir.string() << "\n"
-              << "CIG:       " << (state.use_cig ? "enabled" : "disabled") << "\n"
-              << std::endl;
 
     // -----------------------------------------------------------------
     // Init Vulkan
@@ -742,11 +742,6 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
     // Load ONNX models
     // -----------------------------------------------------------------
-    std::cout << "=== Loading ONNX Models ===" << std::endl;
-    auto nvtx_scope_load = nvtx3::start_range("load_onnx_models");
-    din::common::EpContextOptions ep_context;
-    ep_context.output_dir = config.ep_context_dir.string();
-    const std::string cache_dir = config.ep_cache_dir.string();
     std::vector<std::pair<std::string, std::string>> graphics_ep_options;
     if (state.use_cig)
     {
@@ -767,15 +762,9 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         // graphics_ep_options.emplace_back("nv_use_sync_gpu_allocator", "1");
     }
 
-    auto make_profile = [&](std::string cache_subpath)
-    {
-        din::common::ModelProfile profile;
-        profile.cache_subpath = std::move(cache_subpath);
-        profile.embed_ep_context = false;
-        profile.enable_cuda_graph = !state.use_cig;
-        profile.extra_ep_options = graphics_ep_options;
-        return profile;
-    };
+    state.model_profile.enable_cuda_graph = !state.use_cig;
+    state.model_profile.embed_ep_context = false;
+    state.model_profile.extra_ep_options = graphics_ep_options;
 
     // -----------------------------------------------------------------
     // Allocate tensors from Vulkan buffers imported through ORT's external
@@ -868,20 +857,6 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     state.bn_mean_buf = state.vk->createExternalBuffer(LATENT_CHANNELS * sizeof(float));
     state.bn_std_buf = state.vk->createExternalBuffer(LATENT_CHANNELS * sizeof(float));
 
-    {
-        VkCommandBuffer cmd = state.vk->beginCommandBuffer(state.command_pool);
-        memcpy(state.staging.mapped, BN_MEAN, LATENT_CHANNELS * sizeof(float));
-        VkBufferCopy region = {0, 0, state.bn_mean_buf.size};
-        vkCmdCopyBuffer(cmd, state.staging.buffer, state.bn_mean_buf.buffer, 1, &region);
-        state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
-    }
-    {
-        VkCommandBuffer cmd = state.vk->beginCommandBuffer(state.command_pool);
-        memcpy(state.staging.mapped, BN_STD, LATENT_CHANNELS * sizeof(float));
-        VkBufferCopy region = {0, 0, state.bn_std_buf.size};
-        vkCmdCopyBuffer(cmd, state.staging.buffer, state.bn_std_buf.buffer, 1, &region);
-        state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
-    }
 
     state.postprocess_shader =
         loadComputeShader(POSTPROCESS_SHADER_PATH, *state.vk, sizeof(PostprocessPushConstants),
@@ -901,31 +876,21 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
 
     // Sessions are intentionally last: their CIG context sees the fully initialized importer,
     // external queue, shared buffers, and timeline semaphore.
-    state.text_encoder_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, model_paths.text_encoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.text_encoder), &*state.sync_stream);
-    std::cout << "  Text encoder loaded" << std::endl;
-
-    state.transformer_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, model_paths.transformer_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.transformer), &*state.sync_stream);
-    std::cout << "  Transformer loaded" << std::endl;
-
-    state.vae_decoder_runner = std::make_unique<din::common::OrtRunner>(
-        state.env, model_paths.vae_decoder_model.string(), "trt-rtx", cache_dir, ep_context,
-        make_profile(cache_paths.vae_decoder), &*state.sync_stream);
-    std::cout << "  VAE decoder loaded" << std::endl;
-    nvtx3::end_range(nvtx_scope_load);
 
     // -----------------------------------------------------------------
     // Persistent command buffers (pool already created above)
     // -----------------------------------------------------------------
 
     // Euler sampler
-    state.vk->device.allocateCommandBuffers(state.command_pool, FLOW_STEPS, state.cmd_bufs_euler.data());
+    // Reserve all supported steps so changing the schedule needs no model reload
+    // or command-buffer allocation while generation is in progress.
+    constexpr unsigned int max_steps = 50;
+    state.cmd_bufs_euler.resize(max_steps);
+    state.cmd_bufs_time.resize(max_steps);
+    state.vk->device.allocateCommandBuffers(state.command_pool, max_steps, state.cmd_bufs_euler.data());
 
     // Time scheduler
-    state.vk->device.allocateCommandBuffers(state.command_pool, FLOW_STEPS, state.cmd_bufs_time.data());
+    state.vk->device.allocateCommandBuffers(state.command_pool, max_steps, state.cmd_bufs_time.data());
 
     VkCommandBuffer cmd_bufs[3];
     state.vk->device.allocateCommandBuffers(state.command_pool, 3, cmd_bufs);
@@ -938,22 +903,6 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
     // Create persistent IoBindings (all GPU tensors, reused every run)
     // -----------------------------------------------------------------
-    state.text_encoder_io = std::make_unique<Ort::IoBinding>(state.text_encoder_runner->session);
-    state.text_encoder_io->BindInput("input_ids", state.token_tensor);
-    state.text_encoder_io->BindInput("attention_mask", state.attention_mask_tensor);
-    state.text_encoder_io->BindOutput("prompt_embeds", state.text_encoder_embeds_tensor);
-
-    state.transformer_io = std::make_unique<Ort::IoBinding>(state.transformer_runner->session);
-    state.transformer_io->BindInput("hidden_states", state.hidden_states_tensor);
-    state.transformer_io->BindInput("encoder_hidden_states", state.text_encoder_embeds_tensor);
-    state.transformer_io->BindInput("timestep", state.timestep_tensor);
-    state.transformer_io->BindInput("img_ids", state.img_ids_tensor);
-    state.transformer_io->BindInput("txt_ids", state.txt_ids_tensor);
-    state.transformer_io->BindOutput("sample", state.transformer_output_tensor);
-
-    state.vae_decoder_io = std::make_unique<Ort::IoBinding>(state.vae_decoder_runner->session);
-    state.vae_decoder_io->BindInput("latent_sample", state.decoder_input_tensor);
-    state.vae_decoder_io->BindOutput("sample", state.decoded_image_tensor);
 
     // -----------------------------------------------------------------
     // One-time upload: position IDs (via staging buffer)
@@ -1001,55 +950,100 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     }
 
     // -----------------------------------------------------------------
-    // Time schedule (computed once, constant across images)
+    // Initial time schedule; generation options can replace it per image.
     // -----------------------------------------------------------------
-    constexpr double MU = 2.291179894115571;
-    state.time_schedule.resize(FLOW_STEPS + 1);
-    for (int i = 0; i <= FLOW_STEPS; ++i)
-    {
-        double t = T_START - (T_START - T_END) * static_cast<double>(i) / FLOW_STEPS;
-        state.time_schedule[i] = static_cast<float>(std::exp(MU) / (std::exp(MU) + std::pow(1.0 / t - 1.0, 1.0)));
-        std::cout << "  sigma[" << i << "] = " << state.time_schedule[i] << std::endl;
-    }
+    state.time_schedule = MakeFlux2Schedule(config.steps);
 
     // -----------------------------------------------------------------
     // Load prompt tokens & upload to GPU (once for all images)
     // -----------------------------------------------------------------
-    std::cout << "\n=== Tokenizing Prompt ===" << std::endl;
-    {
-        nvtx3::scoped_range nvtx("tokenize");
-
-        const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config.prompt);
-
-        std::vector<int64_t> tokens_cpu(shape_numel(token_shape));
-        std::vector<int64_t> attn_mask_cpu(shape_numel(attn_mask_shape));
-        FillTextEncoderInputs(text_inputs.token_ids, text_inputs.pad_token_id, tokens_cpu.data(), attn_mask_cpu.data(),
-                              BATCH_SIZE, SEQUENCE_LENGTH);
-
-        memcpy(state.staging.mapped, tokens_cpu.data(), state.token_buf.size);
-        VkCommandBuffer cmd = state.vk->beginCommandBuffer(state.command_pool);
-        VkBufferCopy region = {0, 0, state.token_buf.size};
-        vkCmdCopyBuffer(cmd, state.staging.buffer, state.token_buf.buffer, 1, &region);
-        state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
-
-        memcpy(state.staging.mapped, attn_mask_cpu.data(), state.attn_mask_buf.size);
-        cmd = state.vk->beginCommandBuffer(state.command_pool);
-        region = {0, 0, state.attn_mask_buf.size};
-        vkCmdCopyBuffer(cmd, state.staging.buffer, state.attn_mask_buf.buffer, 1, &region);
-        state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
-    }
 }
 
-static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed)
+static void upload_vk_prompt(VkPipelineState& state, const Flux2Config& config)
 {
-    initialize_latent(static_cast<float*>(state.staging.mapped), state.hidden_count, seed);
+    const Flux2ModelPaths model_paths =
+        MakeFlux2ModelPaths(config);
+    const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config.prompt);
+    std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
+    std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
+    FillTextEncoderInputs(text_inputs.token_ids, text_inputs.pad_token_id, tokens_cpu.data(), attn_mask_cpu.data(),
+                          BATCH_SIZE, SEQUENCE_LENGTH);
+
+    memcpy(state.staging.mapped, tokens_cpu.data(), state.token_buf.size);
+    VkCommandBuffer cmd = state.vk->beginCommandBuffer(state.command_pool);
+    VkBufferCopy region = {0, 0, state.token_buf.size};
+    vkCmdCopyBuffer(cmd, state.staging.buffer, state.token_buf.buffer, 1, &region);
+    state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
+
+    memcpy(state.staging.mapped, attn_mask_cpu.data(), state.attn_mask_buf.size);
+    cmd = state.vk->beginCommandBuffer(state.command_pool);
+    region = {0, 0, state.attn_mask_buf.size};
+    vkCmdCopyBuffer(cmd, state.staging.buffer, state.attn_mask_buf.buffer, 1, &region);
+    state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
+}
+
+static void update_vk_models(VkPipelineState& state, const Flux2Config& config)
+{
+    if (!state.loaded.Matches(config))
+    {
+        signal_and_wait_on_host(*state.sync_stream);
+        VK_CHECK(vkDeviceWaitIdle(state.vk->device.raw()));
+    }
+    const char* provider = config.provider == Flux2ExecutionProvider::Cpu ? "cpu" : "trt-rtx";
+    Ort::SyncStream* stream = &*state.sync_stream;
+    if (state.loaded.text_encoder != config.text_encoder) state.prompt_embeds_valid = false;
+    ReloadFlux2Stage("text encoder", config.text_encoder, state.loaded.text_encoder,
+        state.text_encoder_runner, state.text_encoder_io, state.env, provider, stream, state.model_profile,
+        [&](Ort::Session& session)
+        {
+            auto binding = BindFlux2Model(session, {{"input_ids", &state.token_tensor}, {"attention_mask", &state.attention_mask_tensor}}, {{"prompt_embeds", &state.text_encoder_embeds_tensor}});
+            upload_vk_prompt(state, config);
+            return binding;
+        });
+    auto transformer_profile = state.model_profile;
+    if (!config.transformer.initial_weight_streaming_budget.empty())
+        transformer_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
+                                                          config.transformer.initial_weight_streaming_budget);
+    if (ReloadFlux2Stage("transformer", config.transformer, state.loaded.transformer,
+        state.transformer_runner, state.transformer_io, state.env, provider, stream, transformer_profile,
+        [&](Ort::Session& session) { return BindFlux2Model(session, {{"hidden_states", &state.hidden_states_tensor}, {"encoder_hidden_states", &state.text_encoder_embeds_tensor}, {"timestep", &state.timestep_tensor}, {"img_ids", &state.img_ids_tensor}, {"txt_ids", &state.txt_ids_tensor}}, {{"sample", &state.transformer_output_tensor}}); }))
+        state.applied_budget.reset();
+    ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io,
+        state.env, provider, stream, state.model_profile, [&](Ort::Session& session)
+        {
+            auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_input_tensor}}, {{"sample", &state.decoded_image_tensor}});
+            const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
+            for (const auto& upload : {std::pair{&state.bn_mean_buf, stats.mean.data()},
+                                       std::pair{&state.bn_std_buf, stats.std.data()}})
+            {
+                memcpy(state.staging.mapped, upload.second, upload.first->size);
+                const auto cmd = state.vk->beginCommandBuffer(state.command_pool);
+                VkBufferCopy region = {0, 0, upload.first->size};
+                vkCmdCopyBuffer(cmd, state.staging.buffer, upload.first->buffer, 1, &region);
+                state.vk->endAndSubmitCommandBuffer(cmd, state.command_pool);
+            }
+            return binding;
+        });
+}
+
+static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed, din::common::Rng rng, const Flux2Progress& progress)
+{
+    Flux2Telemetry telemetry(static_cast<int>(state.time_schedule.size()) - 1, progress,
+                             [&]
+                             {
+                                 signal_and_wait_on_host(*state.sync_stream);
+                                 VK_CHECK(vkQueueWaitIdle(state.vk->queue));
+                             });
+    initialize_cpu_latent(static_cast<float*>(state.staging.mapped), state.hidden_count, seed, rng,
+                          BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH);
 
     const uint64_t vae_done = run_pipeline(
         state.text_encoder_runner->session, state.transformer_runner->session, state.vae_decoder_runner->session,
         *state.text_encoder_io, *state.transformer_io, *state.vae_decoder_io, state.time_schedule, state.timestep_buf,
         *state.vk, *state.sync_semaphore, *state.sync_stream, state.cmd_upload_lat, state.cmd_bufs_time.data(),
         state.cmd_bufs_euler.data(), state.cmd_postprocess, state.euler_shader, state.postprocess_shader,
-        state.hidden_states, state.transformer_output, state.decoder_latent, state.staging, !state.prompt_embeds_valid);
+        state.hidden_states, state.transformer_output, state.decoder_latent, state.staging, !state.prompt_embeds_valid,
+        telemetry);
     state.prompt_embeds_valid = true;
 
     vkResetCommandBuffer(state.cmd_download, 0);
@@ -1069,6 +1063,7 @@ static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed)
     image.width = static_cast<int>(IMAGE_WIDTH);
     image.data.resize(state.decoded_image_bytes / sizeof(float));
     std::copy_n(static_cast<const float*>(state.staging.mapped), image.data.size(), image.data.data());
+    image.timings = telemetry.Finish();
     return image;
 }
 
@@ -1085,15 +1080,32 @@ public:
     {
         if (state_)
         {
+            UpdateModels(config_);
             return;
         }
         std::cout << "Initializing Flux2 Vulkan pipeline" << std::endl;
         state_ = std::make_unique<VkPipelineState>(runtime_.env);
-        initialize_vk_state(*state_, config_, runtime_.trt_device);
+        try { initialize_vk_state(*state_, config_, runtime_.trt_device); }
+        catch (...) { state_.reset(); throw; }
+        UpdateModels(config_);
+    }
+
+    void UpdateModels(const Flux2Config& requested) override
+    {
+        if (!state_) throw std::runtime_error("Pipeline resources are not initialized");
+        if (requested.processing != config_.processing || requested.provider != config_.provider)
+            throw std::invalid_argument("Changing processing backend or provider requires a new pipeline");
+        // Keep the previous prompt until SetPrompt decides whether embeddings can be reused.
+        const auto previous_prompt = config_.prompt;
+        config_ = requested;
+        config_.prompt = previous_prompt;
+        update_vk_models(*state_, requested);
     }
 
     void SetPrompt(std::string prompt) override
     {
+        if (state_ && state_->prompt_embeds_valid && config_.prompt == prompt)
+            return;
         config_.prompt = std::move(prompt);
         if (!state_)
         {
@@ -1101,33 +1113,44 @@ public:
         }
         state_->prompt_embeds_valid = false;
 
-        const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config_.model_dir, config_.precision);
-        const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config_.prompt);
-        std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
-        std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
-        FillTextEncoderInputs(text_inputs.token_ids, text_inputs.pad_token_id, tokens_cpu.data(), attn_mask_cpu.data(),
-                              BATCH_SIZE, SEQUENCE_LENGTH);
-
-        memcpy(state_->staging.mapped, tokens_cpu.data(), state_->token_buf.size);
-        VkCommandBuffer cmd = state_->vk->beginCommandBuffer(state_->command_pool);
-        VkBufferCopy region = {0, 0, state_->token_buf.size};
-        vkCmdCopyBuffer(cmd, state_->staging.buffer, state_->token_buf.buffer, 1, &region);
-        state_->vk->endAndSubmitCommandBuffer(cmd, state_->command_pool);
-
-        memcpy(state_->staging.mapped, attn_mask_cpu.data(), state_->attn_mask_buf.size);
-        cmd = state_->vk->beginCommandBuffer(state_->command_pool);
-        region = {0, 0, state_->attn_mask_buf.size};
-        vkCmdCopyBuffer(cmd, state_->staging.buffer, state_->attn_mask_buf.buffer, 1, &region);
-        state_->vk->endAndSubmitCommandBuffer(cmd, state_->command_pool);
+        upload_vk_prompt(*state_, config_);
     }
 
-    Flux2Image GenerateImage(unsigned int seed) override
+    const void* TransformerSessionIdentity() const override
     {
-        if (!state_)
+        return state_ && state_->transformer_runner ? static_cast<OrtSession*>(state_->transformer_runner->session) : nullptr;
+    }
+
+    const void* TextEncoderSessionIdentity() const override
+    {
+        return state_ && state_->text_encoder_runner ? static_cast<OrtSession*>(state_->text_encoder_runner->session) : nullptr;
+    }
+
+    const void* VaeSessionIdentity() const override
+    {
+        return state_ && state_->vae_decoder_runner ? static_cast<OrtSession*>(state_->vae_decoder_runner->session) : nullptr;
+    }
+
+    Flux2Image GenerateImage(unsigned int seed, const Flux2Progress& progress,
+                             const Flux2GenerationOptions& options) override
+    {
+        if (!state_ || !state_->loaded.Ready())
         {
             throw std::runtime_error("Flux2 Vulkan pipeline was not initialized");
         }
-        return run_vk_image(*state_, seed);
+        const din::common::Rng rng = options.rng.value_or(config_.rng);
+        ValidateFlux2Rng(rng, config_.processing);
+        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps));
+        const std::string budget = options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
+        const std::string& previous = state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
+        if (budget != previous)
+        {
+            const char* keys[] = {"nv_weight_streaming_budget"};
+            const char* values[] = {budget.c_str()};
+            state_->transformer_runner->session.SetEpDynamicOptions(keys, values, 1);
+            state_->applied_budget = budget;
+        }
+        return run_vk_image(*state_, seed, rng, progress);
     }
 
 private:

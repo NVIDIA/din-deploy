@@ -42,6 +42,14 @@ OrtFileString toOrtFileString(const std::filesystem::path& path);
 std::filesystem::path get_executable_path();
 std::filesystem::path get_executable_parent_path();
 
+struct Flux2LatentStats
+{
+    std::vector<float> mean;
+    std::vector<float> std;
+};
+
+Flux2LatentStats LoadFlux2LatentStats(const std::filesystem::path& path, size_t channels);
+
 void flush_ort_stream(Ort::SyncStream& stream);
 void copy_tensors(Ort::Env& env, std::initializer_list<Ort::Value*> src, std::initializer_list<Ort::Value*> dst,
                   Ort::SyncStream& stream);

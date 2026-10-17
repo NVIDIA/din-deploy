@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <cstdint>
 
 void launch_flux_euler_kernel(cudaStream_t stream, float t_curr, float t_next, size_t total_elements,
                               float* hidden_states, const float* transformer_output);
