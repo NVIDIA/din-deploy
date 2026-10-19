@@ -29,7 +29,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-DEFAULT_SNAPSHOT = Path("D:/hf/hub/models--Comfy-Org--SeedVR2/snapshots/673340c8a66db62b84e4099def7d01d337ae12dc")
+DEFAULT_REPO_ID = "Comfy-Org/SeedVR2"
 CONTEXT_TOKENS = 58
 CONTEXT_WIDTH = 5120
 LATENT_CHANNELS = 16
@@ -39,14 +39,20 @@ DIT_INPUT_NAMES = (
     "context",
     "condition",
     "normal_window_tgt_idx",
-    "normal_window_shape",
+    "normal_window_src_idx",
     "normal_concat_tgt_idx",
     "normal_concat_src_idx",
+    "normal_padded_flat_idx",
+    "normal_padded_gather_idx",
+    "normal_valid_keys",
     "normal_freqs",
     "shifted_window_tgt_idx",
-    "shifted_window_shape",
+    "shifted_window_src_idx",
     "shifted_concat_tgt_idx",
     "shifted_concat_src_idx",
+    "shifted_padded_flat_idx",
+    "shifted_padded_gather_idx",
+    "shifted_valid_keys",
     "shifted_freqs",
 )
 
@@ -56,17 +62,24 @@ class WindowMetadata:
     """Resolution-dependent tensors consumed by one DiT window configuration."""
 
     window_tgt_idx: torch.Tensor
+    window_src_idx: torch.Tensor
     window_shape: torch.Tensor
     concat_tgt_idx: torch.Tensor
     concat_src_idx: torch.Tensor
+    padded_flat_idx: torch.Tensor
+    padded_gather_idx: torch.Tensor
+    valid_keys: torch.Tensor
     freqs: torch.Tensor
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         return (
             self.window_tgt_idx,
-            self.window_shape,
+            self.window_src_idx,
             self.concat_tgt_idx,
             self.concat_src_idx,
+            self.padded_flat_idx,
+            self.padded_gather_idx,
+            self.valid_keys,
             self.freqs,
         )
 
@@ -138,6 +151,7 @@ def _generate_metadata_pack(
     partition, _, window_shape, window_count, _, _ = seedvr_model.window_idx(vid_shape, make_window)
     patched_tokens = patch_height * patch_width
     window_tgt_idx = partition(torch.arange(patched_tokens, device=device)).to(torch.long)
+    window_src_idx = torch.argsort(window_tgt_idx)
 
     vid_len = window_shape.prod(-1)
     txt_len = torch.tensor([text_length], device=device, dtype=torch.long)
@@ -147,15 +161,34 @@ def _generate_metadata_pack(
     concat_tgt_idx = concat(video_ids, text_ids).to(torch.long)
     concat_src_idx = torch.argsort(concat_tgt_idx)
 
+    lengths = (window_shape.prod(-1) + text_length).tolist()
+    max_length = max(lengths)
+    padded_flat_idx = []
+    padded_gather_idx = []
+    valid_keys = []
+    offset = 0
+    for window_index, length in enumerate(lengths):
+        padded_flat_idx.extend(window_index * max_length + position for position in range(length))
+        padded_gather_idx.extend(offset + position for position in range(length))
+        padded_gather_idx.extend(0 for _ in range(max_length - length))
+        valid_keys.append([True] * length + [False] * (max_length - length))
+        offset += length
+    if offset != concat_tgt_idx.numel():
+        raise RuntimeError("Padded attention metadata does not match packed attention length.")
+
     txt_shape = torch.full((window_shape.shape[0], 1), text_length, device=device, dtype=torch.long)
     vid_freqs, txt_freqs = attention.rope.get_freqs(window_shape, txt_shape)
     freqs = torch.cat([vid_freqs, txt_freqs], dim=0)
     freqs = torch.index_select(freqs, 0, concat_tgt_idx).to(device=device, dtype=dtype)
     return WindowMetadata(
         window_tgt_idx=window_tgt_idx,
+        window_src_idx=window_src_idx,
         window_shape=window_shape.to(device=device, dtype=torch.long),
         concat_tgt_idx=concat_tgt_idx,
         concat_src_idx=concat_src_idx,
+        padded_flat_idx=torch.tensor(padded_flat_idx, device=device, dtype=torch.long),
+        padded_gather_idx=torch.tensor(padded_gather_idx, device=device, dtype=torch.long),
+        valid_keys=torch.tensor(valid_keys, device=device, dtype=torch.bool),
         freqs=freqs,
     )
 
@@ -201,7 +234,10 @@ class SeedVRVaeEncoderExportWrapper(torch.nn.Module):
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         # The native VAE consumes raw [-1, 1] video in (B, C, T, H, W).
-        return self.vae.encode(image.mul(2.0).sub(1.0).unsqueeze(2))
+        # ComfyUI's VAE.encode then applies comfy_format_encoded.  Match that
+        # latent scaling before passing the result to the diffusion model.
+        from comfy.ldm.seedvr.constants import BYTEDANCE_VAE_SCALING_FACTOR
+        return self.vae.encode(image.mul(2.0).sub(1.0).unsqueeze(2)).mul(BYTEDANCE_VAE_SCALING_FACTOR)
 
 
 class SeedVRVaeDecoderExportWrapper(torch.nn.Module):
@@ -214,24 +250,33 @@ class SeedVRVaeDecoderExportWrapper(torch.nn.Module):
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         # The VAE returns raw (B, C, T, H, W).  This matches ComfyUI's VAE
         # output normalization, while leaving crop/postprocessing outside ONNX.
-        return self.vae.decode(latent).squeeze(2).add(1.0).div(2.0).clamp(0.0, 1.0)
-
-
-def _export_extend_head(tensor: torch.Tensor, times: int = 2, memory=None) -> torch.Tensor:
-    """Equivalent single-call VAE padding without a rank-dependent Tile shape."""
-    if memory is not None:
-        return torch.cat((memory.to(tensor), tensor), dim=2)
-    if times < 0:
-        raise ValueError(f"SeedVR2 VAE extend_head expected times >= 0, got {times}.")
-    if times == 0:
-        return tensor
-    return torch.cat((*([tensor[:, :, :1]] * times), tensor), dim=2)
+        image = self.vae.decode(latent).squeeze(2).add(1.0).div(2.0)
+        # Clamp only after spatial tile blending in the CUDA pipeline.
+        return image
 
 
 def _export_causal_conv_forward(self, input: torch.Tensor, memory_state=None, memory_cache=None) -> torch.Tensor:
-    """One-frame causal convolution expressed as a native padded Conv."""
+    """Fold repeated temporal slices into a spatial kernel for one-frame inputs."""
     del memory_state, memory_cache
-    input = _export_extend_head(input, times=self.temporal_padding * 2)
+    padded_frames = 1 + self.temporal_padding * 2
+    temporal_kernel_extent = 1 + (self.kernel_size[0] - 1) * self.dilation[0]
+    temporal_outputs = 1 + (padded_frames - temporal_kernel_extent) // self.stride[0]
+    if input.shape[2] == 1 and temporal_outputs == 1:
+        # The causal extension is [frame, ..., frame], so every temporal
+        # kernel slice sees the same frame. Precompute the spatial weight
+        # before export to avoid materializing the repeated-frame activation.
+        return torch.nn.functional.conv2d(
+            input[:, :, 0].float(),
+            self._folded_spatial_weight,
+            self.bias.float() if self.bias is not None else None,
+            self.stride[1:],
+            self.padding[1:],
+            self.dilation[1:],
+            self.groups,
+        ).to(input.dtype).unsqueeze(2)
+    from comfy.ldm.seedvr.vae import extend_head
+
+    input = extend_head(input, times=self.temporal_padding * 2)
     return torch.nn.functional.conv3d(
         input,
         self.weight,
@@ -243,20 +288,69 @@ def _export_causal_conv_forward(self, input: torch.Tensor, memory_state=None, me
     )
 
 
-@contextlib.contextmanager
-def trt_rtx_vae_export_patches():
-    """Keep ComfyUI unmodified while emitting a TensorRT-friendly VAE graph."""
-    import comfy.ldm.seedvr.vae as comfy_seedvr_vae
+def _export_causal_norm_wrapper(norm_layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Use the normal VAE norm path without a symbolic memory-size branch."""
+    input_dtype = x.dtype
+    if isinstance(norm_layer, (torch.nn.LayerNorm, torch.nn.RMSNorm)):
+        if x.ndim == 4:
+            return norm_layer(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).to(input_dtype)
+        if x.ndim == 5:
+            return norm_layer(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).to(input_dtype)
+    if isinstance(norm_layer, (torch.nn.GroupNorm, torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
+        if x.ndim <= 4:
+            return norm_layer(x).to(input_dtype)
+        if x.ndim == 5:
+            batch, channels, temporal, height, width = x.shape
+            x = x.transpose(1, 2).reshape(batch * temporal, channels, height, width)
+            x = norm_layer(x)
+            return x.reshape(batch, temporal, x.size(1), x.size(2), x.size(3)).transpose(1, 2).to(input_dtype)
+    raise TypeError(f"SeedVR2 VAE unsupported norm layer type: {type(norm_layer).__name__}")
 
-    original_extend_head = comfy_seedvr_vae.extend_head
+
+def _export_scaled_dot_product_attention(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args, **kwargs
+) -> torch.Tensor:
+    """Avoid ONNX Attention, which ONNX Runtime's TensorRT RTX EP cannot build."""
+    if args or kwargs.get("attn_mask") is not None or kwargs.get("dropout_p", 0.0) != 0.0 or kwargs.get("is_causal", False):
+        raise ValueError("The SeedVR2 VAE export expects unmasked, noncausal attention without dropout.")
+    scale = q.shape[-1] ** -0.5
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    return torch.matmul(torch.softmax(scores, dim=-1), v.float()).to(q.dtype)
+
+
+@contextlib.contextmanager
+def trt_rtx_vae_export_patches(vae: torch.nn.Module, *, decompose_attention: bool = False):
+    """Keep ComfyUI unmodified while exporting the folded VAE graph."""
+    import comfy.ldm.seedvr.vae as comfy_seedvr_vae
+    import comfy.ops as comfy_ops
+
     original_causal_conv_forward = comfy_seedvr_vae.InflatedCausalConv3d.forward
-    comfy_seedvr_vae.extend_head = _export_extend_head
+    original_causal_norm_wrapper = comfy_seedvr_vae.causal_norm_wrapper
+    original_scaled_dot_product_attention = comfy_ops.scaled_dot_product_attention
+    folded_modules = []
+    for module in vae.modules():
+        if isinstance(module, comfy_seedvr_vae.InflatedCausalConv3d):
+            if hasattr(module, "_folded_spatial_weight"):
+                raise RuntimeError("Temporary folded convolution weight already exists.")
+            module.register_buffer(
+                "_folded_spatial_weight",
+                module.weight.detach().float().sum(dim=2),
+                persistent=False,
+            )
+            folded_modules.append(module)
     comfy_seedvr_vae.InflatedCausalConv3d.forward = _export_causal_conv_forward
+    comfy_seedvr_vae.causal_norm_wrapper = _export_causal_norm_wrapper
+    if decompose_attention:
+        comfy_ops.scaled_dot_product_attention = _export_scaled_dot_product_attention
     try:
         yield
     finally:
+        for module in folded_modules:
+            delattr(module, "_folded_spatial_weight")
+        if decompose_attention:
+            comfy_ops.scaled_dot_product_attention = original_scaled_dot_product_attention
+        comfy_seedvr_vae.causal_norm_wrapper = original_causal_norm_wrapper
         comfy_seedvr_vae.InflatedCausalConv3d.forward = original_causal_conv_forward
-        comfy_seedvr_vae.extend_head = original_extend_head
 
 
 class SeedVRDiTExportAdapter(torch.nn.Module):
@@ -303,34 +397,27 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
-            lengths: torch.Tensor,
+            padded_flat_idx: torch.Tensor,
+            padded_gather_idx: torch.Tensor,
+            valid_keys: torch.Tensor,
     ) -> torch.Tensor:
-        """Exportable variable-length attention via padded batched matmuls."""
-        cumulative = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
-        total = q.shape[0]
-        sequence_starts = torch.zeros(total, device=q.device, dtype=torch.long)
-        sequence_starts = sequence_starts.index_fill(0, cumulative[1:-1], 1)
-        sequence_ids = sequence_starts.cumsum(0)
-        positions = torch.arange(total, device=q.device) - cumulative.index_select(0, sequence_ids)
-        max_length = lengths.max()
-        flat_indices = sequence_ids * max_length + positions
-
-        padded_shape = (lengths.shape[0] * max_length, q.shape[1], q.shape[2])
-        q_padded = q.new_zeros(padded_shape).index_copy(0, flat_indices, q)
-        k_padded = k.new_zeros(padded_shape).index_copy(0, flat_indices, k)
-        v_padded = v.new_zeros(padded_shape).index_copy(0, flat_indices, v)
-        batch_shape = (lengths.shape[0], max_length, q.shape[1], q.shape[2])
+        """Exportable variable-length attention with CPU-generated padding metadata."""
+        window_count, max_length = valid_keys.shape
+        padded_shape = (window_count * max_length, q.shape[1], q.shape[2])
+        q_padded = q.index_select(0, padded_gather_idx)
+        k_padded = k.index_select(0, padded_gather_idx)
+        v_padded = v.index_select(0, padded_gather_idx)
+        batch_shape = (window_count, max_length, q.shape[1], q.shape[2])
         q_padded = q_padded.reshape(batch_shape).transpose(1, 2)
         k_padded = k_padded.reshape(batch_shape).transpose(1, 2)
         v_padded = v_padded.reshape(batch_shape).transpose(1, 2)
 
         scale = q.shape[-1] ** -0.5
         scores = torch.matmul(q_padded.float(), k_padded.float().transpose(-2, -1)) * scale
-        valid_keys = torch.arange(max_length, device=q.device).unsqueeze(0) < lengths.unsqueeze(1)
         scores = scores.masked_fill(~valid_keys[:, None, None, :], torch.finfo(scores.dtype).min)
         output = torch.matmul(torch.softmax(scores, dim=-1), v_padded.float()).to(q.dtype)
         output = output.transpose(1, 2).reshape(padded_shape)
-        return output.index_select(0, flat_indices)
+        return output.index_select(0, padded_flat_idx)
 
     def _attention(
             self,
@@ -338,9 +425,12 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
             vid: torch.Tensor,
             txt: torch.Tensor,
             window_tgt_idx: torch.Tensor,
-            window_shape: torch.Tensor,
+            window_src_idx: torch.Tensor,
             concat_tgt_idx: torch.Tensor,
             concat_src_idx: torch.Tensor,
+            padded_flat_idx: torch.Tensor,
+            padded_gather_idx: torch.Tensor,
+            valid_keys: torch.Tensor,
             freqs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         vid_qkv, txt_qkv = attention.proj_qkv(vid, txt)
@@ -352,7 +442,7 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
         vid_q, txt_q = self._mm_rms_norm(attention.norm_q, vid_q, txt_q)
         vid_k, txt_k = self._mm_rms_norm(attention.norm_k, vid_k, txt_k)
 
-        window_count = window_shape.shape[0]
+        window_count = valid_keys.shape[0]
         txt_q = txt_q.repeat(window_count, 1, 1)
         txt_k = txt_k.repeat(window_count, 1, 1)
         txt_v = txt_v.repeat(window_count, 1, 1)
@@ -362,8 +452,7 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
         q = self._apply_rope(q, freqs)
         k = self._apply_rope(k, freqs)
 
-        lengths = window_shape.prod(-1) + CONTEXT_TOKENS
-        output = self._padded_attention(q, k, v, lengths)
+        output = self._padded_attention(q, k, v, padded_flat_idx, padded_gather_idx, valid_keys)
         output = torch.index_select(output, 0, concat_src_idx)
         video_tokens = window_tgt_idx.shape[0]
         vid_out = output[:video_tokens]
@@ -372,7 +461,7 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
         )
         vid_out = vid_out.flatten(1, 2)
         txt_out = txt_out.flatten(1, 2)
-        vid_out = torch.index_select(vid_out, 0, torch.argsort(window_tgt_idx))
+        vid_out = torch.index_select(vid_out, 0, window_src_idx)
         return attention.proj_out(vid_out, txt_out)
 
     def _block(
@@ -415,14 +504,20 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
             context: torch.Tensor,
             condition: torch.Tensor,
             normal_window_tgt_idx: torch.Tensor,
-            normal_window_shape: torch.Tensor,
+            normal_window_src_idx: torch.Tensor,
             normal_concat_tgt_idx: torch.Tensor,
             normal_concat_src_idx: torch.Tensor,
+            normal_padded_flat_idx: torch.Tensor,
+            normal_padded_gather_idx: torch.Tensor,
+            normal_valid_keys: torch.Tensor,
             normal_freqs: torch.Tensor,
             shifted_window_tgt_idx: torch.Tensor,
-            shifted_window_shape: torch.Tensor,
+            shifted_window_src_idx: torch.Tensor,
             shifted_concat_tgt_idx: torch.Tensor,
             shifted_concat_src_idx: torch.Tensor,
+            shifted_padded_flat_idx: torch.Tensor,
+            shifted_padded_gather_idx: torch.Tensor,
+            shifted_valid_keys: torch.Tensor,
             shifted_freqs: torch.Tensor,
     ) -> torch.Tensor:
         model = self.diffusion_model
@@ -447,16 +542,22 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
 
         normal = (
             normal_window_tgt_idx,
-            normal_window_shape,
+            normal_window_src_idx,
             normal_concat_tgt_idx,
             normal_concat_src_idx,
+            normal_padded_flat_idx,
+            normal_padded_gather_idx,
+            normal_valid_keys,
             normal_freqs,
         )
         shifted = (
             shifted_window_tgt_idx,
-            shifted_window_shape,
+            shifted_window_src_idx,
             shifted_concat_tgt_idx,
             shifted_concat_src_idx,
+            shifted_padded_flat_idx,
+            shifted_padded_gather_idx,
+            shifted_valid_keys,
             shifted_freqs,
         )
         from comfy.ldm.seedvr.model import Cache
@@ -544,22 +645,11 @@ def dynamic_dit_shapes() -> tuple[object, ...]:
     latent_width = 2 * torch.export.Dim("latent_width", min=1, max=2048)
     spatial = {3: latent_height, 4: latent_width}
     auto = torch.export.Dim.AUTO
-    return (
-        spatial,
-        None,
-        None,
-        spatial,
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
-        {0: auto},
+    metadata_shapes = tuple(
+        {0: auto, 1: auto} if name.endswith("_valid_keys") else {0: auto}
+        for name in DIT_INPUT_NAMES[4:]
     )
+    return (spatial, None, None, spatial, *metadata_shapes)
 
 
 def dit_inputs_with_metadata(
@@ -604,8 +694,12 @@ def validate_metadata_shapes(diffusion_model: torch.nn.Module, device: torch.dev
         for pack in (normal, shifted):
             if pack.window_tgt_idx.numel() != expected_tokens:
                 raise RuntimeError(f"Metadata for {height}x{width} has an invalid video token count.")
+            if pack.window_src_idx.numel() != expected_tokens:
+                raise RuntimeError(f"Metadata for {height}x{width} has an invalid inverse token count.")
             if pack.concat_tgt_idx.numel() != pack.freqs.shape[0]:
                 raise RuntimeError(f"Metadata for {height}x{width} has mismatched attention/frequency lengths.")
+            if pack.padded_flat_idx.numel() != pack.concat_tgt_idx.numel():
+                raise RuntimeError(f"Metadata for {height}x{width} has mismatched padded attention length.")
         observations.append(
             (
                 height,
@@ -641,7 +735,7 @@ def export_onnx(
         str(output_path),
         input_names=input_names,
         output_names=output_names,
-        opset_version=22 if dynamo else 20,
+        opset_version=23,
         dynamo=dynamo,
         external_data=True,
         dynamic_shapes=dynamic_shapes,
@@ -654,6 +748,25 @@ def export_onnx(
     )
 
 
+def name_dynamic_dit_dimensions(output_path: Path) -> None:
+    """Give ORT's free-dimension overrides names stable across PyTorch exports."""
+    import onnx
+
+    model = onnx.load(str(output_path), load_external_data=False)
+    names = {}
+    for value in model.graph.input:
+        for axis, dimension in enumerate(value.type.tensor_type.shape.dim):
+            if dimension.dim_param:
+                names.setdefault(dimension.dim_param, f"{value.name}_dim{axis}")
+    for value in (*model.graph.input, *model.graph.output, *model.graph.value_info):
+        for dimension in value.type.tensor_type.shape.dim:
+            if dimension.dim_param in names:
+                dimension.dim_param = names[dimension.dim_param]
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    onnx.save_model(model, str(temporary))
+    temporary.replace(output_path)
+
+
 def capture_and_validate_exported_program(
         adapter: SeedVRDiTExportAdapter,
         diffusion_model: torch.nn.Module,
@@ -661,7 +774,8 @@ def capture_and_validate_exported_program(
         device: torch.device,
         dtype: torch.dtype,
 ) -> torch.export.ExportedProgram:
-    if inputs[5].shape[0] < 2 or inputs[10].shape[0] < 2:
+    if (inputs[DIT_INPUT_NAMES.index("normal_valid_keys")].shape[0] < 2 or
+            inputs[DIT_INPUT_NAMES.index("shifted_valid_keys")].shape[0] < 2):
         raise ValueError(
             "The DiT capture example must produce multiple normal and shifted windows; "
             "use the default 64x96 latent or a larger shape."
@@ -693,24 +807,30 @@ def export_vae_components(
         artifacts_dir: Path,
         export_encoder: bool,
         export_decoder: bool,
+        decompose_attention: bool = False,
 ) -> None:
     if image_height < 16 or image_width < 16 or image_height % 16 or image_width % 16:
         raise ValueError("--image-height and --image-width must be multiples of 16 and at least 16.")
-    image = torch.randn(1, 3, image_height, image_width, device=device, dtype=dtype)
-    latent = torch.randn(1, LATENT_CHANNELS, image_height // 8, image_width // 8, device=device, dtype=dtype)
+    generator = torch.Generator(device=device).manual_seed(0)
+    image = torch.randn(1, 3, image_height, image_width, device=device, dtype=dtype, generator=generator)
+    latent = torch.randn(
+        1, LATENT_CHANNELS, image_height // 8, image_width // 8,
+        device=device, dtype=dtype, generator=generator,
+    )
     encoder = SeedVRVaeEncoderExportWrapper(vae).eval()
     decoder = SeedVRVaeDecoderExportWrapper(vae).eval()
     with torch.no_grad():
         expected_encoded = encoder(image)
         expected_decoded = decoder(latent)
-        with trt_rtx_vae_export_patches():
+        with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
             actual_encoded = encoder(image)
             actual_decoded = decoder(latent)
-    torch.testing.assert_close(actual_encoded, expected_encoded, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(actual_decoded, expected_decoded, rtol=2e-3, atol=2e-3)
+    # Folding sums temporal weights before convolution and changes FP16 rounding.
+    torch.testing.assert_close(actual_encoded, expected_encoded, rtol=2e-3, atol=4e-3)
+    torch.testing.assert_close(actual_decoded, expected_decoded, rtol=2e-3, atol=4e-3)
     print("TensorRT RTX VAE export patch passed eager parity.")
     if export_encoder:
-        with trt_rtx_vae_export_patches():
+        with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
             export_onnx(
                 encoder,
                 (image,),
@@ -718,16 +838,15 @@ def export_vae_components(
                 artifacts_dir / "vae_encoder",
                 ("image",),
                 ("latent",),
-                dynamic_axes={
-                    "image": {2: "image_height", 3: "image_width"},
-                    "latent": {2: "latent_height", 3: "latent_width"},
-                },
-                dynamo=False,
+                dynamic_shapes=({
+                    2: 16 * torch.export.Dim("image_height_units", min=1),
+                    3: 16 * torch.export.Dim("image_width_units", min=1),
+                },),
             )
         print(f"Exported dynamic SeedVR VAE encoder: {encoder_output}")
         validate_vae_onnx(encoder_output, "image", "latent")
     if export_decoder:
-        with trt_rtx_vae_export_patches():
+        with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
             export_onnx(
                 decoder,
                 (latent,),
@@ -735,11 +854,10 @@ def export_vae_components(
                 artifacts_dir / "vae_decoder",
                 ("latent",),
                 ("image",),
-                dynamic_axes={
-                    "latent": {2: "latent_height", 3: "latent_width"},
-                    "image": {2: "image_height", 3: "image_width"},
-                },
-                dynamo=False,
+                dynamic_shapes=({
+                    2: 2 * torch.export.Dim("latent_height_units", min=1),
+                    3: 2 * torch.export.Dim("latent_width_units", min=1),
+                },),
             )
         print(f"Exported dynamic SeedVR VAE decoder: {decoder_output}")
         validate_vae_onnx(decoder_output, "latent", "image")
@@ -752,6 +870,8 @@ def validate_onnx(output_path: Path) -> None:
     # limit.  Passing the path lets ONNX validate the adjacent .data file.
     onnx.checker.check_model(str(output_path))
     model = onnx.load(str(output_path), load_external_data=False)
+    if not any(item.domain == "" and item.version == 23 for item in model.opset_import):
+        raise RuntimeError(f"{output_path} is not an ONNX opset 23 model.")
     tensor_inputs = {value.name: value for value in model.graph.input}
     if set(tensor_inputs) != set(DIT_INPUT_NAMES):
         raise RuntimeError(f"Expected inputs {DIT_INPUT_NAMES}, found {tuple(tensor_inputs)}.")
@@ -783,7 +903,9 @@ def validate_vae_onnx(output_path: Path, input_name: str, output_name: str) -> N
     import onnx
 
     model = onnx.load(str(output_path), load_external_data=False)
-    onnx.checker.check_model(model)
+    if not any(item.domain == "" and item.version == 23 for item in model.opset_import):
+        raise RuntimeError(f"{output_path} is not an ONNX opset 23 model.")
+    onnx.checker.check_model(str(output_path))
     values = {value.name: value for value in (*model.graph.input, *model.graph.output)}
     for name in (input_name, output_name):
         if name not in values:
@@ -805,8 +927,9 @@ def export_positive_context(diffusion_model: torch.nn.Module, output_path: Path)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export the ComfyUI SeedVR2 VAE and DiT to dynamic-H/W ONNX.")
-    parser.add_argument("--comfy-root", default="D:/repos/ComfyUI")
-    parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
+    parser.add_argument("--comfy-root", default="out/seedvr/ComfyUI")
+    parser.add_argument("--snapshot", type=Path, default=None,
+                        help="Optional local checkpoint snapshot; otherwise download from Hugging Face's global cache.")
     parser.add_argument(
         "--model", type=Path, default=None, help="Defaults to seedvr2_3b_fp16.safetensors in --snapshot."
     )
@@ -820,11 +943,13 @@ def parse_args() -> argparse.Namespace:
         default=("vae_encoder", "vae_decoder", "dit"),
         help="Components to export; VAE components can be exported independently of the DiT.",
     )
-    parser.add_argument("--output", type=Path, default=Path("out/seedvr/onnx/seedvr2_3b_fp16_dit.onnx"))
+    parser.add_argument("--output", type=Path, default=Path("models/SeedVR2-3B-onnx/seedvr2_3b_fp16_dit.onnx"))
     parser.add_argument("--vae-encoder-output", type=Path, default=None)
     parser.add_argument("--vae-decoder-output", type=Path, default=None)
     parser.add_argument("--positive-context-output", type=Path, default=None)
-    parser.add_argument("--artifacts-dir", type=Path, default=Path("out/seedvr/onnx/export-artifacts"))
+    parser.add_argument("--decompose-vae-attention", action="store_true",
+                        help="Export VAE attention as matmul/softmax for ONNX Runtime TensorRT RTX compatibility; default: native ONNX Attention.")
+    parser.add_argument("--artifacts-dir", type=Path, default=Path("out/seedvr/export-artifacts"))
     parser.add_argument("--temporal", type=int, default=1, help="Example latent temporal length.")
     parser.add_argument("--latent-height", type=int, default=64, help="Even multi-window example latent height.")
     parser.add_argument("--latent-width", type=int, default=96, help="Even multi-window example latent width.")
@@ -843,8 +968,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     add_comfyui_to_path(args.comfy_root)
-    model_path = args.model or args.snapshot / "diffusion_models" / "seedvr2_3b_fp16.safetensors"
-    vae_path = args.vae or args.snapshot / "vae" / "seedvr2_ema_vae_fp16.safetensors"
+    components = set(args.components)
+    snapshot = args.snapshot or Path()
+    if args.snapshot is None and (({"dit", "context"} & components and args.model is None) or
+                                  ({"vae_encoder", "vae_decoder"} & components and args.vae is None)):
+        from huggingface_hub import snapshot_download
+
+        patterns = []
+        if {"dit", "context"} & components and args.model is None:
+            patterns.append("diffusion_models/seedvr2_3b_fp16.safetensors")
+        if {"vae_encoder", "vae_decoder"} & components and args.vae is None:
+            patterns.append("vae/seedvr2_ema_vae_fp16.safetensors")
+        snapshot = Path(snapshot_download(repo_id=DEFAULT_REPO_ID, allow_patterns=patterns))
+    model_path = args.model or snapshot / "diffusion_models" / "seedvr2_3b_fp16.safetensors"
+    vae_path = args.vae or snapshot / "vae" / "seedvr2_ema_vae_fp16.safetensors"
     # Preserve the Hugging Face snapshot symlink suffix for ComfyUI's
     # safetensors loader; .resolve() would yield an extensionless blob path.
     model_path = model_path.expanduser().absolute()
@@ -862,7 +999,6 @@ def main() -> None:
         .absolute()
     )
 
-    components = set(args.components)
     if {"vae_encoder", "vae_decoder"} & components:
         print(f"Loading SeedVR VAE: {vae_path}")
         vae, device, dtype = load_vae_model(vae_path)
@@ -878,6 +1014,7 @@ def main() -> None:
             artifacts_dir,
             export_encoder="vae_encoder" in components,
             export_decoder="vae_decoder" in components,
+            decompose_attention=args.decompose_vae_attention,
         )
     if {"dit", "context"} & components:
         print(f"Loading SeedVR diffusion model: {model_path}")
@@ -904,6 +1041,7 @@ def main() -> None:
             ("denoised_latent",),
             dynamic_dit_shapes(),
         )
+        name_dynamic_dit_dimensions(output_path)
         print(f"Exported dynamic SeedVR DiT: {output_path}")
         if not args.skip_validation:
             validate_onnx(output_path)

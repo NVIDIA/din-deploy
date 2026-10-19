@@ -838,6 +838,10 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
             [[maybe_unused]] din::common::nvtx_scoped_range range{"load_or_compile_ep_context"};
             session_model_path = CompileEpContextModel(env, model_path, cache_dir, ep_context, profile);
         }
+        for (const auto& [name, value] : profile.free_dimension_overrides)
+        {
+            options_.AddFreeDimensionOverrideByName(name.c_str(), value);
+        }
         AppendTensorRTRTXEP(env, options_, cache_dir, model_path, ep_context, profile, compute_stream);
     }
     else if (provider == "cpu")

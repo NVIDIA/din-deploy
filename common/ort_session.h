@@ -94,6 +94,8 @@ struct ModelProfile
     bool embed_ep_context = true;
     bool skip_compile = false;
     std::vector<std::pair<std::string, std::string>> extra_ep_options;
+    // Named ONNX symbolic dimensions fixed at session creation.
+    std::vector<std::pair<std::string, int64_t>> free_dimension_overrides;
 };
 
 class OrtRunner

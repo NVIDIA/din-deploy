@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from export_seedvr import (
     CONTEXT_TOKENS,
     CONTEXT_WIDTH,
-    DEFAULT_SNAPSHOT,
+    DEFAULT_REPO_ID,
     DIT_INPUT_NAMES,
     get_seedvr_metadata,
 )
@@ -82,6 +82,8 @@ def _numpy(tensor: torch.Tensor, dtype: np.dtype) -> np.ndarray:
         tensor = tensor.to(torch.float32)
     elif dtype == np.int64:
         tensor = tensor.to(torch.int64)
+    elif dtype == np.bool_:
+        tensor = tensor.to(torch.bool)
     return np.ascontiguousarray(tensor.to("cpu").numpy().astype(dtype, copy=False))
 
 
@@ -90,6 +92,7 @@ def _numpy_dtype(ort_type: str) -> np.dtype:
         "tensor(float16)": np.float16,
         "tensor(float)": np.float32,
         "tensor(int64)": np.int64,
+        "tensor(bool)": np.bool_,
     }[ort_type]
 
 
@@ -201,8 +204,18 @@ class SeedVRTrtRtxDenoiser(torch.nn.Module):
 
 
 def _checkpoint_paths(args: argparse.Namespace) -> tuple[Path, Path]:
-    model_path = args.model or args.snapshot / "diffusion_models" / "seedvr2_3b_fp16.safetensors"
-    vae_path = args.vae or args.snapshot / "vae" / "seedvr2_ema_vae_fp16.safetensors"
+    snapshot = args.snapshot
+    if snapshot is None and (args.model is None or args.vae is None):
+        from huggingface_hub import snapshot_download
+
+        patterns = []
+        if args.model is None:
+            patterns.append("diffusion_models/seedvr2_3b_fp16.safetensors")
+        if args.vae is None:
+            patterns.append("vae/seedvr2_ema_vae_fp16.safetensors")
+        snapshot = Path(snapshot_download(repo_id=DEFAULT_REPO_ID, allow_patterns=patterns, local_files_only=True))
+    model_path = args.model or snapshot / "diffusion_models" / "seedvr2_3b_fp16.safetensors"
+    vae_path = args.vae or snapshot / "vae" / "seedvr2_ema_vae_fp16.safetensors"
     return model_path.expanduser().absolute(), vae_path.expanduser().absolute()
 
 
@@ -371,17 +384,19 @@ def compare_images(reference: Image.Image, ort_image: Image.Image, output_dir: P
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify SeedVR2 ONNX against the ComfyUI PyTorch reference.")
-    parser.add_argument("--comfy-root", default="D:/repos/ComfyUI")
-    parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
+    parser.add_argument("--comfy-root", default="out/seedvr/ComfyUI")
+    parser.add_argument("--snapshot", type=Path, default=None,
+                        help="Checkpoint snapshot; default: use the global Hugging Face cache offline.")
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--vae", type=Path, default=None)
-    parser.add_argument("--onnx-dir", type=Path, default=Path("out/seedvr/onnx"))
+    parser.add_argument("--onnx-dir", type=Path, default=Path("models/SeedVR2-3B-onnx"))
     parser.add_argument("--output-dir", type=Path, default=Path("out/seedvr/verify"))
     parser.add_argument("--runtime-cache-dir", type=Path, default=Path("out/seedvr/trt_rtx_cache"))
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--scale", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--color-correction", choices=("none", "lab", "wavelet", "adain"), default="none")
+    parser.add_argument("--pytorch-only", action="store_true", help="Save the PyTorch result without running ONNX.")
     return parser.parse_args()
 
 
@@ -396,6 +411,9 @@ def main() -> None:
     reference_path = output_dir / "pytorch_output.png"
     reference.save(reference_path)
     print(f"[PyTorch] Saved {reference_path}")
+
+    if args.pytorch_only:
+        return
 
     ort_image = run_onnx_pipeline(args)
     ort_path = output_dir / "ort_output.png"
