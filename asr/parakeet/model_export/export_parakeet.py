@@ -81,6 +81,7 @@ def main() -> None:
     model = load_nemo_model(args.model, device=device, dtype=dtype)
     if args.local_window:
         model.change_attention_model("rel_pos_local_attn", [256, 256])
+        model.to(device=device, dtype=dtype)
     configure_encoder_sdpa(model.encoder)
     extend_encoder_positional_encoding(model, args.encoder_profile_frames)
     model.eval()
