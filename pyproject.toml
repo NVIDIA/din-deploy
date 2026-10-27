@@ -1,6 +1,6 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "nanobind", "setuptools>=69", "wheel"]
-build-backend = "scikit_build_core.build"
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "din-deploy"
@@ -20,8 +20,6 @@ dependencies = [
     "onnxscript",
     "safetensors",
     "tqdm",
-    "nanobind",
-    "matplotlib",
     "Pillow",
 ]
 
@@ -33,21 +31,10 @@ dev = [
 parakeet = [
     "nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/Speech.git@v3.0.0",
     "jiwer",
-    "librosa>=0.10.2",
-    "numba>=0.59",
-    "nvidia-modelopt",
-    "soundfile",
 ]
 nemotron = [
     "nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/Speech.git@v3.0.0",
-    "librosa>=0.10.2",
-    "numba>=0.59",
-    "PyYAML",
-    "sentencepiece",
-    "soundfile",
-]
-nemotron-reference = [
-    "nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/Speech.git@v3.0.0",
+    "jiwer",
 ]
 sam2 = [
     "av",
@@ -65,29 +52,14 @@ flux = [
     "transformers",
 ]
 
-[project.scripts]
-parakeet-tdt = "rnnt.parakeet_tdt.cli:main"
-nemotron-asr = "rnnt.nemotron_asr.cli:main"
-rnnt-quantize-encoder = "rnnt.validation.quantization:main"
-
-[tool.scikit-build]
-wheel.packages = [
-    "asr/rnnt/python/rnnt",
-]
-wheel.py-api = "cp312"
-
-[tool.scikit-build.cmake.define]
-DIN_ENABLE_PARAKEET_PYTHON_BINDINGS = "ON"
-DIN_ENABLE_NEMOTRON_PYTHON_BINDINGS = "ON"
-
-[tool.pytest.ini_options]
-testpaths = ["asr/rnnt/python/tests"]
-pythonpath = ["asr/rnnt/python", "asr/rnnt/python/tests", "vision/sam2/python"]
+# Python is used for model preparation; inference is provided by the C++ CLIs.
+[tool.setuptools]
+packages = []
 
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-src = ["asr/rnnt/python/rnnt", "asr/rnnt/python/tools", "asr/rnnt/python/tests", "vision/sam2/python"]
+src = ["asr/parakeet/model_export", "asr/nemotron/model_export", "common/model_export", "vision/sam2/python"]
 
 [tool.ruff.lint]
 select = [
@@ -109,4 +81,5 @@ indent-style = "space"
 line-ending = "auto"
 
 [tool.ruff.lint.per-file-ignores]
-"asr/rnnt/python/tools/*.py" = ["E402"]
+"asr/parakeet/model_export/*.py" = ["E402"]
+"asr/nemotron/model_export/*.py" = ["E402"]
