@@ -1,0 +1,6 @@
+add_executable(din_asr_cli_test test_asr_cli.cpp)
+target_link_libraries(din_asr_cli_test PRIVATE din_asr_common argparse nlohmann_json::nlohmann_json)
+if(DIN_BUILD_TESTING)
+    add_test(NAME din_asr_cli_test COMMAND din_asr_cli_test)
+    set_tests_properties(din_asr_cli_test PROPERTIES LABELS "unit")
+endif()

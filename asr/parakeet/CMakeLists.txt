@@ -1,0 +1,6 @@
+add_din_shared_library(din_asr_parakeet_tdt parakeet_tdt.cpp)
+target_include_directories(din_asr_parakeet_tdt PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(din_asr_parakeet_tdt PUBLIC din_asr_common din_common_ort din_common_io nlohmann_json::nlohmann_json)
+
+add_din_executable(din_asr_parakeet_tdt_cli main.cpp)
+target_link_libraries(din_asr_parakeet_tdt_cli PRIVATE din_asr_parakeet_tdt argparse)

@@ -18,6 +18,19 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
 jobs:
+  asr-validation:
+    name: ASR validation helpers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Test CLI validation helpers
+        run: |
+          python -m pip install pytest jiwer
+          python -m pytest -q tests/model_export
+
   clang-format:
     name: clang-format
     runs-on: ubuntu-24.04
@@ -77,6 +90,9 @@ jobs:
       - name: List registered CTest tests
         run: ctest --test-dir out/build/linux-x64 --build-config Release --show-only=human
 
+      - name: Run model-independent unit tests
+        run: ctest --test-dir out/build/linux-x64 --build-config Release --output-on-failure -L unit
+
       - name: Upload build output
         if: success()
         uses: actions/upload-artifact@v7
@@ -117,6 +133,9 @@ jobs:
 
       - name: List registered CTest tests
         run: ctest --test-dir out/build/linux-arm64 --build-config Release --show-only=human
+
+      - name: Run model-independent unit tests
+        run: ctest --test-dir out/build/linux-arm64 --build-config Release --output-on-failure -L unit
 
       - name: Upload build output
         if: success()
@@ -162,6 +181,9 @@ jobs:
 
       - name: List registered CTest tests
         run: ctest --test-dir out/build/windows-x64 --build-config Release --show-only=human
+
+      - name: Run model-independent unit tests
+        run: ctest --test-dir out/build/windows-x64 --build-config Release --output-on-failure -L unit
 
       - name: Upload build output
         if: success()
