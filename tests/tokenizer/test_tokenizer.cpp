@@ -273,11 +273,11 @@ std::string join(const std::vector<int64_t>& ids)
 
 // din::io::Tokenizer loads from a path, so each tokenizer.json is written to a temporary directory.
 int run_cases(const std::filesystem::path& dir, const char* name, const json& tokenizer_json,
-              const std::vector<Case>& cases)
+              const std::vector<Case>& cases, din::io::TokenizerFormat format = din::io::TokenizerFormat::Json)
 {
     const auto path = dir / name;
     std::ofstream(path, std::ios::binary) << tokenizer_json.dump();
-    const din::io::Tokenizer tokenizer(path.string(), din::io::TokenizerFormat::Json);
+    const din::io::Tokenizer tokenizer(path.string(), format);
     int failures = 0;
     for (const auto& test_case : cases)
     {
@@ -291,6 +291,38 @@ int run_cases(const std::filesystem::path& dir, const char* name, const json& to
         }
     }
     std::cout << name << ": " << (cases.size() - failures) << "/" << cases.size() << " cases match" << std::endl;
+    return failures;
+}
+
+// Added-token content is literal text, even when it resembles the byte-level alphabet.
+int check_byte_level_added_tokens(const std::filesystem::path& dir)
+{
+    auto tokenizer_json = byte_level_tokenizer();
+    auto& vocab = tokenizer_json["model"]["vocab"];
+    for (const auto& token : {std::string("中"), std::string("Ā"), std::string("<中>")})
+    {
+        const auto id = vocab.contains(token) ? vocab[token].get<int64_t>() : static_cast<int64_t>(vocab.size());
+        vocab[token] = id;
+        tokenizer_json["added_tokens"].push_back(added_token(id, token, token == "<中>"));
+    }
+    const auto path = dir / "byte_level_added_tokens.json";
+    std::ofstream(path, std::ios::binary) << tokenizer_json.dump();
+    const din::io::Tokenizer tokenizer(path.string(), din::io::TokenizerFormat::ByteBpeJson);
+    int failures = 0;
+    for (const std::string text : {"hello 中 world", "Ā", "hello <中> 中 Ā"})
+    {
+        const auto ids = tokenizer.Encode(text);
+        auto without_special = text;
+        const auto special = without_special.find("<中>");
+        if (special != std::string::npos)
+            without_special.erase(special, std::string("<中>").size());
+        if (tokenizer.Decode(ids, false) != text || tokenizer.Decode(ids, true) != without_special)
+        {
+            ++failures;
+            std::cerr << "FAIL added-token round trip: " << escape(text) << std::endl;
+        }
+    }
+    std::cout << "byte-level added-token round trips: " << (3 - failures) << "/3 cases match" << std::endl;
     return failures;
 }
 
@@ -329,6 +361,9 @@ int main()
         failures += run_cases(dir, "gemma_style.json", sentencepiece_tokenizer(false), kGemmaStyleCases);
         failures += run_cases(dir, "llama_style.json", sentencepiece_tokenizer(true), kLlamaStyleCases);
         failures += run_cases(dir, "byte_level.json", byte_level_tokenizer(), kByteLevelCases);
+        failures += run_cases(dir, "qwen_byte_level.json", byte_level_tokenizer(), kByteLevelCases,
+                              din::io::TokenizerFormat::ByteBpeJson);
+        failures += check_byte_level_added_tokens(dir);
         failures += check_unsupported_normalizer_rejected(dir);
         std::filesystem::remove_all(dir);
         return failures == 0 ? 0 : 1;

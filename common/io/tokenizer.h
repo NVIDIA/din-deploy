@@ -17,6 +17,7 @@ enum class TokenizerFormat
     Json,
     Vocab,
     WhisperJson,
+    ByteBpeJson,  // Qwen byte-level decoding and Unicode encoding.
 };
 
 inline constexpr int64_t kWhisperEndOfText = 50257;
@@ -48,6 +49,7 @@ private:
     enum class DecodeMode
     {
         Pieces,
+        ByteBpe,
         WhisperByteBpe,
     };
 
@@ -78,11 +80,11 @@ private:
     std::unordered_map<std::string, int32_t> bpe_ranks_;
     std::array<std::string, 256> byte_encoder_;
     std::vector<std::string> special_tokens_;
+    std::vector<std::string> added_tokens_;
+    bool normalize_nfc_ = false;
     std::vector<std::string> lang_codes_;
     DecodeMode decode_mode_ = DecodeMode::Pieces;
     EncodeMode encode_mode_ = EncodeMode::ByteLevelBpe;
-    // SentencePieceBpe only: all added tokens (special or not), longest first, split before BPE.
-    std::vector<std::string> added_tokens_;
     std::vector<NormalizerStep> normalizer_;
     bool byte_fallback_ = false;
     int64_t unk_id_ = -1;

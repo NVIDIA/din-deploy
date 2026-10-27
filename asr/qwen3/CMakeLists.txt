@@ -1,0 +1,17 @@
+# Independent ASR and forced-alignment APIs, sharing the model runtime.
+add_din_shared_library(din_asr_qwen3 STATIC qwen3.cpp forced_aligner.cpp)
+target_include_directories(din_asr_qwen3 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(din_asr_qwen3 PUBLIC din_common_ort din_common_io nlohmann_json::nlohmann_json)
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    target_link_libraries(din_asr_qwen3 PRIVATE CUDA::cudart)
+    target_compile_definitions(din_asr_qwen3 PRIVATE DIN_QWEN3_CUDA=1)
+endif()
+add_din_executable(din_asr_qwen3_cli main.cpp)
+target_link_libraries(din_asr_qwen3_cli PRIVATE din_asr_qwen3 argparse)
+add_din_executable(din_asr_qwen3_aligner_cli aligner_main.cpp)
+target_link_libraries(din_asr_qwen3_aligner_cli PRIVATE din_asr_qwen3 argparse)
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+    add_subdirectory(tests)
+endif()

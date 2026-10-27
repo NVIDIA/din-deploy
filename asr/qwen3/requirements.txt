@@ -1,0 +1,13 @@
+# Tested export/validation environment (Python 3.12).
+# Install this directly: pip install -r asr/qwen3/requirements.txt
+# For BF16 GPU validation, install the CUDA PyTorch wheel as described in README.
+torch==2.14.0
+transformers==5.13.0
+onnx==1.22.0
+onnxscript==0.7.2
+onnxruntime==1.30.0
+onnxruntime-ep-nv-tensorrt-rtx==0.4.0
+numpy==2.5.3
+scipy==1.18.1
+soundfile==0.14.0
+librosa==1.0.0
