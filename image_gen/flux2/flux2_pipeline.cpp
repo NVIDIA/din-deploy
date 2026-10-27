@@ -93,8 +93,8 @@ void ValidateFlux2Config(const Flux2Config& config)
     if (config.num_images == 0)
         throw std::invalid_argument("Image count must be positive");
     ValidateFlux2Rng(config.rng, config.processing);
-    if (config.transformer.precision != "bf16" && config.transformer.precision != "fp16" && config.transformer.precision != "fp8" &&
-        config.transformer.precision != "nvfp4")
+    if (config.transformer.precision != "bf16" && config.transformer.precision != "fp16" &&
+        config.transformer.precision != "fp8" && config.transformer.precision != "nvfp4")
         throw std::invalid_argument("Precision must be bf16, fp16, fp8, or nvfp4");
     if (!config.transformer.initial_weight_streaming_budget.empty())
     {

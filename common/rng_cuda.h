@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cuda_runtime_api.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -16,6 +17,6 @@ void GenerateNormalCuda(cudaStream_t stream, float* output, size_t count, uint64
 
 // Generate the same [batch, channels, spatial] samples directly into contiguous
 // [batch, spatial, channels] storage. count must be a multiple of channels * spatial.
-void GenerateNormalCudaPacked(cudaStream_t stream, float* output, size_t count, uint64_t seed,
-                             size_t channels, size_t spatial, bool round_to_bfloat16 = false);
-}
+void GenerateNormalCudaPacked(cudaStream_t stream, float* output, size_t count, uint64_t seed, size_t channels,
+                              size_t spatial, bool round_to_bfloat16 = false);
+}  // namespace din::common

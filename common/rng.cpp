@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rng.h"
 
-#include <Random123/philox.h>
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
 #include <random>
 #include <stdexcept>
+
+#include <Random123/philox.h>
 
 namespace din::common
 {
@@ -18,7 +19,7 @@ float round_bfloat16(float value)
 {
     uint32_t bits = std::bit_cast<uint32_t>(value);
     if ((bits & 0x7fffffffU) > 0x7f800000U)
-        bits |= 0x00400000U; // Preserve NaNs as quiet NaNs.
+        bits |= 0x00400000U;  // Preserve NaNs as quiet NaNs.
     else
         bits += 0x7fffU + ((bits >> 16) & 1U);
     return std::bit_cast<float>(bits & 0xffff0000U);
@@ -35,7 +36,7 @@ void box_muller(uint32_t x, uint32_t y, float* result)
     result[0] = radius * std::sin(v);
     result[1] = radius * std::cos(v);
 }
-}
+}  // namespace
 
 void GenerateNormalCpu(std::span<float> output, uint64_t seed, Rng rng, const NormalOptions& options)
 {
@@ -64,9 +65,9 @@ void GenerateNormalCpu(std::span<float> output, uint64_t seed, Rng rng, const No
         uint64_t iteration = 0;
         for (size_t base = thread; base < count; ++iteration)
         {
-            const Philox::ctr_type counter = {{static_cast<uint32_t>(iteration),
-                static_cast<uint32_t>(iteration >> 32), static_cast<uint32_t>(thread),
-                static_cast<uint32_t>(static_cast<uint64_t>(thread) >> 32)}};
+            const Philox::ctr_type counter = {{static_cast<uint32_t>(iteration), static_cast<uint32_t>(iteration >> 32),
+                                               static_cast<uint32_t>(thread),
+                                               static_cast<uint32_t>(static_cast<uint64_t>(thread) >> 32)}};
             const auto words = Philox{}(counter, key);
             float samples[4];
             box_muller(words[0], words[1], samples);
@@ -85,4 +86,4 @@ void GenerateNormalCpu(std::span<float> output, uint64_t seed, Rng rng, const No
         }
     }
 }
-} // namespace din::common
+}  // namespace din::common

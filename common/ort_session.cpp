@@ -934,12 +934,14 @@ TensorBuffer<T>::TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::Syn
         if (!device || stream == nullptr)
             throw std::invalid_argument("Device tensors require a device and a persistent stream");
         const auto pinned = env.GetSharedAllocator(device.GetMemoryInfo(OrtDeviceMemoryType_HOST_ACCESSIBLE));
-        if (!pinned) throw std::runtime_error("Missing shared pinned allocator");
+        if (!pinned)
+            throw std::runtime_error("Missing shared pinned allocator");
         host_tensor_ = Ort::Value::CreateTensor<T>(pinned, shape_.data(), shape_.size());
         if (!use_unified_memory_)
         {
             const auto allocator = env.GetSharedAllocator(device.GetMemoryInfo(OrtDeviceMemoryType_DEFAULT));
-            if (!allocator) throw std::runtime_error("Missing shared device allocator");
+            if (!allocator)
+                throw std::runtime_error("Missing shared device allocator");
             device_tensor_ = Ort::Value::CreateTensor<T>(allocator, shape_.data(), shape_.size());
         }
     }

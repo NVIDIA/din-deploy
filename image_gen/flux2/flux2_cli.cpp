@@ -284,8 +284,11 @@ int main(int argc, char* argv[])
                   << "Output: " << config.output_path.string() << "\n"
                   << "Prompt: " << config.prompt << "\n"
                   << "Seed:   " << config.seed << "\n"
-                  << "RNG: " << (config.rng == din::common::Rng::CpuStd ? "cpu-std" :
-                                  config.rng == din::common::Rng::CudaPhilox ? "cuda-philox" : "cpu-philox") << "\n"
+                  << "RNG: "
+                  << (config.rng == din::common::Rng::CpuStd       ? "cpu-std"
+                      : config.rng == din::common::Rng::CudaPhilox ? "cuda-philox"
+                                                                   : "cpu-philox")
+                  << "\n"
                   << "Num images: " << config.num_images << "\n"
                   << "Processing: " << to_string(config.processing) << "\n"
                   << "Provider: " << to_string(config.provider) << "\n"

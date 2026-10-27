@@ -8,7 +8,12 @@
 
 namespace din::common
 {
-enum class Rng { CpuStd, CudaPhilox, CpuPhilox };
+enum class Rng
+{
+    CpuStd,
+    CudaPhilox,
+    CpuPhilox
+};
 
 // Reference launch geometry: H100 SXM5, 132 SMs * 2048 threads/SM.
 inline constexpr size_t kH100PhiloxStride = 270336;
@@ -26,6 +31,5 @@ struct NormalOptions
 // CpuPhilox uses Philox4x32-10 and cuRAND's Box-Muller convention and ordering.
 // CPU math can differ from CUDA, including at BF16 rounding boundaries.
 // CudaPhilox must be dispatched through GenerateNormalCuda in rng_cuda.h.
-void GenerateNormalCpu(std::span<float> output, uint64_t seed, Rng rng,
-                       const NormalOptions& options = {});
-}
+void GenerateNormalCpu(std::span<float> output, uint64_t seed, Rng rng, const NormalOptions& options = {});
+}  // namespace din::common

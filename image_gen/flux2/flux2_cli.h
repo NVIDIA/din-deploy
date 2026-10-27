@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include "rng.h"
-
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -12,6 +10,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "rng.h"
 
 enum class Flux2ProcessingBackend
 {

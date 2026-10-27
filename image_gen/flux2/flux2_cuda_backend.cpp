@@ -25,12 +25,12 @@
 
 #include "cu_helper.h"
 #include "cuda_kernels.h"
-#include "rng_cuda.h"
 #include "flux2.h"
-#include "flux2_runtime_context.h"
 #include "flux2_models.h"
+#include "flux2_runtime_context.h"
 #include "flux2_telemetry.h"
 #include "ort_session.h"
+#include "rng_cuda.h"
 #include "utils.h"
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_run_options_config_keys.h>
@@ -518,58 +518,56 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
     state.model_profile.extra_ep_options.emplace_back("nv_length_aux_stream_array", "0");
 
     std::vector<int64_t> token_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
-    state.token = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr, token_shape,
-                                                                       has_separate_binding);
+    state.token = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr,
+                                                                       token_shape, has_separate_binding);
 
     std::vector<int64_t> attn_mask_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
-    state.attention_mask = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr,
-                                                                                attn_mask_shape, has_separate_binding);
+    state.attention_mask = std::make_unique<din::common::TensorBuffer<int64_t>>(
+        state.env, state.ep_device, compute_stream_ptr, attn_mask_shape, has_separate_binding);
 
     std::vector<int64_t> te_out_shape = {BATCH_SIZE, SEQUENCE_LENGTH, TEXT_ENCODER_EMBED_DIM};
-    state.text_encoder_embeds = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
-                                                                                   te_out_shape, has_separate_binding);
+    state.text_encoder_embeds = std::make_unique<din::common::TensorBuffer<float>>(
+        state.env, state.ep_device, compute_stream_ptr, te_out_shape, has_separate_binding);
 
     std::vector<int64_t> timestep_shape = {BATCH_SIZE};
-    state.timestep = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, timestep_shape,
-                                                                        has_separate_binding);
+    state.timestep = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
+                                                                        timestep_shape, has_separate_binding);
 
     std::vector<int64_t> hidden_shape = {BATCH_SIZE, TRANSFORMER_HIDDEN_DIM, LATENT_CHANNELS};
-    state.hidden_states = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, hidden_shape,
-                                                                             has_separate_binding);
+    state.hidden_states = std::make_unique<din::common::TensorBuffer<float>>(
+        state.env, state.ep_device, compute_stream_ptr, hidden_shape, has_separate_binding);
 
     std::vector<int64_t> img_ids_shape = {BATCH_SIZE, IMAGE_SEQUENCE, 4};
-    state.img_ids = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr, img_ids_shape,
-                                                                         has_separate_binding);
+    state.img_ids = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr,
+                                                                         img_ids_shape, has_separate_binding);
 
     std::vector<int64_t> txt_ids_shape = {BATCH_SIZE, SEQUENCE_LENGTH, 4};
-    state.txt_ids = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr, txt_ids_shape,
-                                                                         has_separate_binding);
+    state.txt_ids = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr,
+                                                                         txt_ids_shape, has_separate_binding);
 
-    state.transformer_output = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
-                                                                                  hidden_shape, has_separate_binding);
+    state.transformer_output = std::make_unique<din::common::TensorBuffer<float>>(
+        state.env, state.ep_device, compute_stream_ptr, hidden_shape, has_separate_binding);
 
     std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
                                              LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
-    state.decoder_latent = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
-                                                                              dec_latent_shape, has_separate_binding);
+    state.decoder_latent = std::make_unique<din::common::TensorBuffer<float>>(
+        state.env, state.ep_device, compute_stream_ptr, dec_latent_shape, has_separate_binding);
 
     std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH};
-    state.decoded_image = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, image_shape,
-                                                                             has_separate_binding);
+    state.decoded_image = std::make_unique<din::common::TensorBuffer<float>>(
+        state.env, state.ep_device, compute_stream_ptr, image_shape, has_separate_binding);
 
     std::vector<int64_t> bn_shape = {LATENT_CHANNELS};
-    state.bn_mean =
-        std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, bn_shape, has_separate_binding);
-    state.bn_std =
-        std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, bn_shape, has_separate_binding);
-
+    state.bn_mean = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
+                                                                       bn_shape, has_separate_binding);
+    state.bn_std = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
+                                                                      bn_shape, has_separate_binding);
 
     std::vector<int64_t> img_ids_cpu(state.img_ids->BindingValue().GetTensorTypeAndShapeInfo().GetElementCount());
     std::vector<int64_t> txt_ids_cpu(state.txt_ids->BindingValue().GetTensorTypeAndShapeInfo().GetElementCount());
     fill_position_ids(img_ids_cpu, txt_ids_cpu);
     std::copy(img_ids_cpu.begin(), img_ids_cpu.end(), state.img_ids->HostData());
     std::copy(txt_ids_cpu.begin(), txt_ids_cpu.end(), state.txt_ids->HostData());
-
 
     if (has_separate_binding)
     {
@@ -594,8 +592,7 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
 
 static void upload_cuda_prompt(CudaPipelineState& state, const Flux2Config& config)
 {
-    const Flux2ModelPaths model_paths =
-        MakeFlux2ModelPaths(config);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config);
     const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config.prompt);
     FillTextEncoderInputs(text_inputs.token_ids, text_inputs.pad_token_id, state.token->HostData(),
                           state.attention_mask->HostData(), BATCH_SIZE, SEQUENCE_LENGTH);
@@ -613,43 +610,61 @@ static void update_cuda_models(CudaPipelineState& state, const Flux2Config& conf
 {
     if (!state.loaded.Matches(config))
     {
-        if (state.compute_stream) signal_and_wait_on_host(*state.compute_stream);
+        if (state.compute_stream)
+            signal_and_wait_on_host(*state.compute_stream);
     }
     const char* provider = config.provider == Flux2ExecutionProvider::Cpu ? "cpu" : "trt-rtx";
     Ort::SyncStream* stream = state.compute_stream ? &*state.compute_stream : nullptr;
-    if (state.loaded.text_encoder != config.text_encoder) state.prompt_embeds_valid = false;
-    ReloadFlux2Stage("text encoder", config.text_encoder, state.loaded.text_encoder,
-        state.text_encoder_runner, state.text_encoder_io, state.env, provider, stream, state.model_profile,
-        [&](Ort::Session& session)
-        {
-            auto binding = BindFlux2Model(session, {{"input_ids", &state.token->BindingValue()}, {"attention_mask", &state.attention_mask->BindingValue()}}, {{"prompt_embeds", &state.text_encoder_embeds->BindingValue()}});
-            upload_cuda_prompt(state, config);
-            return binding;
-        });
+    if (state.loaded.text_encoder != config.text_encoder)
+        state.prompt_embeds_valid = false;
+    ReloadFlux2Stage("text encoder", config.text_encoder, state.loaded.text_encoder, state.text_encoder_runner,
+                     state.text_encoder_io, state.env, provider, stream, state.model_profile,
+                     [&](Ort::Session& session)
+                     {
+                         auto binding = BindFlux2Model(session,
+                                                       {{"input_ids", &state.token->BindingValue()},
+                                                        {"attention_mask", &state.attention_mask->BindingValue()}},
+                                                       {{"prompt_embeds", &state.text_encoder_embeds->BindingValue()}});
+                         upload_cuda_prompt(state, config);
+                         return binding;
+                     });
     auto transformer_profile = state.model_profile;
     if (!config.transformer.initial_weight_streaming_budget.empty())
         transformer_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
                                                           config.transformer.initial_weight_streaming_budget);
-    if (ReloadFlux2Stage("transformer", config.transformer, state.loaded.transformer,
-        state.transformer_runner, state.transformer_io, state.env, provider, stream, transformer_profile,
-        [&](Ort::Session& session) { return BindFlux2Model(session, {{"hidden_states", &state.hidden_states->BindingValue()}, {"encoder_hidden_states", &state.text_encoder_embeds->BindingValue()}, {"timestep", &state.timestep->BindingValue()}, {"img_ids", &state.img_ids->BindingValue()}, {"txt_ids", &state.txt_ids->BindingValue()}}, {{"sample", &state.transformer_output->BindingValue()}}); }))
+    if (ReloadFlux2Stage("transformer", config.transformer, state.loaded.transformer, state.transformer_runner,
+                         state.transformer_io, state.env, provider, stream, transformer_profile,
+                         [&](Ort::Session& session)
+                         {
+                             return BindFlux2Model(
+                                 session,
+                                 {{"hidden_states", &state.hidden_states->BindingValue()},
+                                  {"encoder_hidden_states", &state.text_encoder_embeds->BindingValue()},
+                                  {"timestep", &state.timestep->BindingValue()},
+                                  {"img_ids", &state.img_ids->BindingValue()},
+                                  {"txt_ids", &state.txt_ids->BindingValue()}},
+                                 {{"sample", &state.transformer_output->BindingValue()}});
+                         }))
         state.applied_budget.reset();
-    ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io,
-        state.env, provider, stream, state.model_profile, [&](Ort::Session& session)
-        {
-            auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_latent->BindingValue()}}, {{"sample", &state.decoded_image->BindingValue()}});
-            const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
-            std::copy_n(stats.mean.data(), LATENT_CHANNELS, state.bn_mean->HostData());
-            std::copy_n(stats.std.data(), LATENT_CHANNELS, state.bn_std->HostData());
-            if (state.has_separate_binding)
-            {
-                auto mean_ready = state.bn_mean->CopyAsyncToDeviceWithNotification();
-                auto std_ready = state.bn_std->CopyAsyncToDeviceWithNotification();
-                mean_ready.Sync();
-                std_ready.Sync();
-            }
-            return binding;
-        });
+    ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io, state.env,
+                     provider, stream, state.model_profile,
+                     [&](Ort::Session& session)
+                     {
+                         auto binding =
+                             BindFlux2Model(session, {{"latent_sample", &state.decoder_latent->BindingValue()}},
+                                            {{"sample", &state.decoded_image->BindingValue()}});
+                         const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
+                         std::copy_n(stats.mean.data(), LATENT_CHANNELS, state.bn_mean->HostData());
+                         std::copy_n(stats.std.data(), LATENT_CHANNELS, state.bn_std->HostData());
+                         if (state.has_separate_binding)
+                         {
+                             auto mean_ready = state.bn_mean->CopyAsyncToDeviceWithNotification();
+                             auto std_ready = state.bn_std->CopyAsyncToDeviceWithNotification();
+                             mean_ready.Sync();
+                             std_ready.Sync();
+                         }
+                         return binding;
+                     });
 }
 
 Flux2Image run_initialized_pipeline(CudaPipelineState& state, unsigned int seed, din::common::Rng rng,
@@ -687,8 +702,8 @@ Flux2Image run_initialized_pipeline(CudaPipelineState& state, unsigned int seed,
                 LATENT_CHANNELS, LATENT_HEIGHT * LATENT_WIDTH, true);
         }
         else
-            initialize_cpu_latent(state.hidden_states->HostData(), hidden_count, seed, rng,
-                                  BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH);
+            initialize_cpu_latent(state.hidden_states->HostData(), hidden_count, seed, rng, BATCH_SIZE, LATENT_CHANNELS,
+                                  LATENT_HEIGHT, LATENT_WIDTH);
         if (state.binding_is_cuda && rng != din::common::Rng::CudaPhilox)
         {
             auto hidden_uploaded = state.hidden_states->CopyAsyncToDeviceWithNotification();
@@ -742,13 +757,19 @@ public:
             throw std::runtime_error("CUDA processing requires --provider trt-rtx");
         }
 
-
         state_ = std::make_unique<CudaPipelineState>(runtime_.env);
         if (provider == ExecutionProviderMode::Cpu)
         {
             std::cout << "Using CPU execution provider" << std::endl;
-            try { initialize_ep(*state_, find_cpu_device(state_->env), config_, provider, sampling_backend); }
-            catch (...) { state_.reset(); throw; }
+            try
+            {
+                initialize_ep(*state_, find_cpu_device(state_->env), config_, provider, sampling_backend);
+            }
+            catch (...)
+            {
+                state_.reset();
+                throw;
+            }
             UpdateModels(config_);
             return;
         }
@@ -760,14 +781,22 @@ public:
         }
 
         std::cout << "Using TensorRT RTX execution provider" << std::endl;
-        try { initialize_ep(*state_, trt_device, config_, provider, sampling_backend); }
-        catch (...) { state_.reset(); throw; }
+        try
+        {
+            initialize_ep(*state_, trt_device, config_, provider, sampling_backend);
+        }
+        catch (...)
+        {
+            state_.reset();
+            throw;
+        }
         UpdateModels(config_);
     }
 
     void UpdateModels(const Flux2Config& requested) override
     {
-        if (!state_) throw std::runtime_error("Pipeline resources are not initialized");
+        if (!state_)
+            throw std::runtime_error("Pipeline resources are not initialized");
         if (requested.processing != config_.processing || requested.provider != config_.provider)
             throw std::invalid_argument("Changing processing backend or provider requires a new pipeline");
         // Keep the previous prompt until SetPrompt decides whether embeddings can be reused.
@@ -793,17 +822,20 @@ public:
 
     const void* TransformerSessionIdentity() const override
     {
-        return state_ && state_->transformer_runner ? static_cast<OrtSession*>(state_->transformer_runner->session) : nullptr;
+        return state_ && state_->transformer_runner ? static_cast<OrtSession*>(state_->transformer_runner->session)
+                                                    : nullptr;
     }
 
     const void* TextEncoderSessionIdentity() const override
     {
-        return state_ && state_->text_encoder_runner ? static_cast<OrtSession*>(state_->text_encoder_runner->session) : nullptr;
+        return state_ && state_->text_encoder_runner ? static_cast<OrtSession*>(state_->text_encoder_runner->session)
+                                                     : nullptr;
     }
 
     const void* VaeSessionIdentity() const override
     {
-        return state_ && state_->vae_decoder_runner ? static_cast<OrtSession*>(state_->vae_decoder_runner->session) : nullptr;
+        return state_ && state_->vae_decoder_runner ? static_cast<OrtSession*>(state_->vae_decoder_runner->session)
+                                                    : nullptr;
     }
 
     Flux2Image GenerateImage(unsigned int seed, const Flux2Progress& progress,
@@ -816,8 +848,10 @@ public:
         const din::common::Rng rng = options.rng.value_or(config_.rng);
         ValidateFlux2Rng(rng, config_.processing);
         state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps));
-        const std::string budget = options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
-        const std::string& previous = state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
+        const std::string budget =
+            options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
+        const std::string& previous =
+            state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
         if (budget != previous)
         {
             const char* keys[] = {"nv_weight_streaming_budget"};

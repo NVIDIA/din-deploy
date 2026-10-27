@@ -9,8 +9,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
-#include <numeric>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,9 +34,8 @@ struct Flux2ModelPaths
 
 inline Flux2ModelPaths MakeFlux2ModelPaths(const Flux2Config& config)
 {
-    return {config.text_encoder.model_path.parent_path().parent_path(),
-            config.text_encoder.model_path, config.transformer.model_path,
-            config.vae.model_path, config.text_encoder.tokenizer_dir};
+    return {config.text_encoder.model_path.parent_path().parent_path(), config.text_encoder.model_path,
+            config.transformer.model_path, config.vae.model_path, config.text_encoder.tokenizer_dir};
 }
 
 static const std::filesystem::path TEXT_ENCODER_MODEL_CTX = "text_encoder_model_ctx.onnx";
@@ -150,8 +149,8 @@ inline void FillTextEncoderInputs(const std::vector<int64_t>& token_ids, int64_t
 // Random latent initialisation
 // ============================================================================
 
-inline void initialize_cpu_latent(float* output, size_t count, uint64_t seed, din::common::Rng rng,
-                                  unsigned int batch, unsigned int channels, unsigned int height, unsigned int width)
+inline void initialize_cpu_latent(float* output, size_t count, uint64_t seed, din::common::Rng rng, unsigned int batch,
+                                  unsigned int channels, unsigned int height, unsigned int width)
 {
     size_t expected = 1;
     for (unsigned int dimension : {batch, channels, height, width})

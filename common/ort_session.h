@@ -199,8 +199,8 @@ class TensorBuffer
 {
 public:
     TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma = false);
-    TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream,
-                 const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma = false);
+    TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream, const std::vector<int64_t>& shape,
+                 bool use_device_io, bool disable_uma = false);
 
     Ort::Value& BindingValue();
 

@@ -256,7 +256,10 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
     int budget = 50;
     int count = static_cast<int>(config.num_images);
     int encoder = config.text_encoder.variant == Flux2TextEncoder::Qwen3_4B ? 0 : 1;
-    int precision = config.transformer.precision == "bf16" ? 0 : config.transformer.precision == "fp16" ? 1 : config.transformer.precision == "fp8" ? 2 : 3;
+    int precision = config.transformer.precision == "bf16"   ? 0
+                    : config.transformer.precision == "fp16" ? 1
+                    : config.transformer.precision == "fp8"  ? 2
+                                                             : 3;
     const char* precisions[] = {"bf16", "fp16", "fp8", "nvfp4"};
     const char* backends[] = {"CPU", "CUDA", "DirectX", "DirectX CIG", "Vulkan", "Vulkan CIG"};
     int backend = static_cast<int>(config.processing);
@@ -377,13 +380,14 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
             config.output_path = output.data();
             config.prompt = prompt.data();
             const auto cache_namespace = CacheNamespace(model_root);
-            const auto cache_root =
-                (cache_changed ? std::filesystem::u8path(cache.data()) / "runtime" : initial.text_encoder.ep_cache_dir) /
-                cache_namespace;
-            const auto context_root =
-                (cache_changed ? std::filesystem::u8path(cache.data()) / "ep_context" : initial.text_encoder.ep_context_dir) /
-                cache_namespace;
-            config.text_encoder.variant = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+            const auto cache_root = (cache_changed ? std::filesystem::u8path(cache.data()) / "runtime"
+                                                   : initial.text_encoder.ep_cache_dir) /
+                                    cache_namespace;
+            const auto context_root = (cache_changed ? std::filesystem::u8path(cache.data()) / "ep_context"
+                                                     : initial.text_encoder.ep_context_dir) /
+                                      cache_namespace;
+            config.text_encoder.variant =
+                encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
             config.transformer.precision = precisions[precision];
             config.num_images = static_cast<unsigned int>(count);
             config.processing = static_cast<Flux2ProcessingBackend>(backend);
@@ -504,10 +508,9 @@ int main(int argc, char** argv)
         config.transformer.precision = args.get<std::string>("--precision");
         config.num_images = 1;
         const auto encoder = args.get<std::string>("--encoder");
-        const bool translator =
-            encoder == "translator" ||
-            (encoder == "auto" && !model_root.empty() &&
-             std::filesystem::is_regular_file(model_root / "text_encoder_translator/model.onnx"));
+        const bool translator = encoder == "translator" ||
+                                (encoder == "auto" && !model_root.empty() &&
+                                 std::filesystem::is_regular_file(model_root / "text_encoder_translator/model.onnx"));
         config.text_encoder.variant = translator ? Flux2TextEncoder::Qwen3_06BTranslator : Flux2TextEncoder::Qwen3_4B;
         config.transformer.initial_weight_streaming_budget = "-1";
         ConfigureFlux2Models(config, model_root, config.text_encoder.ep_cache_dir, config.text_encoder.ep_context_dir);

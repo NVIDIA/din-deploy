@@ -18,8 +18,8 @@
 
 #include "dx_helper.h"
 #include "flux2.h"
-#include "flux2_runtime_context.h"
 #include "flux2_models.h"
+#include "flux2_runtime_context.h"
 #include "flux2_telemetry.h"
 #include "ort_session.h"
 #include "utils.h"
@@ -463,7 +463,6 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         throw std::runtime_error("DirectX processing requires --provider trt-rtx");
     }
 
-
     std::cout << "\n=== Initializing D3D12 ===" << std::endl;
     state.trt_device = trt_device;
     state.interop_api = &Ort::GetInteropApi();
@@ -498,7 +497,6 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     state.model_profile.enable_cuda_graph = !state.use_cig;
     state.model_profile.embed_ep_context = false;
     state.model_profile.extra_ep_options = graphics_ep_options;
-
 
     std::vector<int64_t> token_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
     std::vector<int64_t> attn_mask_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
@@ -557,7 +555,6 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     state.decoded_image_tensor =
         state.tensor_importer->create_tensor(state.decoded_image_buf, image_shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
-
     std::cout << "\n=== Uploading Static Inputs (D3D12) ===" << std::endl;
     state.dx.begin();
 
@@ -606,8 +603,7 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
 
 static void upload_dx_prompt(DxPipelineState& state, const Flux2Config& config)
 {
-    const Flux2ModelPaths model_paths =
-        MakeFlux2ModelPaths(config);
+    const Flux2ModelPaths model_paths = MakeFlux2ModelPaths(config);
     const Flux2TextEncoderInputs text_inputs = TokenizeFlux2Prompt(model_paths, config.prompt);
     std::vector<int64_t> tokens_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
     std::vector<int64_t> attn_mask_cpu(BATCH_SIZE * SEQUENCE_LENGTH);
@@ -632,40 +628,56 @@ static void update_dx_models(DxPipelineState& state, const Flux2Config& config)
     }
     const char* provider = config.provider == Flux2ExecutionProvider::Cpu ? "cpu" : "trt-rtx";
     Ort::SyncStream* stream = &*state.sync_stream;
-    if (state.loaded.text_encoder != config.text_encoder) state.prompt_embeds_valid = false;
-    ReloadFlux2Stage("text encoder", config.text_encoder, state.loaded.text_encoder,
-        state.text_encoder_runner, state.text_encoder_io, state.env, provider, stream, state.model_profile,
-        [&](Ort::Session& session)
-        {
-            auto binding = BindFlux2Model(session, {{"input_ids", &state.token_tensor}, {"attention_mask", &state.attention_mask_tensor}}, {{"prompt_embeds", &state.text_encoder_embeds_tensor}});
-            upload_dx_prompt(state, config);
-            return binding;
-        });
+    if (state.loaded.text_encoder != config.text_encoder)
+        state.prompt_embeds_valid = false;
+    ReloadFlux2Stage("text encoder", config.text_encoder, state.loaded.text_encoder, state.text_encoder_runner,
+                     state.text_encoder_io, state.env, provider, stream, state.model_profile,
+                     [&](Ort::Session& session)
+                     {
+                         auto binding = BindFlux2Model(
+                             session,
+                             {{"input_ids", &state.token_tensor}, {"attention_mask", &state.attention_mask_tensor}},
+                             {{"prompt_embeds", &state.text_encoder_embeds_tensor}});
+                         upload_dx_prompt(state, config);
+                         return binding;
+                     });
     auto transformer_profile = state.model_profile;
     if (!config.transformer.initial_weight_streaming_budget.empty())
         transformer_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
                                                           config.transformer.initial_weight_streaming_budget);
-    if (ReloadFlux2Stage("transformer", config.transformer, state.loaded.transformer,
-        state.transformer_runner, state.transformer_io, state.env, provider, stream, transformer_profile,
-        [&](Ort::Session& session) { return BindFlux2Model(session, {{"hidden_states", &state.hidden_states_tensor}, {"encoder_hidden_states", &state.text_encoder_embeds_tensor}, {"timestep", &state.timestep_tensor}, {"img_ids", &state.img_ids_tensor}, {"txt_ids", &state.txt_ids_tensor}}, {{"sample", &state.transformer_output_tensor}}); }))
+    if (ReloadFlux2Stage("transformer", config.transformer, state.loaded.transformer, state.transformer_runner,
+                         state.transformer_io, state.env, provider, stream, transformer_profile,
+                         [&](Ort::Session& session)
+                         {
+                             return BindFlux2Model(session,
+                                                   {{"hidden_states", &state.hidden_states_tensor},
+                                                    {"encoder_hidden_states", &state.text_encoder_embeds_tensor},
+                                                    {"timestep", &state.timestep_tensor},
+                                                    {"img_ids", &state.img_ids_tensor},
+                                                    {"txt_ids", &state.txt_ids_tensor}},
+                                                   {{"sample", &state.transformer_output_tensor}});
+                         }))
         state.applied_budget.reset();
-    ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io,
-        state.env, provider, stream, state.model_profile, [&](Ort::Session& session)
-        {
-            auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_input_tensor}}, {{"sample", &state.decoded_image_tensor}});
-            const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
-            state.dx.begin();
-            state.dx.record_upload(state.bn_mean_buf, stats.mean.data(), state.bn_mean_buf.size);
-            state.dx.record_upload(state.bn_std_buf, stats.std.data(), state.bn_std_buf.size);
-            state.dx.execute();
-            const auto uploaded = state.sync_fence->signal_d3d12(state.dx.queue.Get());
-            state.sync_fence->wait_ort(*state.sync_stream, uploaded);
-            signal_and_wait_on_host(*state.sync_stream);
-            return binding;
-        });
+    ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io, state.env,
+                     provider, stream, state.model_profile,
+                     [&](Ort::Session& session)
+                     {
+                         auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_input_tensor}},
+                                                       {{"sample", &state.decoded_image_tensor}});
+                         const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
+                         state.dx.begin();
+                         state.dx.record_upload(state.bn_mean_buf, stats.mean.data(), state.bn_mean_buf.size);
+                         state.dx.record_upload(state.bn_std_buf, stats.std.data(), state.bn_std_buf.size);
+                         state.dx.execute();
+                         const auto uploaded = state.sync_fence->signal_d3d12(state.dx.queue.Get());
+                         state.sync_fence->wait_ort(*state.sync_stream, uploaded);
+                         signal_and_wait_on_host(*state.sync_stream);
+                         return binding;
+                     });
 }
 
-static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed, din::common::Rng rng, const Flux2Progress& progress)
+static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed, din::common::Rng rng,
+                               const Flux2Progress& progress)
 {
     Flux2Telemetry telemetry(static_cast<int>(state.time_schedule.size()) - 1, progress,
                              [&]
@@ -675,8 +687,8 @@ static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed, din::c
                                  signal_and_wait_on_host(*state.sync_stream);
                              });
     std::vector<float> latent_cpu(state.hidden_count);
-    initialize_cpu_latent(latent_cpu.data(), latent_cpu.size(), seed, rng,
-                          BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH);
+    initialize_cpu_latent(latent_cpu.data(), latent_cpu.size(), seed, rng, BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT,
+                          LATENT_WIDTH);
     state.dx.begin();
     state.dx.record_upload(state.hidden_states, latent_cpu.data(), state.hidden_states.size);
     state.dx.execute();
@@ -724,14 +736,22 @@ public:
         std::cout << "Initializing Flux2 DirectX pipeline" << std::endl;
         const auto identity = din::common::ResolveOrtGraphicsDeviceIdentity(runtime_.trt_device);
         state_ = std::make_unique<DxPipelineState>(runtime_.env, identity.luid);
-        try { initialize_dx_state(*state_, config_, runtime_.trt_device); }
-        catch (...) { state_.reset(); throw; }
+        try
+        {
+            initialize_dx_state(*state_, config_, runtime_.trt_device);
+        }
+        catch (...)
+        {
+            state_.reset();
+            throw;
+        }
         UpdateModels(config_);
     }
 
     void UpdateModels(const Flux2Config& requested) override
     {
-        if (!state_) throw std::runtime_error("Pipeline resources are not initialized");
+        if (!state_)
+            throw std::runtime_error("Pipeline resources are not initialized");
         if (requested.processing != config_.processing || requested.provider != config_.provider)
             throw std::invalid_argument("Changing processing backend or provider requires a new pipeline");
         // Keep the previous prompt until SetPrompt decides whether embeddings can be reused.
@@ -757,17 +777,20 @@ public:
 
     const void* TransformerSessionIdentity() const override
     {
-        return state_ && state_->transformer_runner ? static_cast<OrtSession*>(state_->transformer_runner->session) : nullptr;
+        return state_ && state_->transformer_runner ? static_cast<OrtSession*>(state_->transformer_runner->session)
+                                                    : nullptr;
     }
 
     const void* TextEncoderSessionIdentity() const override
     {
-        return state_ && state_->text_encoder_runner ? static_cast<OrtSession*>(state_->text_encoder_runner->session) : nullptr;
+        return state_ && state_->text_encoder_runner ? static_cast<OrtSession*>(state_->text_encoder_runner->session)
+                                                     : nullptr;
     }
 
     const void* VaeSessionIdentity() const override
     {
-        return state_ && state_->vae_decoder_runner ? static_cast<OrtSession*>(state_->vae_decoder_runner->session) : nullptr;
+        return state_ && state_->vae_decoder_runner ? static_cast<OrtSession*>(state_->vae_decoder_runner->session)
+                                                    : nullptr;
     }
 
     Flux2Image GenerateImage(unsigned int seed, const Flux2Progress& progress,
@@ -780,8 +803,10 @@ public:
         const din::common::Rng rng = options.rng.value_or(config_.rng);
         ValidateFlux2Rng(rng, config_.processing);
         state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps));
-        const std::string budget = options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
-        const std::string& previous = state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
+        const std::string budget =
+            options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
+        const std::string& previous =
+            state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
         if (budget != previous)
         {
             const char* keys[] = {"nv_weight_streaming_budget"};
