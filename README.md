@@ -2,7 +2,7 @@
 
 **Do inference now** — local inference samples for client PCs.
 
-DIN Deploy is a collection of practical samples for exporting and running local models with ONNX Runtime. The samples prioritize CUDA-accelerated inference where available, with model-specific support for CPU execution.
+DIN Deploy is a collection of practical samples for exporting and running local models with ONNX Runtime. The samples prioritize CUDA-accelerated inference where available, while supporting CPU execution for cross-vendor use.
 
 ## Supported models
 
@@ -22,11 +22,6 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | `nvidia/nemotron-3.5-asr-streaming-0.6b` | [RNNT](asr/rnnt/README.md) |
 | Qwen3 ASR | `Qwen/Qwen3-ASR-0.6B-hf`<br>`Qwen/Qwen3-ASR-1.7B-hf` | [Qwen3](asr/qwen3/README.md) |
 | Qwen3 Forced Aligner | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | [Qwen3](asr/qwen3/README.md) |
-
-### Speaker diarization
-
-| Model | Hugging Face ID | Docs |
-| --- | --- | --- |
 | NVIDIA Nemotron-3 Diarization | `nvidia/Nemotron-3-Diarization` | [Diarization](asr/diarization/README.md) |
 
 ### Computer Vision
@@ -59,7 +54,7 @@ Each model sample has two parts:
 1. a Python exporter that downloads/converts a model into an ONNX artifact directory; and
 2. a native CLI that runs that directory with ONNX Runtime using [TensorRT RTX execution provider](https://github.com/NVIDIA/TensorRT-RTX-EP-ABI) (EP) or CPU EP.
 
-Use the model-specific README for the exporter command, supported execution providers, and CLI arguments. PixelDiT currently requires the TensorRT RTX execution provider.
+Use the model-specific README for the exporter command and CLI arguments.
 
 ## Requirements
 
@@ -89,9 +84,9 @@ Choose a preset from `CMakePresets.json` (for example, `windows-x64`, `linux-x64
 
 | CMake setting | Default | Purpose                                                                                                                                                                                                                                                                     |
 | --- | --- |-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `DIN_BUILD_TRT_RTX_EP` | `ON` | Builds the TensorRT RTX execution provider from source. Set to `OFF` when a compatible provider library was [downloaded](https://github.com/NVIDIA/TensorRT-RTX-EP-ABI/releases/) and placed in the executable directory.                                                                                                          |
+| `DIN_BUILD_TRT_RTX_EP` | `ON` | Builds the TensorRT RTX execution provider from source. Set to `OFF` when a compatible provider library was [downloaded](github.com/NVIDIA/TensorRT-RTX-EP-ABI/releases/) and placed in the executable directory.                                                                                                          |
 | `DIN_ENABLE_NVTX` | `ON` | Enables NVTX profiling instrumentation. Set to `OFF` to build without it.                                                                                                                                                                                                   |
-| `ONNXRUNTIME_VERSION` | `1.27.0` (presets: `1.29.0`) | ONNX Runtime version to download when `ONNXRUNTIME_ROOT` is not provided.                                                                                                                                                                                                   |
+| `ONNXRUNTIME_VERSION` | `1.27.0` | ONNX Runtime version to download when `ONNXRUNTIME_ROOT` is not provided.                                                                                                                                                                                                   |
 | `TRT_RTX_ROOT` | Not set | Optional path to an extracted TensorRT RTX SDK root. Set it to use a local SDK instead of the preset's download; the directory must contain `include/` and `lib/`. Releases are available from the [TensorRT RTX download page](https://developer.nvidia.com/tensorrt-rtx). |
 
 Build one sample rather than the whole project by naming its target:
@@ -100,12 +95,7 @@ Build one sample rather than the whole project by naming its target:
 cmake --build out/build/<preset> --config Release --target din_asr_nemotron_cli
 cmake --build out/build/<preset> --config Release --target din_asr_parakeet_tdt_cli
 cmake --build out/build/<preset> --config Release --target din_asr_whisper_cli
-cmake --build out/build/<preset> --config Release --target din_asr_qwen3_cli
-cmake --build out/build/<preset> --config Release --target din_asr_qwen3_aligner_cli
-cmake --build out/build/<preset> --config Release --target din_diarization_cli
 cmake --build out/build/<preset> --config Release --target din_flux2_cli
-cmake --build out/build/<preset> --config Release --target din_pixeldit_cli
-cmake --build out/build/<preset> --config Release --target din_sam2_cli
 ```
 
 The built executable and required runtime libraries are placed under `out/build/<preset>/bin/<configuration>/` for multi-config generators.
