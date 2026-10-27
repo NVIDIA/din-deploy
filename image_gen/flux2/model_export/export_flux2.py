@@ -14,7 +14,7 @@ Usage:
 Output layout:
     <output>/
         text_encoder/model.onnx + model.onnx_data
-        transformer/model.onnx + model.onnx_data
+        transformer_bf16/model.onnx + model.onnx_data
         vae_encoder/model.onnx + model.onnx_data
         vae_decoder/model.onnx + model.onnx_data
         scheduler/ (config only)
@@ -49,6 +49,11 @@ DEFAULT_MODEL_OPSETS = {
 IO_PRECISION_MAP = {
     "fp32": torch.float32,
 }
+
+
+def model_output_path(output_path: Path, name: str, transformer_precision: str) -> Path:
+    directory = f"transformer_{transformer_precision}" if name == "transformer" else name
+    return output_path / directory / "model.onnx"
 
 
 def _configure_stdio():
@@ -165,6 +170,7 @@ def export_transformer(
     image_size: int = 1024,
     seq_len: int = 512,
     io_dtype: torch.dtype = torch.float32,
+    transformer_precision: str = "bf16",
 ):
     """Export with static shapes for image_size x image_size (default 1024x1024)."""
     trans = pipe.transformer
@@ -209,7 +215,7 @@ def export_transformer(
     _onnx_export(
         wrapper,
         (dummy_hidden, dummy_encoder, dummy_timestep, dummy_img_ids, dummy_txt_ids),
-        output_path / "transformer" / "model.onnx",
+        model_output_path(output_path, "transformer", transformer_precision),
         input_names=["hidden_states", "encoder_hidden_states", "timestep", "img_ids", "txt_ids"],
         output_names=["sample"],
         opset=opset,
@@ -447,6 +453,12 @@ def main():
         help="IO precision of ONNX models; only fp32 is supported by the C++ pipeline",
     )
     ap.add_argument(
+        "--transformer-precision",
+        choices=["bf16", "fp8", "nvfp4"],
+        default="bf16",
+        help="Precision label used for the transformer_<precision> output directory.",
+    )
+    ap.add_argument(
         "--compile_trt",
         action="store_true",
         help="After export, build each selected ONNX model with the TensorRT RTX CLI and --skipInference.",
@@ -518,13 +530,14 @@ def main():
                seq_len=seq_len, io_dtype=io_dtype)
         elif name == "transformer":
             fn(pipe, output_path, device, model_opset,
-               image_size=image_size, seq_len=seq_len, io_dtype=io_dtype)
+               image_size=image_size, seq_len=seq_len, io_dtype=io_dtype,
+               transformer_precision=args.transformer_precision)
         elif name in ("vae_encoder", "vae_decoder"):
             fn(pipe, output_path, device, model_opset,
                image_size=image_size, io_dtype=io_dtype)
         else:
             fn(pipe, output_path, device, model_opset, io_dtype=io_dtype)
-        exported_model_paths.append(output_path / name / "model.onnx")
+        exported_model_paths.append(model_output_path(output_path, name, args.transformer_precision))
 
     if export_all:
         copy_scheduler_and_tokenizer(model_snapshot, output_path)
