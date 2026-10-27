@@ -1000,6 +1000,11 @@ std::string Tokenizer::Decode(const std::vector<int64_t>& ids, bool skip_special
             if (skip_special_tokens &&
                 std::find(special_tokens_.begin(), special_tokens_.end(), token) != special_tokens_.end())
                 continue;
+            if (std::find(added_tokens_.begin(), added_tokens_.end(), token) != added_tokens_.end())
+            {
+                text += token;
+                continue;
+            }
             for (size_t i = 0; i < token.size();)
             {
                 const auto code = NextCodePoint(token, i);
