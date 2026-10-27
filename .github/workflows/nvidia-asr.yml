@@ -61,6 +61,21 @@ jobs:
           source_ref="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq .head_sha)"
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
 
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.build.outputs.source_ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Test CLI validation helpers
+        run: |
+          python -m pip install pytest jiwer
+          python -m pytest -q tests/model_export
+
   export-parakeet:
     name: Export Parakeet TDT ONNX
     needs: requirements
