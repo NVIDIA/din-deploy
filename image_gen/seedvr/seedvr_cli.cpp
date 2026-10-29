@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -21,7 +22,7 @@ namespace {
         argparse::ArgumentParser parser("din_seedvr2");
         parser.add_description(
             "Upscale a PNG or a directory of PNGs with SeedVR2 using ONNX Runtime, TensorRT RTX, and CUDA.");
-        parser.add_argument("input").help("Input PNG image or directory of PNG images.");
+        parser.add_argument("input").help("Input PNG image or a video sequence of filename-sorted PNGs; folders require video exports.");
         parser.add_argument("--output")
                 .default_value(config.output_path.string())
                 .nargs(1)
@@ -167,12 +168,32 @@ int main(int argc, char *argv[]) {
             throw std::invalid_argument("The output directory must differ from the input directory");
         }
 
+        std::ifstream video_manifest(config.model_dir / "seedvr2_video_frames.txt");
+        if (!(video_manifest >> config.video_frames) || config.video_frames < 5 || (config.video_frames - 1) % 4) {
+            throw std::runtime_error("Folder input requires video exports: run export_seedvr.py --video-frames 5 (or another 4n+1 clip length) into --model-dir");
+        }
         din::seedvr::Pipeline pipeline(config);
-        for (size_t index = 0; index < inputs.size(); ++index) {
-            config.input_path = inputs[index];
-            config.output_path = output_dir / (inputs[index].stem().string() + "_seedvr.png");
-            std::cout << "[" << index + 1 << '/' << inputs.size() << "] " << inputs[index].string() << std::endl;
-            RunOne(config, pipeline);
+        // Consecutive clips share one boundary frame. Keep its first prediction.
+        const size_t stride = config.video_frames - 1;
+        for (size_t start = 0; start < inputs.size();) {
+            const size_t end = std::min(start + config.video_frames, inputs.size());
+            const std::vector<std::filesystem::path> clip(inputs.begin() + start, inputs.begin() + end);
+            std::cout << "Video clip " << start + 1 << ".." << end << '/' << inputs.size()
+                      << " (model frames=" << config.video_frames << ")" << std::endl;
+            const auto results = pipeline.RunClip(clip);
+            for (size_t i = start ? 1 : 0; i < results.size(); ++i) {
+                const auto &image = results[i];
+                const auto output = output_dir / (inputs[start + i].stem().string() + "_seedvr.png");
+                std::vector<float> bytes(image.chw.size());
+                std::transform(image.chw.begin(), image.chw.end(), bytes.begin(), [](float x) { return x * 255.0f; });
+                if (!din::io::SaveRgbFloatImage(output.string(), bytes.data(), image.height, image.width,
+                                              din::io::ImageValueRange::ZeroTo255)) {
+                    throw std::runtime_error("Failed to save " + output.string());
+                }
+                std::cout << "Saved " << output.string() << std::endl;
+            }
+            if (end == inputs.size()) break;
+            start += stride;
         }
         std::cout << "Completed " << inputs.size() << '/' << inputs.size() << " images" << std::endl;
         return EXIT_SUCCESS;

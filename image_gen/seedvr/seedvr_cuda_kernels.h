@@ -21,7 +21,7 @@ void LaunchSeedVrNormalizeTiles(cudaStream_t stream, const float *sum, const flo
                                void *output, size_t channels, size_t spatial_size);
 void LaunchSeedVrClampKernel(cudaStream_t stream, void *image, size_t element_count);
 void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *reference,
-                          size_t height, size_t width, size_t stride);
+                          size_t height, size_t width, size_t stride, size_t channel_stride);
 
 void LaunchSeedVrConditionKernel(cudaStream_t stream, const void *encoded, void *condition, size_t spatial_size);
 

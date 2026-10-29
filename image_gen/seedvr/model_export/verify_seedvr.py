@@ -51,6 +51,30 @@ def load_image(path: Path) -> torch.Tensor:
     return torch.from_numpy(pixels).unsqueeze(0)
 
 
+def load_inputs(args: argparse.Namespace) -> torch.Tensor:
+    if not args.input.is_dir():
+        return load_image(args.input)
+    paths = sorted(path for path in args.input.iterdir() if path.suffix.lower() == ".png")
+    frames = int((args.onnx_dir / "seedvr2_video_frames.txt").read_text())
+    if not paths or len(paths) > frames:
+        raise ValueError(f"Verification accepts one clip of 1..{frames} PNG frames; got {len(paths)}.")
+    return torch.cat([load_image(path) for path in paths])
+
+
+def prepare_inputs(args: argparse.Namespace, images: torch.Tensor) -> torch.Tensor:
+    from comfy_extras.nodes_seedvr import SeedVR2Preprocess
+
+    if args.input.is_dir():
+        frames = int((args.onnx_dir / "seedvr2_video_frames.txt").read_text())
+        images = torch.cat([images, images[-1:].expand(frames - len(images), -1, -1, -1)])
+    return SeedVR2Preprocess.execute(images)[0]
+
+
+def to_pil_frames(images: torch.Tensor) -> list[Image.Image]:
+    images = images.reshape(-1, *images.shape[-3:])
+    return [to_pil_image(frame.unsqueeze(0)) for frame in images]
+
+
 def resize_image(images: torch.Tensor, scale: float) -> torch.Tensor:
     if scale <= 0:
         raise ValueError(f"--scale must be positive, got {scale}.")
@@ -129,6 +153,13 @@ def create_trt_rtx_session(
         "nv_runtime_cache_path": str(cache_path),
     }
     session_options = ort.SessionOptions()
+    import onnx
+    graph = onnx.load(str(onnx_path), load_external_data=False).graph
+    for value in graph.input:
+        if value.name in input_shapes:
+            for dimension, size in zip(value.type.tensor_type.shape.dim, input_shapes[value.name], strict=True):
+                if dimension.dim_param:
+                    session_options.add_free_dimension_override_by_name(dimension.dim_param, size)
     session_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     session_options.add_provider_for_devices(devices, provider_options)
     print(f"Building/loading TensorRT RTX session: {onnx_path}")
@@ -137,13 +168,17 @@ def create_trt_rtx_session(
 
 
 def run_vae_encoder(session, images: torch.Tensor) -> torch.Tensor:
+    input_info = session.get_inputs()[0]
+    if len(input_info.shape) == 5:
+        image_bcthw = images.permute(0, 4, 1, 2, 3)
+        output = session.run(None, {input_info.name: _numpy(image_bcthw, _numpy_dtype(input_info.type))})[0]
+        return torch.from_numpy(output)
     if images.ndim == 5:
         if images.shape[0] * images.shape[1] != 1:
             raise ValueError(f"The initial TensorRT RTX sample supports one image, got {tuple(images.shape)}.")
         images = images.reshape(-1, *images.shape[2:])
     if images.ndim != 4 or images.shape[-1] != 3:
         raise ValueError(f"Expected a BHWC RGB image for VAE encoding, got {tuple(images.shape)}.")
-    input_info = session.get_inputs()[0]
     image_nchw = images.movedim(-1, 1)
     output = session.run(None, {input_info.name: _numpy(image_nchw, _numpy_dtype(input_info.type))})[0]
     latent = torch.from_numpy(output).unsqueeze(2)
@@ -152,9 +187,12 @@ def run_vae_encoder(session, images: torch.Tensor) -> torch.Tensor:
 
 
 def run_vae_decoder(session, latent: torch.Tensor) -> torch.Tensor:
+    input_info = session.get_inputs()[0]
+    if len(input_info.shape) == 5:
+        output = session.run(None, {input_info.name: _numpy(latent, _numpy_dtype(input_info.type))})[0]
+        return torch.from_numpy(output).float().permute(0, 2, 3, 4, 1)
     if latent.ndim != 5 or latent.shape[2] != 1:
         raise ValueError(f"Expected a one-frame BCTHW latent for VAE decoding, got {tuple(latent.shape)}.")
-    input_info = session.get_inputs()[0]
     latent_nchw = latent.squeeze(2)
     output = session.run(None, {input_info.name: _numpy(latent_nchw, _numpy_dtype(input_info.type))})[0]
     images = torch.from_numpy(output).float().movedim(1, -1)
@@ -185,14 +223,15 @@ class SeedVRTrtRtxDenoiser(torch.nn.Module):
         condition = kwargs.get("condition")
         if condition is None:
             raise ValueError("SeedVR2 TensorRT RTX inference requires the conditioning latent.")
-        if latent.shape[0] != 1 or latent.shape[2] != 1:
-            raise ValueError(f"The initial TensorRT RTX sample supports B=T=1, got {tuple(latent.shape)}.")
+        if latent.shape[0] != 1:
+            raise ValueError(f"Expected batch one, got {tuple(latent.shape)}.")
         if context.shape != (1, CONTEXT_TOKENS, CONTEXT_WIDTH):
             raise ValueError(f"Expected context [1, 58, 5120], got {tuple(context.shape)}.")
 
         height, width = latent.shape[3:5]
         device = next(self.diffusion_model.parameters()).device
-        normal, shifted = get_seedvr_metadata(self.diffusion_model, height, width, CONTEXT_TOKENS, device, self.dtype)
+        normal, shifted = get_seedvr_metadata(self.diffusion_model, height, width, CONTEXT_TOKENS, device, self.dtype,
+                                             temporal=latent.shape[2])
         tensors = (latent, timestep, context, condition, *normal.tensors(), *shifted.tensors())
         feed = {
             name: _numpy(tensor, self.input_dtypes[name]) for name, tensor in zip(DIT_INPUT_NAMES, tensors, strict=True)
@@ -219,17 +258,16 @@ def _checkpoint_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     return model_path.expanduser().absolute(), vae_path.expanduser().absolute()
 
 
-def run_pytorch_pipeline(args: argparse.Namespace) -> Image.Image:
+def run_pytorch_pipeline(args: argparse.Namespace) -> list[Image.Image]:
     """Run the unmodified ComfyUI implementation as the reference."""
     import comfy.model_management
     import comfy.sd
     import comfy.utils
     import nodes
-    from comfy_extras.nodes_seedvr import SeedVR2Conditioning, SeedVR2PostProcessing, SeedVR2Preprocess
+    from comfy_extras.nodes_seedvr import SeedVR2Conditioning, SeedVR2PostProcessing
 
     model_path, vae_path = _checkpoint_paths(args)
-    input_path = args.input.expanduser().absolute()
-    for path, label in ((model_path, "diffusion model"), (vae_path, "VAE"), (input_path, "input image")):
+    for path, label in ((model_path, "diffusion model"), (vae_path, "VAE")):
         if not path.is_file():
             raise FileNotFoundError(f"SeedVR2 {label} not found: {path}")
 
@@ -240,8 +278,8 @@ def run_pytorch_pipeline(args: argparse.Namespace) -> Image.Image:
     vae = comfy.sd.VAE(sd=vae_state_dict, metadata=vae_metadata)
     vae.throw_exception_if_invalid()
 
-    resized_images = resize_image(load_image(input_path), args.scale)
-    prepared_images = SeedVR2Preprocess.execute(resized_images)[0]
+    resized_images = resize_image(load_inputs(args), args.scale)
+    prepared_images = prepare_inputs(args, resized_images)
     encoded = vae.encode(prepared_images)
     latent = {"samples": encoded}
     positive, negative = SeedVR2Conditioning.execute(model, latent)
@@ -259,31 +297,34 @@ def run_pytorch_pipeline(args: argparse.Namespace) -> Image.Image:
     )[0]
     decoded = vae.decode(sampled["samples"])
     output = SeedVR2PostProcessing.execute(decoded, resized_images, args.color_correction)[0]
-    result = to_pil_image(output)
+    result = to_pil_frames(output)
     del output, decoded, sampled, latent, encoded, vae, model
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache(force=True)
     return result
 
 
-def run_onnx_pipeline(args: argparse.Namespace) -> Image.Image:
+def run_onnx_pipeline(args: argparse.Namespace) -> list[Image.Image]:
     import comfy.model_management
     import comfy.sd
     import nodes
-    from comfy_extras.nodes_seedvr import SeedVR2Conditioning, SeedVR2PostProcessing, SeedVR2Preprocess
+    from comfy_extras.nodes_seedvr import SeedVR2Conditioning, SeedVR2PostProcessing
 
     model_path, _ = _checkpoint_paths(args)
     onnx_dir = args.onnx_dir.expanduser().absolute()
     onnx_path = onnx_dir / "seedvr2_3b_fp16_dit.onnx"
     vae_encoder_path = onnx_dir / "seedvr2_ema_vae_encoder.onnx"
     vae_decoder_path = onnx_dir / "seedvr2_ema_vae_decoder.onnx"
-    input_path = args.input.expanduser().absolute()
+    video = args.input.is_dir()
+    if video:
+        onnx_path = onnx_dir / "seedvr2_video_dit.onnx"
+        vae_encoder_path = onnx_dir / "seedvr2_video_vae_encoder.onnx"
+        vae_decoder_path = onnx_dir / "seedvr2_video_vae_decoder.onnx"
     for path, label in (
             (model_path, "diffusion model"),
             (onnx_path, "DiT ONNX model"),
             (vae_encoder_path, "VAE encoder ONNX model"),
             (vae_decoder_path, "VAE decoder ONNX model"),
-            (input_path, "input image"),
     ):
         if not path.is_file():
             raise FileNotFoundError(f"SeedVR2 {label} not found: {path}")
@@ -293,10 +334,12 @@ def run_onnx_pipeline(args: argparse.Namespace) -> Image.Image:
     comfy.model_management.load_models_gpu([model], force_full_load=True)
     diffusion_model = model.model.diffusion_model
 
-    resized_images = resize_image(load_image(input_path), args.scale)
-    prepared_images = SeedVR2Preprocess.execute(resized_images)[0]
+    resized_images = resize_image(load_inputs(args), args.scale)
+    prepared_images = prepare_inputs(args, resized_images)
     prepared_image = prepared_images.reshape(-1, *prepared_images.shape[-3:])
     image_nchw_shape = tuple(prepared_image.movedim(-1, 1).shape)
+    if video:
+        image_nchw_shape = tuple(prepared_images.permute(0, 4, 1, 2, 3).shape)
     encoder_session = create_trt_rtx_session(
         vae_encoder_path,
         args.runtime_cache_dir.expanduser().absolute() / "vae_encoder",
@@ -309,7 +352,7 @@ def run_onnx_pipeline(args: argparse.Namespace) -> Image.Image:
     metadata_device = next(diffusion_model.parameters()).device
     metadata_dtype = next(diffusion_model.parameters()).dtype
     normal, shifted = get_seedvr_metadata(
-        diffusion_model, height, width, CONTEXT_TOKENS, metadata_device, metadata_dtype
+        diffusion_model, height, width, CONTEXT_TOKENS, metadata_device, metadata_dtype, temporal=encoded.shape[2]
     )
     example_shapes = {
         name: tuple(tensor.shape)
@@ -319,7 +362,7 @@ def run_onnx_pipeline(args: argparse.Namespace) -> Image.Image:
                 encoded,
                 torch.ones(1),
                 torch.empty(1, CONTEXT_TOKENS, CONTEXT_WIDTH),
-                torch.empty(1, 17, 1, height, width),
+                torch.empty(1, 17, encoded.shape[2], height, width),
                 *normal.tensors(),
                 *shifted.tensors(),
             ),
@@ -353,6 +396,8 @@ def run_onnx_pipeline(args: argparse.Namespace) -> Image.Image:
         raise RuntimeError("The sampler completed without invoking the TensorRT RTX DiT session.")
 
     decoder_shape = tuple(sampled["samples"].squeeze(2).shape)
+    if video:
+        decoder_shape = tuple(sampled["samples"].shape)
     decoder_session = create_trt_rtx_session(
         vae_decoder_path,
         args.runtime_cache_dir.expanduser().absolute() / "vae_decoder",
@@ -360,7 +405,7 @@ def run_onnx_pipeline(args: argparse.Namespace) -> Image.Image:
     )
     decoded = run_vae_decoder(decoder_session, sampled["samples"])
     output_images = SeedVR2PostProcessing.execute(decoded, resized_images, args.color_correction)[0]
-    return to_pil_image(output_images)
+    return to_pil_frames(output_images)
 
 
 def compare_images(reference: Image.Image, ort_image: Image.Image, output_dir: Path) -> None:
@@ -392,7 +437,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--onnx-dir", type=Path, default=Path("models/SeedVR2-3B-onnx"))
     parser.add_argument("--output-dir", type=Path, default=Path("out/seedvr/verify"))
     parser.add_argument("--runtime-cache-dir", type=Path, default=Path("out/seedvr/trt_rtx_cache"))
-    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input", type=Path, required=True,
+                        help="PNG image or filename-sorted PNG folder containing at most one exported video clip.")
     parser.add_argument("--scale", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--color-correction", choices=("none", "lab", "wavelet", "adain"), default="none")
@@ -408,18 +454,21 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     reference = run_pytorch_pipeline(args)
-    reference_path = output_dir / "pytorch_output.png"
-    reference.save(reference_path)
-    print(f"[PyTorch] Saved {reference_path}")
+    for i, frame in enumerate(reference):
+        reference_path = output_dir / (f"pytorch_{i:04d}.png" if args.input.is_dir() else "pytorch_output.png")
+        frame.save(reference_path)
+        print(f"[PyTorch] Saved {reference_path}")
 
     if args.pytorch_only:
         return
 
     ort_image = run_onnx_pipeline(args)
-    ort_path = output_dir / "ort_output.png"
-    ort_image.save(ort_path)
-    print(f"[ONNX Runtime] Saved {ort_path}")
-    compare_images(reference, ort_image, output_dir)
+    for i, (ref, frame) in enumerate(zip(reference, ort_image, strict=True)):
+        frame_dir = output_dir / f"frame_{i:04d}" if args.input.is_dir() else output_dir
+        frame_dir.mkdir(exist_ok=True)
+        frame.save(frame_dir / "ort_output.png")
+        print(f"[ONNX Runtime] Frame {i}: {frame_dir}")
+        compare_images(ref, frame, frame_dir)
 
 
 if __name__ == "__main__":

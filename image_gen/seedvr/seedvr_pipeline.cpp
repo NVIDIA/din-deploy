@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -182,8 +183,7 @@ namespace din::seedvr {
             return result;
         }
 
-        std::vector<Window> MakeWindows(int64_t height, int64_t width, bool shifted) {
-            constexpr int64_t temporal = 1;
+        std::vector<Window> MakeWindows(int64_t height, int64_t width, bool shifted, int64_t temporal = 1) {
             constexpr int64_t requested_t = 4;
             constexpr int64_t requested_h = 3;
             constexpr int64_t requested_w = 3;
@@ -197,7 +197,8 @@ namespace din::seedvr {
             const double st = shifted && wt < temporal ? 0.5 : 0.0;
             const double sh = shifted && wh < height ? 0.5 : 0.0;
             const double sw = shifted && ww < width ? 0.5 : 0.0;
-            const int64_t nt = st > 0.0 ? static_cast<int64_t>(std::ceil((temporal - st) / wt)) + 1 : 1;
+            const int64_t nt = st > 0.0 ? static_cast<int64_t>(std::ceil((temporal - st) / wt)) + 1
+                                       : static_cast<int64_t>(std::ceil(static_cast<double>(temporal) / wt));
             const int64_t nh = sh > 0.0
                                    ? static_cast<int64_t>(std::ceil((height - sh) / wh)) + 1
                                    : static_cast<int64_t>(std::ceil(static_cast<double>(height) / wh));
@@ -245,14 +246,14 @@ namespace din::seedvr {
             }
         }
 
-        MetadataPack MakeMetadata(int64_t latent_height, int64_t latent_width, bool shifted) {
+        MetadataPack MakeMetadata(int64_t latent_height, int64_t latent_width, bool shifted, int64_t temporal = 1) {
             if (latent_height < 2 || latent_width < 2 || latent_height % 2 != 0 || latent_width % 2 != 0) {
                 throw std::invalid_argument("SeedVR latent dimensions must be positive even values");
             }
             const int64_t height = latent_height / kPatchSize;
             const int64_t width = latent_width / kPatchSize;
-            const int64_t patched_tokens = height * width;
-            const std::vector<Window> windows = MakeWindows(height, width, shifted);
+            const int64_t patched_tokens = temporal * height * width;
+            const std::vector<Window> windows = MakeWindows(height, width, shifted, temporal);
 
             MetadataPack pack;
             pack.window_tgt_idx.reserve(static_cast<size_t>(patched_tokens));
@@ -344,10 +345,10 @@ namespace din::seedvr {
             int64_t max_window_length;
         };
 
-        MetadataDimensions ProfileMetadata(int64_t image_height, int64_t image_width, bool shifted) {
+        MetadataDimensions ProfileMetadata(int64_t image_height, int64_t image_width, bool shifted, int64_t temporal = 1) {
             const int64_t patch_height = image_height / (8 * kPatchSize);
             const int64_t patch_width = image_width / (8 * kPatchSize);
-            const auto windows = MakeWindows(patch_height, patch_width, shifted);
+            const auto windows = MakeWindows(patch_height, patch_width, shifted, temporal);
             int64_t max_window_length = 0;
             for (const auto &window: windows) {
                 const int64_t length = (window.t1 - window.t0) * (window.h1 - window.h0) *
@@ -356,8 +357,8 @@ namespace din::seedvr {
             }
             const int64_t window_count = static_cast<int64_t>(windows.size());
             return {
-                patch_height * patch_width,
-                patch_height * patch_width + window_count * kContextTokens,
+                temporal * patch_height * patch_width,
+                temporal * patch_height * patch_width + window_count * kContextTokens,
                 window_count * max_window_length,
                 window_count,
                 max_window_length
@@ -365,7 +366,7 @@ namespace din::seedvr {
         }
 
         std::string DitProfile(int64_t image_height, int64_t image_width,
-                               const MetadataDimensions &normal, const MetadataDimensions &shifted) {
+                               const MetadataDimensions &normal, const MetadataDimensions &shifted, int64_t temporal = 1) {
             const auto pack = [](std::string_view prefix, const MetadataDimensions &metadata) {
                 return std::string{prefix} +
                        "_window_tgt_idx:" + ShapeString({metadata.video_tokens}) + "," +
@@ -385,9 +386,9 @@ namespace din::seedvr {
             };
             const int64_t latent_height = image_height / 8;
             const int64_t latent_width = image_width / 8;
-            return "latent:" + ShapeString({1, kLatentChannels, 1, latent_height, latent_width}) +
+            return "latent:" + ShapeString({1, kLatentChannels, temporal, latent_height, latent_width}) +
                    ",timestep:1,context:" + ShapeString({1, kContextTokens, kContextWidth}) +
-                   ",condition:" + ShapeString({1, kLatentChannels + 1, 1, latent_height, latent_width}) + "," +
+                   ",condition:" + ShapeString({1, kLatentChannels + 1, temporal, latent_height, latent_width}) + "," +
                    pack("normal", normal) + "," + pack("shifted", shifted);
         }
 
@@ -463,9 +464,11 @@ namespace din::seedvr {
         // Scratch is device-only: full-resolution float accumulators do not need pinned host mirrors.
         void RunVaeTiles(common::OrtRunner &runner, Ort::RunOptions &options, cudaStream_t stream,
                          Ort::Value &input, Ort::Value &output, size_t height, size_t width,
-                         size_t tile_height, size_t tile_width, size_t overlap, bool encode) {
-            const size_t in_channels = encode ? 3 : kLatentChannels;
-            const size_t out_channels = encode ? kLatentChannels : 3;
+                         size_t tile_height, size_t tile_width, size_t overlap, bool encode, size_t frames = 1) {
+            const size_t latent_frames = (frames - 1) / 4 + 1;
+            const size_t in_time = encode ? frames : latent_frames, out_time = encode ? latent_frames : frames;
+            const size_t in_channels = (encode ? 3 : kLatentChannels) * in_time;
+            const size_t out_channels = (encode ? kLatentChannels : 3) * out_time;
             const size_t numerator = encode ? 1 : 8, denominator = encode ? 8 : 1;
             const size_t out_height = height * numerator / denominator;
             const size_t out_width = width * numerator / denominator;
@@ -496,11 +499,17 @@ namespace din::seedvr {
                 }
                 return;
             }
-            const std::vector<int64_t> in_shape{1, static_cast<int64_t>(in_channels),
+            std::vector<int64_t> in_shape{1, static_cast<int64_t>(in_channels),
                 static_cast<int64_t>(tile_height), static_cast<int64_t>(tile_width)};
-            const std::vector<int64_t> out_shape{1, static_cast<int64_t>(out_channels),
+            std::vector<int64_t> out_shape{1, static_cast<int64_t>(out_channels),
                 static_cast<int64_t>(tile_height * numerator / denominator),
                 static_cast<int64_t>(tile_width * numerator / denominator)};
+            if (frames > 1) {
+                in_shape[1] /= in_time;
+                in_shape.insert(in_shape.begin() + 2, static_cast<int64_t>(in_time));
+                out_shape[1] /= out_time;
+                out_shape.insert(out_shape.begin() + 2, static_cast<int64_t>(out_time));
+            }
             const std::vector<int64_t> sum_shape{static_cast<int64_t>(out_channels * out_height * out_width)};
             const std::vector<int64_t> weight_shape{static_cast<int64_t>(out_height * out_width)};
             auto allocator = runner.DeviceAllocator();
@@ -549,6 +558,20 @@ namespace din::seedvr {
         }
 
         Image Run(const fs::path &input_path) {
+            return RunClip({input_path}).front();
+        }
+
+        std::vector<Image> RunClip(const std::vector<fs::path> &input_paths) {
+            const size_t frames = config_.video_frames;
+            if (frames < 1 || (frames - 1) % 4 || input_paths.empty() || input_paths.size() > frames) {
+                throw std::invalid_argument("SeedVR clip requires 1..video_frames images and video_frames=4n+1");
+            }
+            const bool video = frames > 1;
+            if (video && config_.transformer_precision != "fp16") {
+                throw std::invalid_argument("Export the video DiT in FP16; image quantized DiTs do not accept clips");
+            }
+            const int64_t latent_frames = static_cast<int64_t>((frames - 1) / 4 + 1);
+            const auto &input_path = input_paths.front();
             if (config_.transformer_precision != "fp16" && config_.transformer_precision != "fp8_wo" &&
                 config_.transformer_precision != "nvfp4") {
                 throw std::invalid_argument("Transformer precision must be fp16, fp8_wo, or nvfp4");
@@ -568,6 +591,14 @@ namespace din::seedvr {
             const size_t resized_width =
                     std::max<size_t>(2, static_cast<size_t>(std::nearbyint(source.width * config_.scale)));
             const RawImage resized = ResizeBicubic(source, resized_height, resized_width);
+            std::vector<RawImage> resized_clip{resized};
+            for (size_t i = 1; i < input_paths.size(); ++i) {
+                const RawImage frame = LoadPng(input_paths[i]);
+                if (frame.height != source.height || frame.width != source.width) {
+                    throw std::invalid_argument("All video frames must have the same dimensions");
+                }
+                resized_clip.push_back(ResizeBicubic(frame, resized_height, resized_width));
+            }
             const size_t padded_height = (resized_height + 15) / 16 * 16;
             const size_t padded_width = (resized_width + 15) / 16 * 16;
             const int64_t latent_height = static_cast<int64_t>(padded_height / 8);
@@ -590,11 +621,12 @@ namespace din::seedvr {
                                             std::to_string(max_width) + "x" + std::to_string(max_height) +
                                             " TensorRT RTX profile");
             }
-            MetadataPack normal = MakeMetadata(latent_height, latent_width, false);
-            MetadataPack shifted = MakeMetadata(latent_height, latent_width, true);
+            MetadataPack normal = MakeMetadata(latent_height, latent_width, false, latent_frames);
+            MetadataPack shifted = MakeMetadata(latent_height, latent_width, true, latent_frames);
             std::cout << "Input " << source.width << 'x' << source.height << " -> resized " << resized_width << 'x'
                     << resized_height << " -> padded " << padded_width << 'x' << padded_height << "\n"
-                    << "Latent " << latent_width << 'x' << latent_height << ", normal windows=" << normal.WindowCount()
+                    << "Latent " << latent_frames << 'x' << latent_height << 'x' << latent_width
+                    << " (T,H,W), normal windows=" << normal.WindowCount()
                     << ", shifted windows=" << shifted.WindowCount() << std::endl;
 
             const fs::path context_path = config_.model_dir / "seedvr2_3b_fp16_positive_context.bin";
@@ -607,12 +639,13 @@ namespace din::seedvr {
                                             std::to_string(padded_width) + "x" + std::to_string(padded_height));
             }
             if (!sessions_) {
-                const fs::path encoder_path = config_.model_dir / "seedvr2_ema_vae_encoder.onnx";
+                const auto session_start = std::chrono::steady_clock::now();
+                const fs::path encoder_path = config_.model_dir / (video ? "seedvr2_video_vae_encoder.onnx" : "seedvr2_ema_vae_encoder.onnx");
                 const fs::path dit_path = config_.model_dir /
-                        ("seedvr2_3b_" + config_.transformer_precision + "_dit.onnx");
+                        (video ? "seedvr2_video_dit.onnx" : "seedvr2_3b_" + config_.transformer_precision + "_dit.onnx");
                 std::cout << "Transformer precision: " << config_.transformer_precision
                           << " (" << dit_path.generic_string() << ")" << std::endl;
-                const fs::path decoder_path = config_.model_dir / "seedvr2_ema_vae_decoder.onnx";
+                const fs::path decoder_path = config_.model_dir / (video ? "seedvr2_video_vae_decoder.onnx" : "seedvr2_ema_vae_decoder.onnx");
                 RequireFile(encoder_path);
                 RequireFile(dit_path);
                 RequireFile(decoder_path);
@@ -624,22 +657,23 @@ namespace din::seedvr {
                 compute_stream_ = common::CreateTensorRTRTXComputeStream(env_);
                 auto *stream = &compute_stream_;
                 const common::EpContextOptions ep_context{.output_dir = config_.ep_context_dir.string()};
-                const std::string image_size = std::to_string(padded_width) + "x" +
+                const std::string video_prefix = video ? "video" + std::to_string(frames) + "_" : "";
+                const std::string image_size = video_prefix + std::to_string(padded_width) + "x" +
                                                std::to_string(padded_height);
                 const auto normal_profile = ProfileMetadata(static_cast<int64_t>(padded_height),
-                                                            static_cast<int64_t>(padded_width), false);
+                                                            static_cast<int64_t>(padded_width), false, latent_frames);
                 const auto shifted_profile = ProfileMetadata(static_cast<int64_t>(padded_height),
-                                                             static_cast<int64_t>(padded_width), true);
+                                                             static_cast<int64_t>(padded_width), true, latent_frames);
 
                 auto sessions = std::make_unique<SessionBundle>();
                 sessions->padded_height = padded_height;
                 sessions->padded_width = padded_width;
                 // TODO: TensorRT RTX attention decomposition fails with dynamic spatial shapes;
                 // restore ranged profiles when that path supports them.
-                auto encoder_profile = ExactProfile("image:" + ShapeString({
-                                                        1, 3, encoder_height, encoder_width
-                                                    }),
-                                                    "vae_encoder_" + std::to_string(encoder_width) + "x" +
+                auto encoder_profile = ExactProfile("image:" + (video
+                                                    ? ShapeString({1, 3, static_cast<int64_t>(frames), encoder_height, encoder_width})
+                                                    : ShapeString({1, 3, encoder_height, encoder_width})),
+                                                    video_prefix + "vae_encoder_" + std::to_string(encoder_width) + "x" +
                                                     std::to_string(encoder_height));
                 encoder_profile.skip_compile = true;
                 sessions->encoder = std::make_unique<common::OrtRunner>(
@@ -647,7 +681,7 @@ namespace din::seedvr {
                     encoder_profile, stream);
                 auto dit_profile = ExactProfile(
                     DitProfile(static_cast<int64_t>(padded_height), static_cast<int64_t>(padded_width),
-                               normal_profile, shifted_profile),
+                               normal_profile, shifted_profile, latent_frames),
                     "dit_" + config_.transformer_precision + "_" + image_size);
                 // The exporter gives each dynamic ONNX input dimension a stable name.
                 // Specializing them at session creation avoids a TensorRT RTX Myelin
@@ -678,8 +712,10 @@ namespace din::seedvr {
                     env_, dit_path.string(), "trt-rtx", config_.ep_cache_dir.string(), ep_context, dit_profile, stream);
                 sessions->decoder = std::make_unique<common::OrtRunner>(
                     env_, decoder_path.string(), "trt-rtx", config_.ep_cache_dir.string(), ep_context,
-                    ExactProfile("latent:" + ShapeString({1, kLatentChannels, decoder_height, decoder_width}),
-                                 std::string("vae_decoder_unclamped_") +
+                    ExactProfile("latent:" + (video
+                                 ? ShapeString({1, kLatentChannels, latent_frames, decoder_height, decoder_width})
+                                 : ShapeString({1, kLatentChannels, decoder_height, decoder_width})),
+                                 video_prefix + std::string("vae_decoder_unclamped_") +
                                  std::to_string(decoder_width * 8) + "x" + std::to_string(decoder_height * 8)),
                     stream);
                 if (!sessions->encoder->HasDeviceIo() || !sessions->dit->HasDeviceIo() ||
@@ -687,24 +723,34 @@ namespace din::seedvr {
                     throw std::runtime_error("SeedVR requires CUDA-backed TensorRT RTX I/O");
                 }
                 sessions_ = std::move(sessions);
+                const double session_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - session_start).count();
+                std::cout << "SeedVR session creation: " << session_ms << " ms" << std::endl;
             }
+            const auto inference_start = std::chrono::steady_clock::now();
             auto &encoder = *sessions_->encoder;
             auto &dit = *sessions_->dit;
             auto &decoder = *sessions_->decoder;
 
-            const size_t spatial_size = static_cast<size_t>(latent_height * latent_width);
-            const std::vector<int64_t> image_shape{
+            const size_t spatial_size = static_cast<size_t>(latent_frames * latent_height * latent_width);
+            std::vector<int64_t> image_shape{
                 1, 3, static_cast<int64_t>(padded_height),
                 static_cast<int64_t>(padded_width)
             };
-            const std::vector<int64_t> encoded_shape{1, kLatentChannels, latent_height, latent_width};
-            const std::vector<int64_t> latent_shape{1, kLatentChannels, 1, latent_height, latent_width};
-            const std::vector<int64_t> condition_shape{1, kLatentChannels + 1, 1, latent_height, latent_width};
-            const std::vector<int64_t> output_shape{
+            std::vector<int64_t> encoded_shape{1, kLatentChannels, latent_height, latent_width};
+            const std::vector<int64_t> latent_shape{1, kLatentChannels, latent_frames, latent_height, latent_width};
+            const std::vector<int64_t> condition_shape{1, kLatentChannels + 1, latent_frames, latent_height, latent_width};
+            std::vector<int64_t> output_shape{
                 1, 3, static_cast<int64_t>(padded_height),
                 static_cast<int64_t>(padded_width)
             };
 
+            const auto frame_shape = output_shape;
+            if (video) {
+                image_shape.insert(image_shape.begin() + 2, static_cast<int64_t>(frames));
+                output_shape.insert(output_shape.begin() + 2, static_cast<int64_t>(frames));
+                encoded_shape.insert(encoded_shape.begin() + 2, latent_frames);
+            }
             const auto cuda_stream = reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle());
             // Drain queued work before buffers are destroyed, including exception paths.
             struct StreamDrain {
@@ -722,12 +768,21 @@ namespace din::seedvr {
                     common::TensorBuffer<Fp16> encoded(encoder, encoded_shape, true);
                     Ort::IoBinding encoder_io(encoder.session);
                     StreamDrain drain{cuda_stream};
-                    FillBuffer(image, PadToNchwFp16(resized, padded_height, padded_width));
+                    const size_t image_plane = padded_height * padded_width;
+                    std::vector<Fp16> clip_pixels(3 * frames * image_plane);
+                    for (size_t t = 0; t < frames; ++t) {
+                        const auto pixels = PadToNchwFp16(resized_clip[std::min(t, resized_clip.size() - 1)], padded_height, padded_width);
+                        for (size_t c = 0; c < 3; ++c) {
+                            std::copy_n(pixels.data() + c * image_plane, image_plane,
+                                        clip_pixels.data() + (c * frames + t) * image_plane);
+                        }
+                    }
+                    FillBuffer(image, clip_pixels);
                     std::cout << "Running VAE encoder" << std::endl;
                     if (config_.vae_encoder_tile_size) {
                         RunVaeTiles(encoder, run_options, cuda_stream, image.BindingValue(), encoded.BindingValue(),
                                     padded_height, padded_width, encoder_height, encoder_width,
-                                    config_.vae_encoder_overlap, true);
+                                    config_.vae_encoder_overlap, true, frames);
                     } else {
                         encoder_io.BindInput("image", image.BindingValue());
                         encoder_io.BindOutput("latent", encoded.BindingValue());
@@ -827,43 +882,61 @@ namespace din::seedvr {
             if (config_.vae_decoder_tile_size) {
                 RunVaeTiles(decoder, run_options, cuda_stream, sampled.BindingValue(), decoded.BindingValue(),
                             latent_height, latent_width, decoder_height, decoder_width,
-                            config_.vae_decoder_overlap / 8, false);
+                            config_.vae_decoder_overlap / 8, false, frames);
             } else {
                 decoder_io.BindInput("latent", sampled.BindingValue());
                 decoder_io.BindOutput("image", decoded.BindingValue());
                 decoder.session.Run(run_options, decoder_io);
             }
             LaunchSeedVrClampKernel(cuda_stream, decoded.BindingValue().GetTensorMutableData<Fp16>(),
-                                    3 * padded_height * padded_width);
+                                    3 * frames * padded_height * padded_width);
             SEEDVR_CUDA_CHECK(cudaGetLastError());
-            if (config_.color_correction == "lab") {
-                common::TensorBuffer<float> reference(decoder, image_shape, true);
-                FillBuffer(reference, PadToNchwFloat(resized, padded_height, padded_width));
-                LaunchSeedVrLabKernel(cuda_stream, decoded.BindingValue().GetTensorMutableData<Fp16>(),
-                                      reference.BindingValue().GetTensorData<float>(),
-                                      resized_height, resized_width, padded_width);
-                SEEDVR_CUDA_CHECK(cudaGetLastError());
-                SEEDVR_CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
-            }
-            auto output_ready = decoded.CopyAsyncToHostWithNotification();
-            output_ready.Sync();
-
-            Image result;
-            result.height = resized_height - resized_height % 2;
-            result.width = resized_width - resized_width % 2;
-            result.chw.resize(3 * result.height * result.width);
-            const Fp16 *decoded_data = decoded.HostData();
+            std::vector<Image> results;
+            common::TensorBuffer<Fp16> output_frame(decoder, frame_shape, true);
             const size_t padded_plane = padded_height * padded_width;
-            const size_t result_plane = result.height * result.width;
-            for (size_t channel = 0; channel < 3; ++channel) {
-                for (size_t y = 0; y < result.height; ++y) {
-                    for (size_t x = 0; x < result.width; ++x) {
-                        result.chw[channel * result_plane + y * result.width + x] =
-                                decoded_data[channel * padded_plane + y * padded_width + x].ToFloat();
+            for (size_t t = 0; t < input_paths.size(); ++t) {
+                for (size_t c = 0; c < 3; ++c) {
+                    SEEDVR_CUDA_CHECK(cudaMemcpyAsync(
+                        output_frame.BindingValue().GetTensorMutableData<Fp16>() + c * padded_plane,
+                        decoded.BindingValue().GetTensorData<Fp16>() + (c * frames + t) * padded_plane,
+                        padded_plane * sizeof(Fp16), cudaMemcpyDeviceToDevice, cuda_stream));
+                }
+                if (config_.color_correction == "lab") {
+                    common::TensorBuffer<float> reference(decoder, frame_shape, true);
+                    FillBuffer(reference, PadToNchwFloat(resized_clip[t], padded_height, padded_width));
+                    LaunchSeedVrLabKernel(cuda_stream, output_frame.BindingValue().GetTensorMutableData<Fp16>(),
+                                          reference.BindingValue().GetTensorData<float>(),
+                                          resized_height, resized_width, padded_width, padded_plane);
+                    SEEDVR_CUDA_CHECK(cudaGetLastError());
+                    SEEDVR_CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+                }
+                auto output_ready = output_frame.CopyAsyncToHostWithNotification();
+                output_ready.Sync();
+
+                Image result;
+                result.height = resized_height - resized_height % 2;
+                result.width = resized_width - resized_width % 2;
+                result.chw.resize(3 * result.height * result.width);
+                const Fp16 *decoded_data = output_frame.HostData();
+                const size_t result_plane = result.height * result.width;
+                for (size_t channel = 0; channel < 3; ++channel) {
+                    for (size_t y = 0; y < result.height; ++y) {
+                        for (size_t x = 0; x < result.width; ++x) {
+                            result.chw[channel * result_plane + y * result.width + x] =
+                                    decoded_data[channel * padded_plane + y * padded_width + x].ToFloat();
+                        }
                     }
                 }
+                results.push_back(std::move(result));
             }
-            return result;
+            // Include completed GPU work and output transfers in the wall-clock timing.
+            SEEDVR_CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+            const double inference_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - inference_start).count();
+            std::cout << "SeedVR inference: " << inference_ms << " ms total, "
+                      << inference_ms / static_cast<double>(input_paths.size()) << " ms/image ("
+                      << input_paths.size() << " images)" << std::endl;
+            return results;
         }
 
     private:
@@ -893,5 +966,8 @@ namespace din::seedvr {
 
     Image Pipeline::Run(const std::filesystem::path &input_path) {
         return impl_->Run(input_path);
+    }
+    std::vector<Image> Pipeline::RunClip(const std::vector<std::filesystem::path> &input_paths) {
+        return impl_->RunClip(input_paths);
     }
 } // namespace din::seedvr

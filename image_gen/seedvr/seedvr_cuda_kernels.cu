@@ -73,13 +73,13 @@ namespace {
 
     __global__ void InitLabLowpass(const __half *generated, const float *reference,
                                    float *generated_low, float *reference_low,
-                                   size_t height, size_t width, size_t stride) {
+                                   size_t height, size_t width, size_t stride, size_t channel_stride) {
         const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t plane = height * width;
         if (i >= 3 * plane) return;
         const size_t channel = i / plane;
         const size_t y = i % plane / width, x = i % width;
-        const size_t padded = channel * height * stride + y * stride + x;
+        const size_t padded = channel * channel_stride + y * stride + x;
         generated_low[i] = Clamp01(__half2float(generated[padded])) * 2.0f - 1.0f;
         reference_low[i] = Clamp01(reference[padded]) * 2.0f - 1.0f;
     }
@@ -125,14 +125,14 @@ namespace {
     __global__ void PrepareLab(const __half *generated, const float *reference,
                                const float *generated_low, const float *reference_low,
                                float *generated_lab, float *reference_lab,
-                               size_t height, size_t width, size_t stride) {
+                               size_t height, size_t width, size_t stride, size_t channel_stride) {
         const size_t p = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t plane = height * width;
         if (p >= plane) return;
         const size_t y = p / width, x = p % width;
         float rgb[3], ref_rgb[3];
         for (size_t c = 0; c < 3; ++c) {
-            const size_t padded = c * height * stride + y * stride + x;
+            const size_t padded = c * channel_stride + y * stride + x;
             const float raw = 2.0f * Clamp01(__half2float(generated[padded])) - 1.0f;
             const float combined = fminf(1.0f, fmaxf(-1.0f, raw - generated_low[c * plane + p] +
                                                               reference_low[c * plane + p]));
@@ -176,7 +176,7 @@ namespace {
                                        : 12.92f * x);
     }
 
-    __global__ void FinishLab(const float *lab, __half *image, size_t height, size_t width, size_t stride) {
+    __global__ void FinishLab(const float *lab, __half *image, size_t height, size_t width, size_t stride, size_t channel_stride) {
         const size_t p = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t plane = height * width;
         if (p >= plane) return;
@@ -192,7 +192,7 @@ namespace {
             LinearToSrgb(0.0556434f * X - 0.2040259f * Y + 1.0572252f * Z)
         };
         const size_t y = p / width, x = p % width;
-        for (size_t c = 0; c < 3; ++c) image[c * height * stride + y * stride + x] = __float2half_rn(rgb[c]);
+        for (size_t c = 0; c < 3; ++c) image[c * channel_stride + y * stride + x] = __float2half_rn(rgb[c]);
     }
 
     void CheckCuda(cudaError_t error, const char *operation) {
@@ -263,7 +263,7 @@ void LaunchSeedVrClampKernel(cudaStream_t stream, void *image, size_t element_co
 }
 
 void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *reference,
-                          size_t height, size_t width, size_t stride) {
+                          size_t height, size_t width, size_t stride, size_t channel_stride) {
     const size_t plane = height * width;
     if (plane > UINT32_MAX) throw std::invalid_argument("SeedVR LAB frame exceeds uint32 index capacity");
     const unsigned int pixel_blocks = static_cast<unsigned int>((plane + kThreads - 1) / kThreads);
@@ -271,7 +271,7 @@ void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *referen
     DeviceScratch<float> generated_low(3 * plane), reference_low(3 * plane);
     DeviceScratch<float> generated_next(3 * plane), reference_next(3 * plane);
     InitLabLowpass<<<channel_blocks, kThreads, 0, stream>>>(static_cast<const __half *>(image),
-        static_cast<const float *>(reference), generated_low.get(), reference_low.get(), height, width, stride);
+        static_cast<const float *>(reference), generated_low.get(), reference_low.get(), height, width, stride, channel_stride);
     float *generated_current = generated_low.get(), *reference_current = reference_low.get();
     float *generated_temp = generated_next.get(), *reference_temp = reference_next.get();
     for (int level = 0; level < 5; ++level) {
@@ -286,7 +286,7 @@ void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *referen
     float *generated_lab = generated_temp, *reference_lab = reference_temp;
     PrepareLab<<<pixel_blocks, kThreads, 0, stream>>>(static_cast<const __half *>(image),
         static_cast<const float *>(reference), generated_current, reference_current,
-        generated_lab, reference_lab, height, width, stride);
+        generated_lab, reference_lab, height, width, stride, channel_stride);
     DeviceScratch<float> generated_sorted(plane), reference_sorted(plane);
     DeviceScratch<uint32_t> indices(plane);
     const auto policy = thrust::cuda::par.on(stream);
@@ -301,7 +301,7 @@ void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *referen
         ScatterLabMatch<<<pixel_blocks, kThreads, 0, stream>>>(reference_sorted.get(),
             indices.get(), generated_lab, plane, channel);
     }
-    FinishLab<<<pixel_blocks, kThreads, 0, stream>>>(generated_lab, static_cast<__half *>(image), height, width, stride);
+    FinishLab<<<pixel_blocks, kThreads, 0, stream>>>(generated_lab, static_cast<__half *>(image), height, width, stride, channel_stride);
     CheckCuda(cudaGetLastError(), "SeedVR LAB kernels");
 }
 

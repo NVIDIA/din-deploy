@@ -24,6 +24,8 @@ namespace din::seedvr {
         common::Rng rng = common::Rng::CpuStd;
         std::string weight_streaming_budget;
         std::string color_correction = "lab";
+        // Fixed exported clip length (4n+1); one selects the image models.
+        size_t video_frames = 1;
         // Tile and overlap dimensions in upscaled image pixels; zero size disables tiling.
         int vae_encoder_tile_size = 0;
         int vae_encoder_overlap = 64;
@@ -50,6 +52,8 @@ namespace din::seedvr {
         Image Run();
 
         Image Run(const std::filesystem::path &input_path);
+        // Repeat the final input to video_frames, returning only the real frames.
+        std::vector<Image> RunClip(const std::vector<std::filesystem::path> &input_paths);
 
     private:
         class Impl;

@@ -6,8 +6,8 @@
 
 The VAE encoder/decoder are separate ONNX components with dynamic image
 height/width. The DiT is exported as a third component with matching dynamic
-latent height/width. Batch, temporal length (one frame), and the 58x5120
-conditioning tensor are fixed.
+latent height/width. Batch, temporal length (--video-frames, default one),
+and the 58x5120 conditioning tensor are fixed.
 """
 
 from __future__ import annotations
@@ -136,12 +136,13 @@ def _generate_metadata_pack(
         text_length: int,
         device: torch.device,
         dtype: torch.dtype,
+    temporal: int = 1,
 ) -> WindowMetadata:
     import comfy.ldm.seedvr.model as seedvr_model
 
     patch_height = latent_height // 2
     patch_width = latent_width // 2
-    vid_shape = torch.tensor([[1, patch_height, patch_width]], device=device, dtype=torch.long)
+    vid_shape = torch.tensor([[temporal, patch_height, patch_width]], device=device, dtype=torch.long)
 
     def make_window(x: torch.Tensor) -> list[torch.Tensor]:
         temporal, height, width, _ = x.shape
@@ -149,7 +150,7 @@ def _generate_metadata_pack(
         return [x[st, sh, sw] for st, sh, sw in slices]
 
     partition, _, window_shape, window_count, _, _ = seedvr_model.window_idx(vid_shape, make_window)
-    patched_tokens = patch_height * patch_width
+    patched_tokens = temporal * patch_height * patch_width
     window_tgt_idx = partition(torch.arange(patched_tokens, device=device)).to(torch.long)
     window_src_idx = torch.argsort(window_tgt_idx)
 
@@ -200,16 +201,17 @@ def get_seedvr_metadata(
         text_length: int,
         device: torch.device,
         dtype: torch.dtype,
+        temporal: int = 1,
 ) -> tuple[WindowMetadata, WindowMetadata]:
     """Return cached normal and shifted metadata for one latent resolution."""
     if latent_height < 2 or latent_width < 2 or latent_height % 2 or latent_width % 2:
         raise ValueError("SeedVR2 latent height and width must be even values of at least 2.")
     normal_attention, shifted_attention = validate_shared_metadata_config(diffusion_model)
-    key = (latent_height, latent_width, text_length, str(device), dtype)
+    key = (temporal, latent_height, latent_width, text_length, str(device), dtype)
     if key not in _METADATA_CACHE:
         _METADATA_CACHE[key] = (
-            _generate_metadata_pack(normal_attention, latent_height, latent_width, text_length, device, dtype),
-            _generate_metadata_pack(shifted_attention, latent_height, latent_width, text_length, device, dtype),
+            _generate_metadata_pack(normal_attention, latent_height, latent_width, text_length, device, dtype, temporal),
+            _generate_metadata_pack(shifted_attention, latent_height, latent_width, text_length, device, dtype, temporal),
         )
     return _METADATA_CACHE[key]
 
@@ -253,6 +255,30 @@ class SeedVRVaeDecoderExportWrapper(torch.nn.Module):
         image = self.vae.decode(latent).squeeze(2).add(1.0).div(2.0)
         # Clamp only after spatial tile blending in the CUDA pipeline.
         return image
+
+
+class SeedVRVideoEncoderExportWrapper(torch.nn.Module):
+    """BCTHW video with native causal temporal compression (4n+1 -> n+1)."""
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, image):
+        from comfy.ldm.seedvr.constants import BYTEDANCE_VAE_SCALING_FACTOR
+        # _encode bypasses the Python temporal slicing/cache loop; the full clip
+        # follows the same causal convolution path with MemoryState.DISABLED.
+        moments = self.vae._encode(image.mul(2.0).sub(1.0))
+        return moments.chunk(2, dim=1)[0].mul(BYTEDANCE_VAE_SCALING_FACTOR)
+
+
+class SeedVRVideoDecoderExportWrapper(torch.nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, latent):
+        from comfy.ldm.seedvr.constants import BYTEDANCE_VAE_SCALING_FACTOR
+        return self.vae._decode(latent / BYTEDANCE_VAE_SCALING_FACTOR).add(1.0).div(2.0)
 
 
 def _export_causal_conv_forward(self, input: torch.Tensor, memory_state=None, memory_cache=None) -> torch.Tensor:
@@ -310,7 +336,7 @@ def _export_causal_norm_wrapper(norm_layer: torch.nn.Module, x: torch.Tensor) ->
 def _export_scaled_dot_product_attention(
         q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args, **kwargs
 ) -> torch.Tensor:
-    """Avoid ONNX Attention, which ONNX Runtime's TensorRT RTX EP cannot build."""
+    """Opt-in workaround for older ORT TensorRT RTX providers rejecting Attention."""
     if args or kwargs.get("attn_mask") is not None or kwargs.get("dropout_p", 0.0) != 0.0 or kwargs.get("is_causal", False):
         raise ValueError("The SeedVR2 VAE export expects unmasked, noncausal attention without dropout.")
     scale = q.shape[-1] ** -0.5
@@ -629,7 +655,7 @@ def dummy_inputs(
         device: torch.device, dtype: torch.dtype, temporal: int, height: int, width: int
 ) -> tuple[torch.Tensor, ...]:
     if temporal < 1:
-        raise ValueError(f"--temporal must be at least 1, got {temporal}.")
+        raise ValueError(f"Latent temporal length must be at least 1, got {temporal}.")
     if height < 2 or width < 2 or height % 2 or width % 2:
         raise ValueError("--latent-height and --latent-width must be even values of at least 2.")
     latent = torch.randn(1, LATENT_CHANNELS, temporal, height, width, device=device, dtype=dtype)
@@ -661,7 +687,7 @@ def dit_inputs_with_metadata(
         width: int,
 ) -> tuple[torch.Tensor, ...]:
     inputs = dummy_inputs(device, dtype, temporal, height, width)
-    normal, shifted = get_seedvr_metadata(diffusion_model, height, width, CONTEXT_TOKENS, device, dtype)
+    normal, shifted = get_seedvr_metadata(diffusion_model, height, width, CONTEXT_TOKENS, device, dtype, temporal)
     return (*inputs, *normal.tensors(), *shifted.tensors())
 
 
@@ -686,11 +712,12 @@ def verify_eager_adapter(
     print(f"Eager adapter parity passed (maximum absolute error {maximum_error:.6g}).")
 
 
-def validate_metadata_shapes(diffusion_model: torch.nn.Module, device: torch.device, dtype: torch.dtype) -> None:
+def validate_metadata_shapes(diffusion_model: torch.nn.Module, device: torch.device, dtype: torch.dtype,
+                             temporal: int = 1) -> None:
     observations: list[tuple[int, int, tuple[int, int], tuple[int, int]]] = []
     for height, width in ((64, 96), (112, 112), (112, 160)):
-        normal, shifted = get_seedvr_metadata(diffusion_model, height, width, CONTEXT_TOKENS, device, dtype)
-        expected_tokens = (height // 2) * (width // 2)
+        normal, shifted = get_seedvr_metadata(diffusion_model, height, width, CONTEXT_TOKENS, device, dtype, temporal)
+        expected_tokens = temporal * (height // 2) * (width // 2)
         for pack in (normal, shifted):
             if pack.window_tgt_idx.numel() != expected_tokens:
                 raise RuntimeError(f"Metadata for {height}x{width} has an invalid video token count.")
@@ -787,7 +814,7 @@ def capture_and_validate_exported_program(
             (example_height, example_width),
             (example_height, example_width + 16),
     ):
-        shape_inputs = dit_inputs_with_metadata(diffusion_model, device, dtype, 1, height, width)
+        shape_inputs = dit_inputs_with_metadata(diffusion_model, device, dtype, inputs[0].shape[2], height, width)
         with torch.no_grad():
             expected = adapter(*shape_inputs)
             actual = exported_module(*shape_inputs)
@@ -808,6 +835,7 @@ def export_vae_components(
         export_encoder: bool,
         export_decoder: bool,
         decompose_attention: bool = False,
+        video_frames: int = 1,
 ) -> None:
     if image_height < 16 or image_width < 16 or image_height % 16 or image_width % 16:
         raise ValueError("--image-height and --image-width must be multiples of 16 and at least 16.")
@@ -819,9 +847,22 @@ def export_vae_components(
     )
     encoder = SeedVRVaeEncoderExportWrapper(vae).eval()
     decoder = SeedVRVaeDecoderExportWrapper(vae).eval()
+    spatial_axis = 2
+    if video_frames > 1:
+        spatial_axis = 3
+        image = torch.randn(1, 3, video_frames, image_height, image_width, device=device, dtype=dtype, generator=generator)
+        latent = torch.randn(1, LATENT_CHANNELS, (video_frames - 1) // 4 + 1,
+                             image_height // 8, image_width // 8, device=device, dtype=dtype, generator=generator)
+        encoder = SeedVRVideoEncoderExportWrapper(vae).eval()
+        decoder = SeedVRVideoDecoderExportWrapper(vae).eval()
     with torch.no_grad():
         expected_encoded = encoder(image)
         expected_decoded = decoder(latent)
+        if video_frames > 1:
+            from comfy.ldm.seedvr.constants import BYTEDANCE_VAE_SCALING_FACTOR
+            torch.testing.assert_close(expected_encoded, vae.encode(image * 2 - 1) * BYTEDANCE_VAE_SCALING_FACTOR,
+                                       rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(expected_decoded, vae.decode(latent).add(1).div(2), rtol=2e-2, atol=2e-2)
         with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
             actual_encoded = encoder(image)
             actual_decoded = decoder(latent)
@@ -839,8 +880,8 @@ def export_vae_components(
                 ("image",),
                 ("latent",),
                 dynamic_shapes=({
-                    2: 16 * torch.export.Dim("image_height_units", min=1),
-                    3: 16 * torch.export.Dim("image_width_units", min=1),
+                    spatial_axis: 16 * torch.export.Dim("image_height_units", min=1),
+                    spatial_axis + 1: 16 * torch.export.Dim("image_width_units", min=1),
                 },),
             )
         print(f"Exported dynamic SeedVR VAE encoder: {encoder_output}")
@@ -855,15 +896,15 @@ def export_vae_components(
                 ("latent",),
                 ("image",),
                 dynamic_shapes=({
-                    2: 2 * torch.export.Dim("latent_height_units", min=1),
-                    3: 2 * torch.export.Dim("latent_width_units", min=1),
+                    spatial_axis: 2 * torch.export.Dim("latent_height_units", min=1),
+                    spatial_axis + 1: 2 * torch.export.Dim("latent_width_units", min=1),
                 },),
             )
         print(f"Exported dynamic SeedVR VAE decoder: {decoder_output}")
         validate_vae_onnx(decoder_output, "latent", "image")
 
 
-def validate_onnx(output_path: Path) -> None:
+def validate_onnx(output_path: Path, temporal: int = 1) -> None:
     import onnx
 
     # The 3B external-data model exceeds protobuf's 2 GiB in-memory checker
@@ -879,8 +920,8 @@ def validate_onnx(output_path: Path) -> None:
         dims = value.type.tensor_type.shape.dim
         if not all(dims[index].dim_param for index in (3, 4)):
             raise RuntimeError(f"{value.name} does not retain dynamic spatial dimensions.")
-        if dims[2].dim_param or dims[2].dim_value != 1:
-            raise RuntimeError(f"{value.name} temporal length must remain fixed at one.")
+        if dims[2].dim_param or dims[2].dim_value != temporal:
+            raise RuntimeError(f"{value.name} temporal length must remain fixed at {temporal}.")
     for name in DIT_INPUT_NAMES[4:]:
         if not tensor_inputs[name].type.tensor_type.shape.dim[0].dim_param:
             raise RuntimeError(f"{name} does not retain its dynamic leading dimension.")
@@ -911,7 +952,7 @@ def validate_vae_onnx(output_path: Path, input_name: str, output_name: str) -> N
         if name not in values:
             raise RuntimeError(f"Expected {name!r} in {output_path}, found {list(values)}.")
         dims = values[name].type.tensor_type.shape.dim
-        if not dims[2].dim_param or not dims[3].dim_param:
+        if not dims[-2].dim_param or not dims[-1].dim_param:
             raise RuntimeError(f"{name} does not retain dynamic spatial dimensions in {output_path}.")
     print(f"VAE ONNX structural validation passed: {output_path}")
 
@@ -950,7 +991,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decompose-vae-attention", action="store_true",
                         help="Export VAE attention as matmul/softmax for ONNX Runtime TensorRT RTX compatibility; default: native ONNX Attention.")
     parser.add_argument("--artifacts-dir", type=Path, default=Path("out/seedvr/export-artifacts"))
-    parser.add_argument("--temporal", type=int, default=1, help="Example latent temporal length.")
+    parser.add_argument("--video-frames", type=int, default=1,
+                        help="Export a video clip of 4n+1 frames; default 1 retains the image export. Temporal size is fixed, H/W are dynamic.")
     parser.add_argument("--latent-height", type=int, default=64, help="Even multi-window example latent height.")
     parser.add_argument("--latent-width", type=int, default=96, help="Even multi-window example latent width.")
     parser.add_argument(
@@ -967,6 +1009,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.video_frames < 1 or (args.video_frames - 1) % 4:
+        raise ValueError("--video-frames must be 4n+1 (1, 5, 9, 13, ...).")
+    args.temporal = (args.video_frames - 1) // 4 + 1
     add_comfyui_to_path(args.comfy_root)
     components = set(args.components)
     snapshot = args.snapshot or Path()
@@ -998,6 +1043,14 @@ def main() -> None:
         .expanduser()
         .absolute()
     )
+    if args.video_frames > 1:
+        output_path = output_path.with_name("seedvr2_video_dit.onnx")
+        vae_encoder_output = vae_encoder_output.with_name("seedvr2_video_vae_encoder.onnx")
+        vae_decoder_output = vae_decoder_output.with_name("seedvr2_video_vae_decoder.onnx")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = output_path.parent / "seedvr2_video_frames.txt"
+        if manifest.exists() and int(manifest.read_text()) != args.video_frames:
+            raise ValueError("Use a separate output directory for each video clip length.")
 
     if {"vae_encoder", "vae_decoder"} & components:
         print(f"Loading SeedVR VAE: {vae_path}")
@@ -1015,6 +1068,7 @@ def main() -> None:
             export_encoder="vae_encoder" in components,
             export_decoder="vae_decoder" in components,
             decompose_attention=args.decompose_vae_attention,
+            video_frames=args.video_frames,
         )
     if {"dit", "context"} & components:
         print(f"Loading SeedVR diffusion model: {model_path}")
@@ -1028,7 +1082,7 @@ def main() -> None:
             diffusion_model, device, dtype, args.temporal, args.latent_height, args.latent_width
         )
         if not args.skip_metadata_validation:
-            validate_metadata_shapes(diffusion_model, device, dtype)
+            validate_metadata_shapes(diffusion_model, device, dtype, args.temporal)
         if not args.skip_eager_parity:
             verify_eager_adapter(diffusion_model, adapter, inputs)
         capture_and_validate_exported_program(adapter, diffusion_model, inputs, device, dtype)
@@ -1044,7 +1098,10 @@ def main() -> None:
         name_dynamic_dit_dimensions(output_path)
         print(f"Exported dynamic SeedVR DiT: {output_path}")
         if not args.skip_validation:
-            validate_onnx(output_path)
+            validate_onnx(output_path, args.temporal)
+
+    if args.video_frames > 1:
+        manifest.write_text(str(args.video_frames) + "\n")
 
 
 if __name__ == "__main__":
