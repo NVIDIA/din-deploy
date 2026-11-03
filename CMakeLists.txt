@@ -44,6 +44,10 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${DIN_RUNTIME_DIR}")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+# Load optional local URL overrides when present.
+if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/cmake/internal_urls.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/internal_urls.cmake")
+endif ()
 include(onnxruntime)
 include(nlohmann_json)
 include(argparse)

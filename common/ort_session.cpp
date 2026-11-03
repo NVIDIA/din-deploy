@@ -909,17 +909,33 @@ Ort::ConstMemoryInfo OrtRunner::DeviceMemory()
 template <typename T>
 TensorBuffer<T>::TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io,
                               bool disable_uma)
-    : runner_(&runner)
+    : TensorBuffer(runner.env, runner.ep_device, runner.compute_stream, shape, use_device_io, disable_uma)
+{
+}
+
+template <typename T>
+TensorBuffer<T>::TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream,
+                              const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma)
+    : env_(&env)
+    , compute_stream_(stream)
     , use_device_io_(use_device_io)
-    , use_unified_memory_(use_device_io && runner.UsesUnifiedMemory() && !disable_uma)
+    , use_unified_memory_(use_device_io && IsCudaUnifiedMemoryDevice(device) && !disable_uma)
     , shape_(shape)
 {
     if (use_device_io_)
     {
-        host_tensor_ = Ort::Value::CreateTensor<T>(runner.PinnedAllocator(), shape_.data(), shape_.size());
+        if (!device || stream == nullptr)
+            throw std::invalid_argument("Device tensors require a device and a persistent stream");
+        const auto pinned = env.GetSharedAllocator(device.GetMemoryInfo(OrtDeviceMemoryType_HOST_ACCESSIBLE));
+        if (!pinned)
+            throw std::runtime_error("Missing shared pinned allocator");
+        host_tensor_ = Ort::Value::CreateTensor<T>(pinned, shape_.data(), shape_.size());
         if (!use_unified_memory_)
         {
-            device_tensor_ = Ort::Value::CreateTensor<T>(runner.DeviceAllocator(), shape_.data(), shape_.size());
+            const auto allocator = env.GetSharedAllocator(device.GetMemoryInfo(OrtDeviceMemoryType_DEFAULT));
+            if (!allocator)
+                throw std::runtime_error("Missing shared device allocator");
+            device_tensor_ = Ort::Value::CreateTensor<T>(allocator, shape_.data(), shape_.size());
         }
     }
     else
@@ -964,7 +980,7 @@ void TensorBuffer<T>::CopyAsyncToDevice()
 {
     if (use_device_io_ && !use_unified_memory_)
     {
-        Copy(runner_->env, {&host_tensor_}, {&device_tensor_}, *runner_->compute_stream);
+        Copy(*env_, {&host_tensor_}, {&device_tensor_}, *compute_stream_);
     }
 }
 
@@ -976,7 +992,7 @@ NotificationPtr TensorBuffer<T>::CopyAsyncToDeviceWithNotification()
     {
         return NotificationPtr{nullptr};
     }
-    auto notification = NotificationPtr(*runner_->compute_stream);
+    auto notification = NotificationPtr(*compute_stream_);
     // Even when the transfer is a unified-memory no-op, record the stream so
     // callers retain a usable ordering point for Sync().
     notification.Record();
@@ -988,7 +1004,7 @@ void TensorBuffer<T>::CopyAsyncToHost()
 {
     if (use_device_io_ && !use_unified_memory_)
     {
-        Copy(runner_->env, {&device_tensor_}, {&host_tensor_}, *runner_->compute_stream);
+        Copy(*env_, {&device_tensor_}, {&host_tensor_}, *compute_stream_);
     }
 }
 
@@ -1000,7 +1016,7 @@ NotificationPtr TensorBuffer<T>::CopyAsyncToHostWithNotification()
     {
         return NotificationPtr{nullptr};
     }
-    auto notification = NotificationPtr(*runner_->compute_stream);
+    auto notification = NotificationPtr(*compute_stream_);
     // A unified-memory buffer needs no copy, but the notification still waits
     // for device writes before its host data is consumed.
     notification.Record();
@@ -1016,7 +1032,7 @@ void TensorBuffer<T>::CopyFrom(TensorBuffer& other)
     }
     if (use_device_io_ && !use_unified_memory_)
     {
-        Copy(runner_->env, {&other.device_tensor_}, {&device_tensor_}, *runner_->compute_stream);
+        Copy(*env_, {&other.device_tensor_}, {&device_tensor_}, *compute_stream_);
     }
     else
     {
