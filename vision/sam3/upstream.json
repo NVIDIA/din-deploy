@@ -1,0 +1,7 @@
+{
+  "source_repo": "https://github.com/facebookresearch/sam3",
+  "source_revision": "f1647e8d0c1d280991f4d1b7d974c2704537fe66",
+  "checkpoint_repo": "facebook/sam3.1",
+  "checkpoint_file": "sam3.1_multiplex.pt",
+  "checkpoint_revision": "daa63191845a41281374e725f4c9e51c7a824460"
+}

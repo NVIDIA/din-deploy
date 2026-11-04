@@ -76,8 +76,9 @@ private:
     void PreparePromptBuffers(const Prompt& prompt);
     void ResizeImageRgbBufferIfNeeded(const Image& image);
     void ResizeMaskRgbBufferIfNeeded(const Image& image);
-    void RunFrame(const Image& image, const std::filesystem::path& mask_path, bool write_mask,
-                  detail::AsyncMaskWriter* writer);
+    void RunFrame(const Image& image);
+    void Synchronize();
+    void RunModel(ort::OrtRunner& runner, Ort::IoBinding& binding, const char* stage);
 
     void RunEncoder(const Image& image);
     void RunFastMemoryAttention();
