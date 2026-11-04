@@ -8,6 +8,7 @@ The VAE encoder/decoder are separate ONNX components with dynamic image
 height/width. The DiT is exported as a third component with matching dynamic
 latent height/width. Batch, temporal length (--video-frames, default one),
 and the 58x5120 conditioning tensor are fixed.
+DiT computation defaults to BF16 with FP16 graph I/O; the VAE remains FP16.
 """
 
 from __future__ import annotations
@@ -20,14 +21,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-
-# Torch's ONNX progress messages contain Unicode status glyphs.  The native
-# Windows console can still default to cp1252, which otherwise obscures the
-# actual export error with a second UnicodeEncodeError.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 DEFAULT_REPO_ID = "Comfy-Org/SeedVR2"
 CONTEXT_TOKENS = 58
@@ -84,7 +77,7 @@ class WindowMetadata:
         )
 
 
-_METADATA_CACHE: dict[tuple[int, int, int, str, torch.dtype], tuple[WindowMetadata, WindowMetadata]] = {}
+_METADATA_CACHE: dict[tuple[object, ...], tuple[WindowMetadata, WindowMetadata]] = {}
 
 
 def _attention_signature(block: torch.nn.Module) -> tuple[object, ...]:
@@ -105,8 +98,6 @@ def validate_shared_metadata_config(
         diffusion_model: torch.nn.Module,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Assert that all blocks can share one normal and one shifted pack."""
-    if getattr(diffusion_model, "_7b_version", False):
-        raise ValueError("The dynamic metadata exporter currently supports only SeedVR2 3B.")
     if len(diffusion_model.blocks) < 2:
         raise ValueError("SeedVR2 must contain at least a normal and shifted attention block.")
 
@@ -178,9 +169,23 @@ def _generate_metadata_pack(
         raise RuntimeError("Padded attention metadata does not match packed attention length.")
 
     txt_shape = torch.full((window_shape.shape[0], 1), text_length, device=device, dtype=torch.long)
-    vid_freqs, txt_freqs = attention.rope.get_freqs(window_shape, txt_shape)
+    if attention.rope.mm:
+        vid_freqs, txt_freqs = attention.rope.get_freqs(window_shape, txt_shape)
+    else:
+        # 7B uses pixel RoPE for video only. Keep the same matrix input ABI;
+        # identity matrices leave the repeated text queries/keys unrotated.
+        angles = attention.rope.get_freqs(window_shape)[..., ::2]
+        cosine, sine = angles.cos(), angles.sin()
+        vid_freqs = torch.stack((cosine, -sine, sine, cosine), dim=-1).reshape(
+            angles.shape[0], angles.shape[1], 2, 2
+        )
+        txt_freqs = torch.eye(2, device=device).expand(
+            window_shape.shape[0] * text_length, angles.shape[1], 2, 2
+        )
     freqs = torch.cat([vid_freqs, txt_freqs], dim=0)
-    freqs = torch.index_select(freqs, 0, concat_tgt_idx).to(device=device, dtype=dtype)
+    freqs = torch.index_select(freqs, 0, concat_tgt_idx).to(
+        device=device, dtype=dtype if attention.rope.mm and dtype != torch.bfloat16 else torch.float32
+    )
     return WindowMetadata(
         window_tgt_idx=window_tgt_idx,
         window_src_idx=window_src_idx,
@@ -207,7 +212,8 @@ def get_seedvr_metadata(
     if latent_height < 2 or latent_width < 2 or latent_height % 2 or latent_width % 2:
         raise ValueError("SeedVR2 latent height and width must be even values of at least 2.")
     normal_attention, shifted_attention = validate_shared_metadata_config(diffusion_model)
-    key = (temporal, latent_height, latent_width, text_length, str(device), dtype)
+    key = (temporal, latent_height, latent_width, text_length, str(device), dtype,
+           _attention_signature(diffusion_model.blocks[0]))
     if key not in _METADATA_CACHE:
         _METADATA_CACHE[key] = (
             _generate_metadata_pack(normal_attention, latent_height, latent_width, text_length, device, dtype, temporal),
@@ -380,12 +386,10 @@ def trt_rtx_vae_export_patches(vae: torch.nn.Module, *, decompose_attention: boo
 
 
 class SeedVRDiTExportAdapter(torch.nn.Module):
-    """Tensor-only 3B NaDiT execution path with external window metadata."""
+    """Tensor-only NaDiT execution path with external window metadata."""
 
     def __init__(self, diffusion_model: torch.nn.Module):
         super().__init__()
-        if getattr(diffusion_model, "_7b_version", False):
-            raise ValueError("The ONNX execution adapter currently supports only SeedVR2 3B.")
         self.diffusion_model = diffusion_model
 
     @staticmethod
@@ -401,6 +405,8 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
 
     @staticmethod
     def _rms_norm(module: torch.nn.Module, value: torch.Tensor) -> torch.Tensor:
+        if value.dtype == torch.bfloat16:
+            return torch.nn.functional.rms_norm(value, module.normalized_shape, module.weight, module.eps)
         normalized = value.float() * torch.rsqrt(value.float().square().mean(-1, keepdim=True) + module.eps)
         normalized = normalized.to(value.dtype)
         if module.weight is not None:
@@ -438,10 +444,15 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
         k_padded = k_padded.reshape(batch_shape).transpose(1, 2)
         v_padded = v_padded.reshape(batch_shape).transpose(1, 2)
 
-        scale = q.shape[-1] ** -0.5
-        scores = torch.matmul(q_padded.float(), k_padded.float().transpose(-2, -1)) * scale
-        scores = scores.masked_fill(~valid_keys[:, None, None, :], torch.finfo(scores.dtype).min)
-        output = torch.matmul(torch.softmax(scores, dim=-1), v_padded.float()).to(q.dtype)
+        # Preserve both the previous FP32 attention math and Dynamo's native
+        # ONNX Attention translation; RTX can fuse the resulting operator.
+        # Native PyTorch uses BF16 SDPA for the 7B BF16 path. Retain the
+        # established FP32 attention computation for FP16 exports.
+        attention_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float32
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q_padded.to(attention_dtype), k_padded.to(attention_dtype), v_padded.to(attention_dtype),
+            attn_mask=valid_keys[:, None, None, :], dropout_p=0.0,
+        ).to(q.dtype)
         output = output.transpose(1, 2).reshape(padded_shape)
         return output.index_select(0, padded_flat_idx)
 
@@ -501,13 +512,11 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from comfy.ldm.seedvr.model import MMArg
 
-        hid_len = MMArg(
-            torch.ones(1, device=vid.device, dtype=torch.long) * vid.shape[0],
-            torch.full((1,), CONTEXT_TOKENS, device=txt.device, dtype=torch.long),
-        )
+        # Batch is fixed to one: AdaSingle's [1, channels] timestep values
+        # broadcast over both token streams. Passing hid_len would instead
+        # export repeat_interleave as CumSum and data-dependent Range ops.
         ada_kwargs = {
             "emb": emb,
-            "hid_len": hid_len,
             "cache": cache,
             "branch_tag": MMArg("vid", "txt"),
         }
@@ -549,7 +558,7 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
         model = self.diffusion_model
         patch_t, patch_h, patch_w = model.vid_in.patch_size
         if patch_t != 1:
-            raise RuntimeError("The SeedVR2 3B export expects temporal patch size one.")
+            raise RuntimeError("The SeedVR2 export expects temporal patch size one.")
         combined = torch.cat((latent, condition), dim=1).permute(0, 2, 3, 4, 1)
         combined = combined.reshape(
             1,
@@ -596,12 +605,18 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
 
         if model.vid_out_norm:
             vid = self._rms_norm(model.vid_out_norm, vid)
+            # Upstream's output Ada reuses emb_repeat_0_vid from the first
+            # block, whose embedding is split across the attn/mlp layers.
+            # Preserve that slice explicitly now that broadcasting skips
+            # AdaSingle's repeat cache (the output Ada has only one layer).
+            first_ada = model.blocks[0].ada
+            first_ada = first_ada.all if first_ada.shared_weights else first_ada.vid
+            output_emb = emb.reshape(emb.shape[0], -1, len(first_ada.layers), 3)[:, :, 0, :].flatten(1)
             vid = model.vid_out_ada(
                 vid,
-                emb=emb,
+                emb=output_emb,
                 layer="out",
                 mode="in",
-                hid_len=torch.ones(1, device=vid.device, dtype=torch.long) * vid.shape[0],
                 cache=cache,
                 branch_tag="vid",
             )
@@ -622,7 +637,7 @@ class SeedVRDiTExportAdapter(torch.nn.Module):
         )
 
 
-def load_diffusion_model(model_path: Path) -> tuple[torch.nn.Module, torch.device, torch.dtype]:
+def load_diffusion_model(model_path: Path, dtype: torch.dtype | None = None) -> tuple[torch.nn.Module, torch.device, torch.dtype]:
     import comfy.model_management
     import comfy.sd
 
@@ -631,6 +646,15 @@ def load_diffusion_model(model_path: Path) -> tuple[torch.nn.Module, torch.devic
     patcher = comfy.sd.load_diffusion_model(str(model_path))
     comfy.model_management.load_models_gpu([patcher], force_full_load=True)
     diffusion_model = patcher.model.diffusion_model.eval()
+    if dtype is not None:
+        # Native inference casts weights, but keeps FP32 frequency tables.
+        fp32_buffers = {name: value for name, value in diffusion_model.named_buffers()
+                        if value.dtype == torch.float32}
+        diffusion_model.to(dtype=dtype)
+        for name, value in fp32_buffers.items():
+            parent, _, attribute = name.rpartition(".")
+            setattr(diffusion_model.get_submodule(parent), attribute, value)
+        diffusion_model.dtype = dtype
     parameter = next(diffusion_model.parameters())
     return diffusion_model, parameter.device, parameter.dtype
 
@@ -643,7 +667,7 @@ def load_vae_model(vae_path: Path) -> tuple[torch.nn.Module, torch.device, torch
     if not vae_path.is_file():
         raise FileNotFoundError(f"SeedVR VAE not found: {vae_path}")
     vae_state_dict, vae_metadata = comfy.utils.load_torch_file(str(vae_path), return_metadata=True)
-    vae = comfy.sd.VAE(sd=vae_state_dict, metadata=vae_metadata)
+    vae = comfy.sd.VAE(sd=vae_state_dict, metadata=vae_metadata, dtype=torch.float16)
     vae.throw_exception_if_invalid()
     comfy.model_management.load_models_gpu([vae.patcher], force_full_load=True)
     vae_model = vae.first_stage_model.eval()
@@ -753,6 +777,7 @@ def export_onnx(
         dynamic_shapes: object | None = None,
         dynamic_axes: dict[str, dict[int, str]] | None = None,
         dynamo: bool = True,
+        opset_version: int = 24,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -762,7 +787,7 @@ def export_onnx(
         str(output_path),
         input_names=input_names,
         output_names=output_names,
-        opset_version=23,
+        opset_version=opset_version,
         dynamo=dynamo,
         external_data=True,
         dynamic_shapes=dynamic_shapes,
@@ -773,6 +798,43 @@ def export_onnx(
         report=False,
         artifacts_dir=str(artifacts_dir),
     )
+
+
+def add_fp16_dit_boundaries(output_path: Path) -> None:
+    """Keep native DiT computation, with FP16 I/O for the C++ CUDA pipeline."""
+    import onnx
+
+    model = onnx.load(str(output_path), load_external_data=False)
+    renamed = {}
+    before, after = [], []
+    for value in model.graph.input:
+        if value.name not in DIT_INPUT_NAMES[:4] or value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16:
+            continue
+        native_name = "__seedvr_native_" + value.name
+        renamed[value.name] = native_name
+        before.append(onnx.helper.make_node("Cast", [value.name], [native_name],
+                                           name=native_name, to=value.type.tensor_type.elem_type))
+        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT16
+    for value in model.graph.output:
+        if value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16:
+            continue
+        native_name = "__seedvr_native_" + value.name
+        renamed[value.name] = native_name
+        after.append(onnx.helper.make_node("Cast", [native_name], [value.name],
+                                          name=value.name + "_fp16", to=onnx.TensorProto.FLOAT16))
+        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT16
+    if not renamed:
+        return
+    for node in model.graph.node:
+        for names in (node.input, node.output):
+            for index, name in enumerate(names):
+                names[index] = renamed.get(name, name)
+    for value in model.graph.value_info:
+        value.name = renamed.get(value.name, value.name)
+    nodes = list(model.graph.node)
+    del model.graph.node[:]
+    model.graph.node.extend((*before, *nodes, *after))
+    onnx.save_model(model, str(output_path))
 
 
 def name_dynamic_dit_dimensions(output_path: Path) -> None:
@@ -836,6 +898,7 @@ def export_vae_components(
         export_decoder: bool,
         decompose_attention: bool = False,
         video_frames: int = 1,
+        opset_version: int = 24,
 ) -> None:
     if image_height < 16 or image_width < 16 or image_height % 16 or image_width % 16:
         raise ValueError("--image-height and --image-width must be multiples of 16 and at least 16.")
@@ -879,13 +942,14 @@ def export_vae_components(
                 artifacts_dir / "vae_encoder",
                 ("image",),
                 ("latent",),
+                opset_version=opset_version,
                 dynamic_shapes=({
                     spatial_axis: 16 * torch.export.Dim("image_height_units", min=1),
                     spatial_axis + 1: 16 * torch.export.Dim("image_width_units", min=1),
                 },),
             )
         print(f"Exported dynamic SeedVR VAE encoder: {encoder_output}")
-        validate_vae_onnx(encoder_output, "image", "latent")
+        validate_vae_onnx(encoder_output, "image", "latent", opset_version)
     if export_decoder:
         with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
             export_onnx(
@@ -895,24 +959,31 @@ def export_vae_components(
                 artifacts_dir / "vae_decoder",
                 ("latent",),
                 ("image",),
+                opset_version=opset_version,
                 dynamic_shapes=({
                     spatial_axis: 2 * torch.export.Dim("latent_height_units", min=1),
                     spatial_axis + 1: 2 * torch.export.Dim("latent_width_units", min=1),
                 },),
             )
         print(f"Exported dynamic SeedVR VAE decoder: {decoder_output}")
-        validate_vae_onnx(decoder_output, "latent", "image")
+        validate_vae_onnx(decoder_output, "latent", "image", opset_version)
 
 
-def validate_onnx(output_path: Path, temporal: int = 1) -> None:
+def validate_onnx(output_path: Path, temporal: int = 1, expected_attention_count: int = 32) -> None:
     import onnx
 
     # The 3B external-data model exceeds protobuf's 2 GiB in-memory checker
     # limit.  Passing the path lets ONNX validate the adjacent .data file.
     onnx.checker.check_model(str(output_path))
     model = onnx.load(str(output_path), load_external_data=False)
-    if not any(item.domain == "" and item.version == 23 for item in model.opset_import):
-        raise RuntimeError(f"{output_path} is not an ONNX opset 23 model.")
+    if not any(item.domain == "" and item.version >= 23 for item in model.opset_import):
+        raise RuntimeError(f"{output_path} requires ONNX opset 23 or newer for Attention.")
+    if any(node.op_type == "CumSum" for node in model.graph.node):
+        raise RuntimeError("The batch-one DiT export must broadcast Ada embeddings without CumSum/repeat_interleave.")
+    attention_count = sum(node.domain in ("", "ai.onnx") and node.op_type == "Attention"
+                          for node in model.graph.node)
+    if attention_count != expected_attention_count:
+        raise RuntimeError(f"Expected {expected_attention_count} native DiT Attention nodes, found {attention_count}.")
     tensor_inputs = {value.name: value for value in model.graph.input}
     if set(tensor_inputs) != set(DIT_INPUT_NAMES):
         raise RuntimeError(f"Expected inputs {DIT_INPUT_NAMES}, found {tuple(tensor_inputs)}.")
@@ -940,12 +1011,12 @@ def validate_onnx(output_path: Path, temporal: int = 1) -> None:
     print(f"ONNX structural validation passed: {output_path}")
 
 
-def validate_vae_onnx(output_path: Path, input_name: str, output_name: str) -> None:
+def validate_vae_onnx(output_path: Path, input_name: str, output_name: str, opset_version: int = 24) -> None:
     import onnx
 
     model = onnx.load(str(output_path), load_external_data=False)
-    if not any(item.domain == "" and item.version == 23 for item in model.opset_import):
-        raise RuntimeError(f"{output_path} is not an ONNX opset 23 model.")
+    if not any(item.domain == "" and item.version == opset_version for item in model.opset_import):
+        raise RuntimeError(f"{output_path} is not an ONNX opset {opset_version} model.")
     onnx.checker.check_model(str(output_path))
     values = {value.name: value for value in (*model.graph.input, *model.graph.output)}
     for name in (input_name, output_name):
@@ -971,6 +1042,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comfy-root", default="out/seedvr/ComfyUI")
     parser.add_argument("--snapshot", type=Path, default=None,
                         help="Optional local checkpoint snapshot; otherwise download from Hugging Face's global cache.")
+    parser.add_argument("--dit-dtype", choices=("bf16", "fp16"), default="bf16",
+                        help="DiT weight/compute dtype (default: bf16). VAE remains fp16.")
+    parser.add_argument("--native-dit-io", action="store_true",
+                        help="Keep DiT I/O at its compute dtype; default FP16 boundaries support the C++ pipeline.")
     parser.add_argument(
         "--model", type=Path, default=None, help="Defaults to seedvr2_3b_fp16.safetensors in --snapshot."
     )
@@ -984,13 +1059,16 @@ def parse_args() -> argparse.Namespace:
         default=("vae_encoder", "vae_decoder", "dit"),
         help="Components to export; VAE components can be exported independently of the DiT.",
     )
-    parser.add_argument("--output", type=Path, default=Path("models/SeedVR2-3B-onnx/seedvr2_3b_fp16_dit.onnx"))
+    parser.add_argument("--output", type=Path, default=None,
+                        help="DiT output path; default: models/SeedVR2-3B-onnx/seedvr2_3b_<dit-dtype>_dit.onnx.")
     parser.add_argument("--vae-encoder-output", type=Path, default=None)
     parser.add_argument("--vae-decoder-output", type=Path, default=None)
     parser.add_argument("--positive-context-output", type=Path, default=None)
     parser.add_argument("--decompose-vae-attention", action="store_true",
                         help="Export VAE attention as matmul/softmax for ONNX Runtime TensorRT RTX compatibility; default: native ONNX Attention.")
     parser.add_argument("--artifacts-dir", type=Path, default=Path("out/seedvr/export-artifacts"))
+    parser.add_argument("--opset", type=int, default=24,
+                        help="ONNX opset version for all models; must be at least 23 for Attention (default: 24).")
     parser.add_argument("--video-frames", type=int, default=1,
                         help="Export a video clip of 4n+1 frames; default 1 retains the image export. Temporal size is fixed, H/W are dynamic.")
     parser.add_argument("--latent-height", type=int, default=64, help="Even multi-window example latent height.")
@@ -1009,6 +1087,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.opset < 23:
+        raise ValueError("--opset must be at least 23 for native ONNX Attention.")
     if args.video_frames < 1 or (args.video_frames - 1) % 4:
         raise ValueError("--video-frames must be 4n+1 (1, 5, 9, 13, ...).")
     args.temporal = (args.video_frames - 1) // 4 + 1
@@ -1030,7 +1110,7 @@ def main() -> None:
     # Preserve the Hugging Face snapshot symlink suffix for ComfyUI's
     # safetensors loader; .resolve() would yield an extensionless blob path.
     model_path = model_path.expanduser().absolute()
-    output_path = args.output.expanduser().absolute()
+    output_path = (args.output or Path(f"models/SeedVR2-3B-onnx/seedvr2_3b_{args.dit_dtype}_dit.onnx")).expanduser().absolute()
     artifacts_dir = args.artifacts_dir.expanduser().absolute()
     vae_encoder_output = (
         (args.vae_encoder_output or output_path.with_name("seedvr2_ema_vae_encoder.onnx")).expanduser().absolute()
@@ -1039,7 +1119,9 @@ def main() -> None:
         (args.vae_decoder_output or output_path.with_name("seedvr2_ema_vae_decoder.onnx")).expanduser().absolute()
     )
     positive_context_output = (
-        (args.positive_context_output or output_path.with_name("seedvr2_3b_fp16_positive_context.bin"))
+        (args.positive_context_output or output_path.with_name(
+            "seedvr2_7b_fp16_positive_context.bin" if output_path.name.startswith("seedvr2_7b_")
+            else "seedvr2_3b_fp16_positive_context.bin"))
         .expanduser()
         .absolute()
     )
@@ -1069,10 +1151,13 @@ def main() -> None:
             export_decoder="vae_decoder" in components,
             decompose_attention=args.decompose_vae_attention,
             video_frames=args.video_frames,
+            opset_version=args.opset,
         )
     if {"dit", "context"} & components:
         print(f"Loading SeedVR diffusion model: {model_path}")
-        diffusion_model, device, dtype = load_diffusion_model(model_path)
+        diffusion_model, device, dtype = load_diffusion_model(
+            model_path, torch.bfloat16 if args.dit_dtype == "bf16" else None
+        )
         print(f"DiT export device={device}, dtype={dtype}")
         export_positive_context(diffusion_model, positive_context_output)
 
@@ -1094,11 +1179,14 @@ def main() -> None:
             DIT_INPUT_NAMES,
             ("denoised_latent",),
             dynamic_dit_shapes(),
+            opset_version=args.opset,
         )
+        if not args.native_dit_io:
+            add_fp16_dit_boundaries(output_path)
         name_dynamic_dit_dimensions(output_path)
         print(f"Exported dynamic SeedVR DiT: {output_path}")
         if not args.skip_validation:
-            validate_onnx(output_path, args.temporal)
+            validate_onnx(output_path, args.temporal, len(diffusion_model.blocks))
 
     if args.video_frames > 1:
         manifest.write_text(str(args.video_frames) + "\n")

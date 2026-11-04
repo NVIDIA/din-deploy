@@ -5,8 +5,11 @@
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
+#include <cub/device/device_radix_sort.cuh>
 
 #include <algorithm>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -16,6 +19,57 @@
 
 namespace {
     constexpr int kThreads = 256;
+
+    inline constexpr size_t DivRoundUp(size_t value, size_t divisor) {
+        return value / divisor + (value % divisor != 0);
+    }
+
+    __device__ float CubicWeight(float x) {
+        constexpr float a = -0.75f;
+        x = fabsf(x);
+        // Keep the reference's individual float operations rather than contracting to FMA.
+        if (x <= 1.0f) {
+            const float factor = __fsub_rn(__fmul_rn(a + 2.0f, x), a + 3.0f);
+            return __fadd_rn(__fmul_rn(__fmul_rn(factor, x), x), 1.0f);
+        }
+        if (x < 2.0f) {
+            const float factor = __fadd_rn(__fmul_rn(__fsub_rn(__fmul_rn(a, x), 5.0f * a), x), 8.0f * a);
+            return __fsub_rn(__fmul_rn(factor, x), 4.0f * a);
+        }
+        return 0.0f;
+    }
+
+    __global__ void ResizeBicubic(const float *source, __half *encoder_input, float *reference,
+                                  size_t source_height, size_t source_width, size_t target_height, size_t target_width,
+                                  size_t padded_height, size_t padded_width, size_t encoder_channel_stride) {
+        const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t plane = padded_height * padded_width;
+        if (i >= 3 * plane) return;
+        const size_t channel = i / plane, y = i % plane / padded_width, x = i % padded_width;
+        float value = 0.0f;
+        if (y < target_height && x < target_width) {
+            const float scale_y = __fdiv_rn(static_cast<float>(source_height), static_cast<float>(target_height));
+            const float scale_x = __fdiv_rn(static_cast<float>(source_width), static_cast<float>(target_width));
+            const float source_y = __fsub_rn(__fmul_rn(__fadd_rn(static_cast<float>(y), 0.5f), scale_y), 0.5f);
+            const float source_x = __fsub_rn(__fmul_rn(__fadd_rn(static_cast<float>(x), 0.5f), scale_x), 0.5f);
+            const int y_base = static_cast<int>(floorf(source_y)), x_base = static_cast<int>(floorf(source_x));
+            float weight_sum = 0.0f;
+            for (int ky = -1; ky <= 2; ++ky) {
+                const int sy = min(max(y_base + ky, 0), static_cast<int>(source_height) - 1);
+                const float wy = CubicWeight(__fsub_rn(source_y, static_cast<float>(y_base + ky)));
+                for (int kx = -1; kx <= 2; ++kx) {
+                    const int sx = min(max(x_base + kx, 0), static_cast<int>(source_width) - 1);
+                    const float weight = __fmul_rn(wy, CubicWeight(__fsub_rn(source_x, static_cast<float>(x_base + kx))));
+                    const float pixel = source[(channel * source_height + sy) * source_width + sx];
+                    value = __fadd_rn(value, __fmul_rn(pixel, weight));
+                    weight_sum = __fadd_rn(weight_sum, weight);
+                }
+            }
+            value = fminf(1.0f, fmaxf(0.0f, __fdiv_rn(value, weight_sum)));
+        }
+        encoder_input[channel * encoder_channel_stride + i % plane] = __float2half_rn(value);
+        reference[i] = value;
+    }
 
     __global__ void GatherTile(const __half *source, __half *tile, size_t channels,
                                size_t height, size_t width, SeedVrTile r) {
@@ -71,9 +125,19 @@ namespace {
 
     __device__ float Clamp01(float value) { return fminf(1.0f, fmaxf(0.0f, value)); }
 
+    __global__ void CropToFloat(const __half *source, float *output, size_t height, size_t width,
+                                size_t source_stride, size_t source_channel_stride) {
+        const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t plane = height * width;
+        if (i >= 3 * plane) return;
+        const size_t c = i / plane, y = i % plane / width, x = i % width;
+        output[i] = Clamp01(__half2float(source[c * source_channel_stride + y * source_stride + x]));
+    }
+
     __global__ void InitLabLowpass(const __half *generated, const float *reference,
                                    float *generated_low, float *reference_low,
-                                   size_t height, size_t width, size_t stride, size_t channel_stride) {
+                                   size_t height, size_t width, size_t stride, size_t channel_stride,
+                                   size_t reference_channel_stride) {
         const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t plane = height * width;
         if (i >= 3 * plane) return;
@@ -81,7 +145,7 @@ namespace {
         const size_t y = i % plane / width, x = i % width;
         const size_t padded = channel * channel_stride + y * stride + x;
         generated_low[i] = Clamp01(__half2float(generated[padded])) * 2.0f - 1.0f;
-        reference_low[i] = Clamp01(reference[padded]) * 2.0f - 1.0f;
+        reference_low[i] = Clamp01(reference[channel * reference_channel_stride + y * stride + x]) * 2.0f - 1.0f;
     }
 
     __global__ void LabWaveletBlur(const float *source, float *target, size_t height, size_t width, int radius) {
@@ -125,7 +189,8 @@ namespace {
     __global__ void PrepareLab(const __half *generated, const float *reference,
                                const float *generated_low, const float *reference_low,
                                float *generated_lab, float *reference_lab,
-                               size_t height, size_t width, size_t stride, size_t channel_stride) {
+                               size_t height, size_t width, size_t stride, size_t channel_stride,
+                               size_t reference_channel_stride) {
         const size_t p = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t plane = height * width;
         if (p >= plane) return;
@@ -137,7 +202,7 @@ namespace {
             const float combined = fminf(1.0f, fmaxf(-1.0f, raw - generated_low[c * plane + p] +
                                                               reference_low[c * plane + p]));
             rgb[c] = Clamp01((combined + 1.0f) * 0.5f);
-            ref_rgb[c] = Clamp01(reference[padded]);
+            ref_rgb[c] = Clamp01(reference[c * reference_channel_stride + y * stride + x]);
         }
         RgbToLab(rgb[0], rgb[1], rgb[2], generated_lab[p], generated_lab[plane + p],
                  generated_lab[2 * plane + p]);
@@ -199,12 +264,30 @@ namespace {
         if (error != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(error));
     }
 
+    // Thrust receives a fixed arena instead of cudaMalloc/cudaFree per sort.
+    struct SortArena {
+        char* base;
+        size_t capacity, offset = 0, active = 0;
+    };
+    struct SortAllocator {
+        using value_type = char;
+        SortArena* arena;
+        char* allocate(std::ptrdiff_t count) {
+            const size_t bytes = (static_cast<size_t>(count) + 255) / 256 * 256;
+            if (count < 0 || bytes > arena->capacity - arena->offset)
+                throw std::runtime_error("SeedVR LAB sort scratch capacity exceeded");
+            auto* result = arena->base + arena->offset;
+            arena->offset += bytes;
+            ++arena->active;
+            return result;
+        }
+        void deallocate(char*, size_t) {
+            if (--arena->active == 0) arena->offset = 0;
+        }
+    };
     template<class T> class DeviceScratch {
     public:
-        explicit DeviceScratch(size_t count) {
-            CheckCuda(cudaMalloc(&data_, count * sizeof(T)), "SeedVR LAB cudaMalloc");
-        }
-        ~DeviceScratch() { cudaFree(data_); }
+        explicit DeviceScratch(void* data) : data_(static_cast<T*>(data)) {}
         DeviceScratch(const DeviceScratch &) = delete;
         DeviceScratch &operator=(const DeviceScratch &) = delete;
         T *get() const { return data_; }
@@ -219,6 +302,19 @@ namespace {
             return;
         }
         condition[index] = index < 16 * spatial_size ? encoded[index] : __float2half(1.0f);
+    }
+
+    __global__ void AugmentCondition(__half *condition, const __half *latent, const float *noise,
+                                    float sigma, size_t element_count) {
+        const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (index < element_count) {
+            // Upstream FP16 augmentation: 0.1 * base_noise + 0.05 * fresh_noise.
+            const __half base = __float2half_rn(__half2float(latent[index]) * 0.1f);
+            const __half fresh = __float2half_rn(__half2float(__float2half_rn(noise[index])) * 0.05f);
+            const float augmented = __half2float(__hadd(base, fresh));
+            condition[index] = __float2half_rn(__fadd_rn(
+                __fmul_rn(1.0f - sigma, __half2float(condition[index])), __fmul_rn(sigma, augmented)));
+        }
     }
 
     __global__ void EulerOneStep(const __half *latent, const __half *velocity, __half *sampled, size_t element_count) {
@@ -236,11 +332,22 @@ namespace {
     }
 } // namespace
 
+void LaunchSeedVrResizeBicubic(cudaStream_t stream, const float *source, void *encoder_input, float *reference,
+                               size_t source_height, size_t source_width, size_t target_height, size_t target_width,
+                               size_t padded_height, size_t padded_width, size_t encoder_channel_stride) {
+    const size_t count = 3 * padded_height * padded_width;
+    ResizeBicubic<<<static_cast<unsigned int>((count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+        source, static_cast<__half *>(encoder_input), reference, source_height, source_width, target_height,
+        target_width, padded_height, padded_width, encoder_channel_stride);
+    CheckCuda(cudaGetLastError(), "SeedVR bicubic resize");
+}
+
 void LaunchSeedVrGatherTile(cudaStream_t stream, const void *source, void *tile,
                            size_t channels, size_t height, size_t width, SeedVrTile region) {
     const size_t count = channels * region.height * region.width;
     GatherTile<<<static_cast<unsigned int>((count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         static_cast<const __half *>(source), static_cast<__half *>(tile), channels, height, width, region);
+    CheckCuda(cudaGetLastError(), "SeedVR tile gather");
 }
 
 void LaunchSeedVrBlendTile(cudaStream_t stream, const void *tile, float *sum, float *weights,
@@ -248,6 +355,7 @@ void LaunchSeedVrBlendTile(cudaStream_t stream, const void *tile, float *sum, fl
     const size_t count = channels * region.height * region.width;
     BlendTile<<<static_cast<unsigned int>((count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         static_cast<const __half *>(tile), sum, weights, channels, height, width, region);
+    CheckCuda(cudaGetLastError(), "SeedVR tile blend");
 }
 
 void LaunchSeedVrNormalizeTiles(cudaStream_t stream, const float *sum, const float *weights,
@@ -255,29 +363,70 @@ void LaunchSeedVrNormalizeTiles(cudaStream_t stream, const float *sum, const flo
     const size_t count = channels * spatial_size;
     NormalizeTiles<<<static_cast<unsigned int>((count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         sum, weights, static_cast<__half *>(output), channels, spatial_size);
+    CheckCuda(cudaGetLastError(), "SeedVR tile normalize");
 }
 
 void LaunchSeedVrClampKernel(cudaStream_t stream, void *image, size_t element_count) {
     ClampImage<<<static_cast<unsigned int>((element_count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         static_cast<__half *>(image), element_count);
+    CheckCuda(cudaGetLastError(), "SeedVR clamp");
+}
+
+void LaunchSeedVrCropToFloat(cudaStream_t stream, const void *source, float *output,
+                             size_t height, size_t width, size_t source_stride, size_t source_channel_stride) {
+    CropToFloat<<<static_cast<unsigned int>(DivRoundUp(3 * height * width, kThreads)), kThreads, 0, stream>>>(
+        static_cast<const __half *>(source), output, height, width, source_stride, source_channel_stride);
+    CheckCuda(cudaGetLastError(), "SeedVR output crop and conversion");
+}
+
+size_t SeedVrLabScratchBytes(size_t height, size_t width) {
+    const size_t plane = height * width;
+    if (plane > INT_MAX) throw std::invalid_argument("SeedVR LAB frame exceeds sort index capacity");
+    cub::DoubleBuffer<float> keys(nullptr, nullptr);
+    cub::DoubleBuffer<uint32_t> indices(nullptr, nullptr);
+    size_t pairs_bytes = 0, keys_bytes = 0;
+    CheckCuda(cub::DeviceRadixSort::SortPairs(nullptr, pairs_bytes, keys, indices, static_cast<std::ptrdiff_t>(plane)), "LAB pair-sort storage query");
+    CheckCuda(cub::DeviceRadixSort::SortKeys(nullptr, keys_bytes, keys, static_cast<std::ptrdiff_t>(plane)), "LAB key-sort storage query");
+    // Thrust's radix path adds alternate key/value buffers to CUB's scratch.
+    const size_t alternate = (plane * sizeof(float) + 127) / 128 * 128;
+    const size_t sort_bytes = std::max(pairs_bytes + 2 * alternate, keys_bytes + alternate);
+    const size_t image_bytes = (3 * plane * sizeof(float) + 255) / 256 * 256;
+    // After PrepareLab the two low-pass buffers are dead. Reuse one for sorted
+    // keys/indices and the other for Thrust's temporary storage.
+    return 3 * image_bytes + std::max(image_bytes, (sort_bytes + 255) / 256 * 256);
 }
 
 void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *reference,
-                          size_t height, size_t width, size_t stride, size_t channel_stride) {
+                          size_t height, size_t width, size_t stride, size_t channel_stride,
+                          size_t reference_channel_stride,
+                          void* scratch, size_t scratch_bytes) {
     const size_t plane = height * width;
     if (plane > UINT32_MAX) throw std::invalid_argument("SeedVR LAB frame exceeds uint32 index capacity");
     const unsigned int pixel_blocks = static_cast<unsigned int>((plane + kThreads - 1) / kThreads);
     const unsigned int channel_blocks = static_cast<unsigned int>((3 * plane + kThreads - 1) / kThreads);
-    DeviceScratch<float> generated_low(3 * plane), reference_low(3 * plane);
-    DeviceScratch<float> generated_next(3 * plane), reference_next(3 * plane);
+    const size_t image_bytes = (3 * plane * sizeof(float) + 255) / 256 * 256;
+    if (!scratch || scratch_bytes < 4 * image_bytes)
+        throw std::invalid_argument("SeedVR LAB scratch buffer is too small");
+    size_t used = 0;
+    auto take = [&](size_t bytes) {
+        auto* result = static_cast<char*>(scratch) + used;
+        used += (bytes + 255) / 256 * 256;
+        return result;
+    };
+    DeviceScratch<float> generated_low(take(3 * plane * sizeof(float))), reference_low(take(3 * plane * sizeof(float)));
+    DeviceScratch<float> generated_next(take(3 * plane * sizeof(float))), reference_next(take(3 * plane * sizeof(float)));
     InitLabLowpass<<<channel_blocks, kThreads, 0, stream>>>(static_cast<const __half *>(image),
-        static_cast<const float *>(reference), generated_low.get(), reference_low.get(), height, width, stride, channel_stride);
+        static_cast<const float *>(reference), generated_low.get(), reference_low.get(), height, width, stride,
+        channel_stride, reference_channel_stride);
+    CheckCuda(cudaGetLastError(), "SeedVR LAB initialization");
     float *generated_current = generated_low.get(), *reference_current = reference_low.get();
     float *generated_temp = generated_next.get(), *reference_temp = reference_next.get();
     for (int level = 0; level < 5; ++level) {
         const int radius = std::max(1, std::min<int>(1 << level, static_cast<int>(std::min(height, width) / 8)));
         LabWaveletBlur<<<channel_blocks, kThreads, 0, stream>>>(generated_current, generated_temp, height, width, radius);
+        CheckCuda(cudaGetLastError(), "SeedVR LAB generated blur");
         LabWaveletBlur<<<channel_blocks, kThreads, 0, stream>>>(reference_current, reference_temp, height, width, radius);
+        CheckCuda(cudaGetLastError(), "SeedVR LAB reference blur");
         std::swap(generated_current, generated_temp);
         std::swap(reference_current, reference_temp);
     }
@@ -286,20 +435,28 @@ void LaunchSeedVrLabKernel(cudaStream_t stream, void *image, const void *referen
     float *generated_lab = generated_temp, *reference_lab = reference_temp;
     PrepareLab<<<pixel_blocks, kThreads, 0, stream>>>(static_cast<const __half *>(image),
         static_cast<const float *>(reference), generated_current, reference_current,
-        generated_lab, reference_lab, height, width, stride, channel_stride);
-    DeviceScratch<float> generated_sorted(plane), reference_sorted(plane);
-    DeviceScratch<uint32_t> indices(plane);
-    const auto policy = thrust::cuda::par.on(stream);
+        generated_lab, reference_lab, height, width, stride, channel_stride, reference_channel_stride);
+    CheckCuda(cudaGetLastError(), "SeedVR LAB preparation");
+    DeviceScratch<float> generated_sorted(generated_current), reference_sorted(generated_current + plane);
+    DeviceScratch<uint32_t> indices(generated_current + 2 * plane);
+    // Five blur levels leave reference_current in the final allocated image
+    // block, followed by any extra queried sort storage.
+    auto* sort_base = reinterpret_cast<char*>(reference_current);
+    SortArena arena{sort_base, scratch_bytes - static_cast<size_t>(sort_base - static_cast<char*>(scratch))};
+    SortAllocator allocator{&arena};
+    const auto policy = thrust::cuda::par_nosync(allocator).on(stream);
     for (int channel = 0; channel < 3; ++channel) {
         const size_t offset = static_cast<size_t>(channel) * plane;
         PrepareLabSort<<<pixel_blocks, kThreads, 0, stream>>>(generated_lab + offset, reference_lab + offset,
             generated_sorted.get(), reference_sorted.get(), indices.get(), plane);
+        CheckCuda(cudaGetLastError(), "SeedVR LAB sort preparation");
         thrust::sort_by_key(policy, thrust::device_pointer_cast(generated_sorted.get()),
             thrust::device_pointer_cast(generated_sorted.get() + plane), thrust::device_pointer_cast(indices.get()));
         thrust::sort(policy, thrust::device_pointer_cast(reference_sorted.get()),
             thrust::device_pointer_cast(reference_sorted.get() + plane));
         ScatterLabMatch<<<pixel_blocks, kThreads, 0, stream>>>(reference_sorted.get(),
             indices.get(), generated_lab, plane, channel);
+        CheckCuda(cudaGetLastError(), "SeedVR LAB scatter");
     }
     FinishLab<<<pixel_blocks, kThreads, 0, stream>>>(generated_lab, static_cast<__half *>(image), height, width, stride, channel_stride);
     CheckCuda(cudaGetLastError(), "SeedVR LAB kernels");
@@ -309,6 +466,14 @@ void LaunchSeedVrConditionKernel(cudaStream_t stream, const void *encoded, void 
     const size_t count = 17 * spatial_size;
     PackCondition<<<static_cast<unsigned int>((count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         static_cast<const __half *>(encoded), static_cast<__half *>(condition), spatial_size);
+    CheckCuda(cudaGetLastError(), "SeedVR conditioning");
+}
+
+void LaunchSeedVrConditionNoiseKernel(cudaStream_t stream, void *condition, const void *latent,
+                                     const float *noise, float sigma, size_t element_count) {
+    AugmentCondition<<<static_cast<unsigned int>((element_count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+        static_cast<__half *>(condition), static_cast<const __half *>(latent), noise, sigma, element_count);
+    CheckCuda(cudaGetLastError(), "SeedVR conditioning noise");
 }
 
 void LaunchSeedVrEulerKernel(cudaStream_t stream, const void *latent, const void *velocity, void *sampled,
@@ -316,10 +481,12 @@ void LaunchSeedVrEulerKernel(cudaStream_t stream, const void *latent, const void
     EulerOneStep<<<static_cast<unsigned int>((element_count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         static_cast<const __half *>(latent), static_cast<const __half *>(velocity), static_cast<__half *>(sampled),
         element_count);
+    CheckCuda(cudaGetLastError(), "SeedVR Euler step");
 }
 
 void LaunchSeedVrFloatToHalfKernel(cudaStream_t stream, const float *source, void *destination,
                                    size_t element_count) {
     FloatToHalf<<<static_cast<unsigned int>((element_count + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
         source, static_cast<__half *>(destination), element_count);
+    CheckCuda(cudaGetLastError(), "SeedVR float to half");
 }

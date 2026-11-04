@@ -203,12 +203,12 @@ def run_vae_decoder(session, latent: torch.Tensor) -> torch.Tensor:
 class SeedVRTrtRtxDenoiser(torch.nn.Module):
     """ComfyUI NaDiT-compatible wrapper around a TensorRT RTX ORT session."""
 
-    def __init__(self, session, diffusion_model: torch.nn.Module):
+    def __init__(self, session, diffusion_model: torch.nn.Module, dtype: torch.dtype | None = None):
         super().__init__()
         self.session = session
         self.diffusion_model = diffusion_model
         self.input_dtypes = {item.name: _numpy_dtype(item.type) for item in session.get_inputs()}
-        self.dtype = next(diffusion_model.parameters()).dtype
+        self.dtype = dtype or next(diffusion_model.parameters()).dtype
         self.calls = 0
 
     def forward(
@@ -312,7 +312,10 @@ def run_onnx_pipeline(args: argparse.Namespace) -> list[Image.Image]:
 
     model_path, _ = _checkpoint_paths(args)
     onnx_dir = args.onnx_dir.expanduser().absolute()
-    onnx_path = onnx_dir / "seedvr2_3b_fp16_dit.onnx"
+    onnx_path = onnx_dir / f"seedvr2_3b_{args.transformer_precision}_dit.onnx"
+    seven_b_path = onnx_dir / f"seedvr2_7b_{args.transformer_precision}_dit.onnx"
+    if seven_b_path.is_file():
+        onnx_path = seven_b_path
     vae_encoder_path = onnx_dir / "seedvr2_ema_vae_encoder.onnx"
     vae_decoder_path = onnx_dir / "seedvr2_ema_vae_decoder.onnx"
     video = args.input.is_dir()
@@ -350,7 +353,7 @@ def run_onnx_pipeline(args: argparse.Namespace) -> list[Image.Image]:
     positive, negative = SeedVR2Conditioning.execute(model, latent)
     height, width = encoded.shape[3:5]
     metadata_device = next(diffusion_model.parameters()).device
-    metadata_dtype = next(diffusion_model.parameters()).dtype
+    metadata_dtype = torch.bfloat16 if args.transformer_precision == "bf16" else torch.float16
     normal, shifted = get_seedvr_metadata(
         diffusion_model, height, width, CONTEXT_TOKENS, metadata_device, metadata_dtype, temporal=encoded.shape[2]
     )
@@ -374,7 +377,7 @@ def run_onnx_pipeline(args: argparse.Namespace) -> list[Image.Image]:
         args.runtime_cache_dir.expanduser().absolute() / "dit",
         example_shapes,
     )
-    trt_denoiser = SeedVRTrtRtxDenoiser(session, diffusion_model)
+    trt_denoiser = SeedVRTrtRtxDenoiser(session, diffusion_model, metadata_dtype)
 
     model.model.diffusion_model = trt_denoiser
     try:
@@ -435,6 +438,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--vae", type=Path, default=None)
     parser.add_argument("--onnx-dir", type=Path, default=Path("models/SeedVR2-3B-onnx"))
+    parser.add_argument("--transformer-precision", choices=("bf16", "fp16"), default="bf16",
+                        help="DiT compute precision of the exported model (default: bf16).")
     parser.add_argument("--output-dir", type=Path, default=Path("out/seedvr/verify"))
     parser.add_argument("--runtime-cache-dir", type=Path, default=Path("out/seedvr/trt_rtx_cache"))
     parser.add_argument("--input", type=Path, required=True,
