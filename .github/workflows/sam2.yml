@@ -108,7 +108,7 @@ jobs:
         run: |
           set -euo pipefail
           source_hash="$(
-            git ls-files -z -- 'vision/sam2/python/*.py' 'vision/sam2/python/**/*.py' \
+            git ls-files -z -- 'vision/sam/python/*.py' 'vision/sam/python/**/*.py' \
               | xargs -0 sha256sum \
               | sha256sum \
               | cut -d' ' -f1

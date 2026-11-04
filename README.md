@@ -26,7 +26,7 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 
 | Model     | Hugging Face ID                                                                                                                         | Docs                          |
 |-----------|-----------------------------------------------------------------------------------------------------------------------------------------|-------------------------------|
-| Meta Sam2 | `facebook/sam2.1-hiera-tiny`<br>`facebook/sam2.1-hiera-small`<br>`facebook/sam2.1-hiera-base-plus`<br>`facebook/sam2.1-hiera-large`<br> | [Sam2](vision/sam2/README.md) |
+| Meta SAM2 / SAM3.1 | `facebook/sam2.1-hiera-tiny`<br>`facebook/sam2.1-hiera-small`<br>`facebook/sam2.1-hiera-base-plus`<br>`facebook/sam2.1-hiera-large`<br>`facebook/sam3.1` | [SAM](vision/sam/README.md) |
 
 ## Performance benchmarks
 

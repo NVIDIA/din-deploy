@@ -55,8 +55,8 @@ jobs:
           elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             force=true
           elif git diff --quiet "$BASE_SHA" "$SOURCE_REF" -- \
-            'vision/sam2/python/*.py' \
-            'vision/sam2/python/**/*.py' \
+            'vision/sam/python/*.py' \
+            'vision/sam/python/**/*.py' \
             '.github/workflows/export-sam2-model.yml' \
             '.github/workflows/sam2.yml'; then
             force=false
@@ -73,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           source_hash="$(
-            git ls-files -z -- 'vision/sam2/python/*.py' 'vision/sam2/python/**/*.py' \
+            git ls-files -z -- 'vision/sam/python/*.py' 'vision/sam/python/**/*.py' \
               | xargs -0 sha256sum \
               | sha256sum \
               | cut -d' ' -f1
@@ -147,7 +147,8 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euxo pipefail
-          python vision/sam2/python/export_sam2_onnx.py \
+          python vision/sam/python/export_sam2_onnx.py \
+            --static-memory \
             --model "$MODEL_ID" \
             --output "$MODEL_OUTPUT" \
             --device cpu \

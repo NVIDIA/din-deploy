@@ -93,12 +93,12 @@ DIN_ENABLE_NEMOTRON_PYTHON_BINDINGS = "ON"
 
 [tool.pytest.ini_options]
 testpaths = ["asr/rnnt/python/tests"]
-pythonpath = ["asr/rnnt/python", "asr/rnnt/python/tests", "vision/sam2/python"]
+pythonpath = ["asr/rnnt/python", "asr/rnnt/python/tests", "vision/sam/python"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-src = ["asr/rnnt/python/rnnt", "asr/rnnt/python/tools", "asr/rnnt/python/tests", "vision/sam2/python"]
+src = ["asr/rnnt/python/rnnt", "asr/rnnt/python/tools", "asr/rnnt/python/tests", "vision/sam/python"]
 
 [tool.ruff.lint]
 select = [
