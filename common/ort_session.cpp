@@ -96,6 +96,9 @@ public:
         cuInit = LoadFunction<CuInitFn>("cuInit");
         cuDeviceGetCount = LoadFunction<CuDeviceGetCountFn>("cuDeviceGetCount");
         cuDeviceGet = LoadFunction<CuDeviceGetFn>("cuDeviceGet");
+        cuCtxGetDevice = LoadFunction<CuCtxGetDeviceFn>("cuCtxGetDevice");
+        cuDeviceGetUuid = LoadFunction<CuDeviceGetUuidFn>("cuDeviceGetUuid");
+        cuDriverGetVersion = LoadFunction<CuDriverGetVersionFn>("cuDriverGetVersion");
         cuDeviceGetAttribute = LoadFunction<CuDeviceGetAttributeFn>("cuDeviceGetAttribute");
         cuGetErrorName = LoadOptionalFunction<CuGetErrorNameFn>("cuGetErrorName");
 #ifdef _WIN32
@@ -124,6 +127,9 @@ public:
     using CuInitFn = CUresult(CUDAAPI*)(unsigned int);
     using CuDeviceGetCountFn = CUresult(CUDAAPI*)(int*);
     using CuDeviceGetFn = CUresult(CUDAAPI*)(CUdevice*, int);
+    using CuCtxGetDeviceFn = CUresult(CUDAAPI*)(CUdevice*);
+    using CuDeviceGetUuidFn = CUresult(CUDAAPI*)(CUuuid*, CUdevice);
+    using CuDriverGetVersionFn = CUresult(CUDAAPI*)(int*);
     using CuDeviceGetAttributeFn = CUresult(CUDAAPI*)(int*, CUdevice_attribute, CUdevice);
     using CuGetErrorNameFn = CUresult(CUDAAPI*)(CUresult, const char**);
 #ifdef _WIN32
@@ -133,6 +139,9 @@ public:
     CuInitFn cuInit = nullptr;
     CuDeviceGetCountFn cuDeviceGetCount = nullptr;
     CuDeviceGetFn cuDeviceGet = nullptr;
+    CuCtxGetDeviceFn cuCtxGetDevice = nullptr;
+    CuDeviceGetUuidFn cuDeviceGetUuid = nullptr;
+    CuDriverGetVersionFn cuDriverGetVersion = nullptr;
     CuDeviceGetAttributeFn cuDeviceGetAttribute = nullptr;
     CuGetErrorNameFn cuGetErrorName = nullptr;
 #ifdef _WIN32
@@ -442,6 +451,12 @@ bool RegisterTensorRTRTXExecutionProvider(Ort::Env& env)
 
 Ort::ConstEpDevice FindTensorRTRTXDevice(Ort::Env& env)
 {
+    auto& api=GetCudaDriverApi();
+    ThrowOnCudaDriverError(api.cuInit(0),"cuInit");
+    CUdevice current=0;
+    const auto status=api.cuCtxGetDevice(&current);
+    if(status!=CUDA_SUCCESS && status!=CUDA_ERROR_INVALID_CONTEXT)
+        ThrowOnCudaDriverError(status,"cuCtxGetDevice");
     std::vector<Ort::ConstEpDevice> selected_devices;
     const auto ep_devices = env.GetEpDevices();
     for (const auto& device : ep_devices)
@@ -456,7 +471,25 @@ Ort::ConstEpDevice FindTensorRTRTXDevice(Ort::Env& env)
     {
         throw std::runtime_error("No TensorRT RTX execution provider devices were found.");
     }
-    return selected_devices.front();
+    for(const auto& device:selected_devices)
+        if(ChooseCudaDeviceOrdinal(device,nullptr)==current) return device;
+    throw std::runtime_error("No TensorRT RTX provider matches the active CUDA device "+std::to_string(current));
+}
+
+std::string CurrentCudaDeviceCacheKeyImpl()
+{
+    auto& api=GetCudaDriverApi();
+    ThrowOnCudaDriverError(api.cuInit(0),"cuInit");
+    CUdevice device=0;auto status=api.cuCtxGetDevice(&device);
+    if(status!=CUDA_SUCCESS && status!=CUDA_ERROR_INVALID_CONTEXT) ThrowOnCudaDriverError(status,"cuCtxGetDevice");
+    CUuuid uuid{};int driver=0;
+    ThrowOnCudaDriverError(api.cuDeviceGetUuid(&uuid,device),"cuDeviceGetUuid");
+    ThrowOnCudaDriverError(api.cuDriverGetVersion(&driver),"cuDriverGetVersion");
+    static constexpr char hex[]="0123456789abcdef";std::string key="gpu-";
+    for(unsigned char byte:uuid.bytes) {key+=hex[byte>>4];key+=hex[byte&15];}
+    key+="-sm"+std::to_string(GetCudaDeviceAttribute(device,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,"compute major"));
+    key+=std::to_string(GetCudaDeviceAttribute(device,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,"compute minor"));
+    return key+"-driver"+std::to_string(driver);
 }
 
 void AppendTensorRTRTXEP(Ort::Env& env, Ort::SessionOptions& options, const std::string& cache_dir,
@@ -596,6 +629,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     return output_model_path;
 }
 }  // namespace
+
+std::string CurrentCudaDeviceCacheKey() {return CurrentCudaDeviceCacheKeyImpl();}
 
 const char* ToString(CudaDeviceGeneration generation)
 {

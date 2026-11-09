@@ -30,10 +30,6 @@ struct DeviceScope {
     DeviceScope(bool gpu,int device) { if(gpu) {Check(cudaGetDevice(&previous)); if(previous!=device) {Check(cudaSetDevice(device));restore=true;}} }
     ~DeviceScope() {if(restore) cudaSetDevice(previous);}
 };
-struct OwnedStream {
-    cudaStream_t value=nullptr;int device=0;
-    ~OwnedStream() {if(value) {DeviceScope scope(true,device);cudaStreamSynchronize(value);cudaStreamDestroy(value);}}
-};
 size_t TypeBytes(ONNXTensorElementDataType type) {
     switch(type) {
         case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8: return 1;
@@ -86,7 +82,7 @@ struct Graph {
     cudaStream_t stream=nullptr;
     cudaGraphExec_t replay=nullptr;
     bool gpu=false;int device=0;
-    Graph(const SamConfig& cfg,const std::string& graph,void* compute_stream):name(graph),stream(static_cast<cudaStream_t>(compute_stream)),gpu(cfg.provider=="trt-rtx"),device(cfg.device) {
+    Graph(Ort::Env& env,const SamConfig& cfg,const std::string& graph,Ort::SyncStream* compute_stream):name(graph),stream(compute_stream ? static_cast<cudaStream_t>(compute_stream->GetHandle()) : nullptr),gpu(cfg.provider=="trt-rtx"),device(cfg.device) {
         common::ModelProfile profile;
         profile.cache_subpath=graph;
         profile.embed_ep_context=false;
@@ -96,8 +92,6 @@ struct Graph {
         // The EP defaults to true when the option is absent. An explicit zero is
         // required before capturing its enqueue from our own persistent stream.
         profile.extra_ep_options.emplace_back("enable_cuda_graph","0");
-        profile.has_user_compute_stream=cfg.provider=="trt-rtx";
-        profile.user_compute_stream=compute_stream;
         profile.extra_ep_options.emplace_back("nv_persistent_context_memory","1");
         if(graph=="seed_memory") {
             // Preserve the validated dynamic antialias boundary in the engine
@@ -120,8 +114,8 @@ struct Graph {
         }
         const auto cache=cfg.cache_dir/identity/
             (cfg.provider=="trt-rtx" ? common::CurrentCudaDeviceCacheKey():"cpu");
-        runner=std::make_unique<common::OrtRunner>(common::SharedInferenceEnvironment(),path.string(),cfg.provider,
-                    cache.string(),common::EpContextOptions{(cache/"context").string()},profile);
+        runner=std::make_unique<common::OrtRunner>(env,path.string(),cfg.provider,
+                    cache.string(),common::EpContextOptions{(cache/"context").string()},profile,compute_stream);
         binding=std::make_unique<Ort::IoBinding>(runner->session);
         if(cfg.provider=="trt-rtx") options.AddConfigEntry(kOrtRunOptionsConfigDisableSynchronizeExecutionProviders,"1");
         Ort::AllocatorWithDefaultOptions allocator;
@@ -240,11 +234,13 @@ struct CompletionToken::Slot {
     ~Slot() {DeviceScope scope(event!=nullptr,device);if(event) cudaEventDestroy(event);}
 };
 struct Sam::Impl {
+    // Declared first so it outlives every session and EP registration below.
+    Ort::Env env{ORT_LOGGING_LEVEL_WARNING,"din_sam"};
     SamConfig cfg;
     json metadata;
     bool gpu=false,half=false;
+    Ort::SyncStream ort_stream{nullptr};
     cudaStream_t stream=nullptr;
-    OwnedStream owned_stream;
     int objects=0,size=0,max_points=0;
     int frame_width=0,frame_height=0;
     size_t state_bytes=0;
@@ -280,9 +276,11 @@ struct Sam::Impl {
             metadata.value("dtype",std::string{})!="float32" || metadata.at("attention_contract").value("pointer_frames",0)!=16))
             throw std::runtime_error("Unsupported SAM3 spatial/state/precision contract");
         if(gpu) {
-            common::RegisterTensorRTRTXProvider(common::SharedInferenceEnvironment());
-            stream=static_cast<cudaStream_t>(cfg.stream);
-            if(!stream) {Check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));owned_stream.value=stream;owned_stream.device=cfg.device;}
+            common::RegisterTensorRTRTXProvider(env);
+            DeviceScope scope(true,cfg.device);
+            Check(cudaFree(nullptr)); // Make the device's context current for EP device selection.
+            ort_stream=common::CreateTensorRTRTXComputeStream(env);
+            stream=static_cast<cudaStream_t>(ort_stream.GetHandle());
         }
         objects=cfg.model==ModelFamily::Sam2 ? 1:16;
         size=cfg.model==ModelFamily::Sam2 ? 256:288;
@@ -347,7 +345,7 @@ struct Sam::Impl {
         Upload(dst.Data(),data.data(),dst.storage->bytes);
     }
     void AddGraph(const char* key,const char* name) {
-        try {graphs.emplace(key,std::make_unique<Graph>(cfg,name,stream));}
+        try {graphs.emplace(key,std::make_unique<Graph>(env,cfg,name,gpu ? &ort_stream : nullptr));}
         catch(const std::exception& e) {throw std::runtime_error("SAM graph initialization "+std::string(name)+": "+e.what());}
     }
     void Build();

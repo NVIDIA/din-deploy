@@ -65,6 +65,8 @@ struct OrtGraphicsDeviceIdentity
 };
 
 [[nodiscard]] const char* ToString(CudaDeviceGeneration generation);
+// Active CUDA context (device 0 if no context exists), UUID, SM and driver.
+[[nodiscard]] std::string CurrentCudaDeviceCacheKey();
 
 [[nodiscard]] int ChooseCudaDeviceOrdinal(Ort::ConstEpDevice ep_device,
                                           const char* override_env_var = "FLUX_CUDA_DEVICE_ID");

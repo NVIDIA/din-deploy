@@ -50,8 +50,6 @@ struct SamConfig {
     std::filesystem::path model_dir;
     std::filesystem::path cache_dir;
     std::string provider = "trt-rtx";
-    // Borrowed cudaStream_t. Null requests a private nonblocking stream.
-    void* stream = nullptr;
     int device = 0;
     int max_source_width = 4096, max_source_height = 4096;
     size_t state_capacity = 1, completion_capacity = 8;
