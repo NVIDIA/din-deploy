@@ -19,6 +19,7 @@ from export_seedvr import (
     CONTEXT_WIDTH,
     DEFAULT_REPO_ID,
     DIT_INPUT_NAMES,
+    VIDEO_FRAME_RANGE,
     get_seedvr_metadata,
 )
 from PIL import Image
@@ -51,11 +52,19 @@ def load_image(path: Path) -> torch.Tensor:
     return torch.from_numpy(pixels).unsqueeze(0)
 
 
+def video_frames(args: argparse.Namespace) -> int:
+    minimum, maximum = VIDEO_FRAME_RANGE
+    frames = args.video_frames or minimum
+    if not minimum <= frames <= maximum or (frames - 1) % 4:
+        raise ValueError("--video-frames must be 4n+1 within the exported range.")
+    return frames
+
+
 def load_inputs(args: argparse.Namespace) -> torch.Tensor:
     if not args.input.is_dir():
         return load_image(args.input)
     paths = sorted(path for path in args.input.iterdir() if path.suffix.lower() == ".png")
-    frames = int((args.onnx_dir / "seedvr2_video_frames.txt").read_text())
+    frames = video_frames(args)
     if not paths or len(paths) > frames:
         raise ValueError(f"Verification accepts one clip of 1..{frames} PNG frames; got {len(paths)}.")
     return torch.cat([load_image(path) for path in paths])
@@ -65,7 +74,7 @@ def prepare_inputs(args: argparse.Namespace, images: torch.Tensor) -> torch.Tens
     from comfy_extras.nodes_seedvr import SeedVR2Preprocess
 
     if args.input.is_dir():
-        frames = int((args.onnx_dir / "seedvr2_video_frames.txt").read_text())
+        frames = video_frames(args)
         images = torch.cat([images, images[-1:].expand(frames - len(images), -1, -1, -1)])
     return SeedVR2Preprocess.execute(images)[0]
 
@@ -437,7 +446,10 @@ def parse_args() -> argparse.Namespace:
                         help="Checkpoint snapshot; default: use the global Hugging Face cache offline.")
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--vae", type=Path, default=None)
-    parser.add_argument("--onnx-dir", type=Path, default=Path("models/SeedVR2-3B-onnx"))
+    parser.add_argument("--onnx-dir", type=Path, default=None,
+                        help="Defaults to models/SeedVR2-3B-video-onnx for a frame folder, models/SeedVR2-3B-onnx for an image.")
+    parser.add_argument("--video-frames", type=int, default=0,
+                        help="Video window within the exported dynamic range; 0 uses its minimum.")
     parser.add_argument("--transformer-precision", choices=("bf16", "fp16"), default="bf16",
                         help="DiT compute precision of the exported model (default: bf16).")
     parser.add_argument("--output-dir", type=Path, default=Path("out/seedvr/verify"))
@@ -448,7 +460,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--color-correction", choices=("none", "lab", "wavelet", "adain"), default="none")
     parser.add_argument("--pytorch-only", action="store_true", help="Save the PyTorch result without running ONNX.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.onnx_dir is None:
+        args.onnx_dir = Path("models/SeedVR2-3B-video-onnx" if args.input.is_dir() else "models/SeedVR2-3B-onnx")
+    return args
 
 
 def main() -> None:

@@ -92,7 +92,6 @@ struct ModelProfile
     // engines larger than ~2 GB, which overflow the protobuf size limit when
     // embedded; the engine is then written as a sidecar file instead.
     bool embed_ep_context = true;
-    bool skip_compile = false;
     std::vector<std::pair<std::string, std::string>> extra_ep_options;
     // Named ONNX symbolic dimensions fixed at session creation.
     std::vector<std::pair<std::string, int64_t>> free_dimension_overrides;

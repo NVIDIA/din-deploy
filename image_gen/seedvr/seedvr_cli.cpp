@@ -7,7 +7,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -28,7 +27,8 @@ struct CliConfig
     std::filesystem::path input_path;
     std::filesystem::path output_path = "out/seedvr/seedvr-cpp";
     float scale = 2.0f;
-    size_t video_frames = 1;
+    size_t video_frames = 5;
+    bool precompile_only = false;
 };
 CliConfig ParseArgs(int argc, char* argv[])
 {
@@ -44,6 +44,12 @@ CliConfig ParseArgs(int argc, char* argv[])
         .metavar("DIR")
         .help("Output directory for PNG images named <input-stem>_seedvr.png.");
     parser.add_argument("--model-dir").default_value(config.model_dir.string()).nargs(1).metavar("DIR");
+    parser.add_argument("--video-frames")
+        .default_value(5)
+        .scan<'i', int>()
+        .help("Video window T=4n+1 in [5,33]. Fixed at pipeline construction.");
+    parser.add_argument("--precompile-only").default_value(false).implicit_value(true)
+        .help("Prepare/cache video models without inference using the built-in dynamic DiT profile.");
     parser.add_argument("--vae-backend").default_value(config.vae_backend).help("VAE backend: onnx or cudnn.");
     parser.add_argument("--vae-weights")
         .default_value(std::string{})
@@ -123,6 +129,16 @@ CliConfig ParseArgs(int argc, char* argv[])
     config.vae_decoder_overlap = parser.get<int>("--vae-decoder-overlap");
     config.output_path = parser.get<std::string>("--output");
     config.model_dir = parser.get<std::string>("--model-dir");
+    if (!parser.is_used("--model-dir") && std::filesystem::is_directory(config.input_path))
+        config.model_dir = "models/SeedVR2-3B-video-onnx";
+    const int video_frames = parser.get<int>("--video-frames");
+    if (video_frames < static_cast<int>(din::seedvr::kVideoFrameRange.min) ||
+        video_frames > static_cast<int>(din::seedvr::kVideoFrameRange.max) || (video_frames - 1) % 4)
+        throw std::invalid_argument("--video-frames must be 4n+1 in [5,33]");
+    if (parser.is_used("--video-frames") && !std::filesystem::is_directory(config.input_path))
+        throw std::invalid_argument("--video-frames requires a video frame directory");
+    config.video_frames = static_cast<size_t>(video_frames);
+    config.precompile_only = parser.get<bool>("--precompile-only");
     config.vae_backend = parser.get<std::string>("--vae-backend");
     config.vae_weights_dir = parser.get<std::string>("--vae-weights");
     const auto autotune = parser.get<std::string>("--vae-autotune");
@@ -272,6 +288,8 @@ int main(int argc, char* argv[])
         if (!std::isfinite(config.scale) || config.scale <= 0)
             throw std::invalid_argument("Scale must be finite and positive");
         const bool video = std::filesystem::is_directory(config.input_path);
+        if (config.precompile_only && !video)
+            throw std::invalid_argument("--precompile-only requires a video frame directory");
         std::vector<std::filesystem::path> files;
         if (video)
         {
@@ -281,9 +299,6 @@ int main(int argc, char* argv[])
             std::sort(files.begin(), files.end());
             if (files.empty())
                 throw std::runtime_error("No PNG images found in " + config.input_path.string());
-            std::ifstream manifest(config.model_dir / "seedvr2_video_frames.txt");
-            if (!(manifest >> config.video_frames) || config.video_frames < 5 || (config.video_frames - 1) % 4)
-                throw std::invalid_argument("Folder input requires video exports with T=4n+1, T >= 5");
         }
         else
         {
@@ -306,6 +321,11 @@ int main(int argc, char* argv[])
         if (video)
         {
             din::seedvr::VideoPipeline pipeline(config, {shape, config.video_frames}, config);
+            if (config.precompile_only)
+            {
+                std::cout << "Shared BF16 DiT context ready in " << config.ep_context_dir << '\n';
+                return EXIT_SUCCESS;
+            }
             Process(pipeline, config, files);
         }
         else

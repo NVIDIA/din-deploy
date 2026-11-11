@@ -42,6 +42,14 @@ struct VideoShape
     ImageShape image;
     size_t frames = 5;  // Exactly 4n+1, n >= 1.
 };
+struct VideoFrameRange
+{
+    size_t min;
+    size_t max;
+};
+// Exporter dependency: export_seedvr.py captures dynamic video T=4n+1 in [5,33].
+// Keep these bounds synchronized with its VIDEO_FRAME_RANGE; no sidecar is used.
+inline constexpr VideoFrameRange kVideoFrameRange{5, 33};
 struct DynamicOptions
 {
     uint32_t seed = 0;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+
 #include "seedvr_pipeline.h"
 #ifdef DIN_SEEDVR_NATIVE_VAE
 #include "seedvr_vae.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -347,6 +349,96 @@ inline std::string DitProfile(int64_t image_height, int64_t image_width, const M
            pack("normal", normal) + "," + pack("shifted", shifted);
 }
 
+inline void AddMetadataOverrides(common::ModelProfile& profile, std::string_view prefix,
+                                 const MetadataDimensions& minimum, const MetadataDimensions& maximum)
+{
+    const auto add = [&](std::string_view suffix, int64_t low, int64_t high)
+    {
+        if (low == high)
+            profile.free_dimension_overrides.emplace_back(std::string(prefix) + std::string(suffix), low);
+    };
+    add("_window_tgt_idx_dim0", minimum.video_tokens, maximum.video_tokens);
+    add("_window_src_idx_dim0", minimum.video_tokens, maximum.video_tokens);
+    add("_concat_tgt_idx_dim0", minimum.attention_tokens, maximum.attention_tokens);
+    add("_concat_src_idx_dim0", minimum.attention_tokens, maximum.attention_tokens);
+    add("_padded_flat_idx_dim0", minimum.attention_tokens, maximum.attention_tokens);
+    add("_padded_gather_idx_dim0", minimum.padded_tokens, maximum.padded_tokens);
+    add("_valid_keys_dim0", minimum.window_count, maximum.window_count);
+    add("_valid_keys_dim1", minimum.max_window_length, maximum.max_window_length);
+}
+
+inline common::ModelProfile RangedVideoDitProfile(int64_t rope_pairs = kRopePairs)
+{
+    struct Shape { int64_t frames, height, width; };
+    const struct { Shape minimum, optimum, maximum; } range{
+        {static_cast<int64_t>(kVideoFrameRange.min), kProfileMinImageSize, kProfileMinImageSize},
+        {static_cast<int64_t>(kVideoFrameRange.min), 720, 1280},
+        {static_cast<int64_t>(kVideoFrameRange.max), kProfileMaxLongSide, kProfileMaxLongSide}};
+    // A rectangular envelope covers both 4K orientations with one context.
+    // Actual requests still obey the existing long/short-side limits.
+    const auto bounds = [&](bool shifted)
+    {
+        auto low = ProfileMetadata(range.minimum.height, range.minimum.width, shifted, (range.minimum.frames - 1) / 4 + 1);
+        auto high = low;
+        // Windows are a Cartesian product of independent temporal/spatial axes.
+        // Scan their extrema separately, retaining the existing window geometry
+        // without repeating the large spatial scan for every temporal length.
+        auto spatial_low = ProfileMetadata(range.minimum.height, range.minimum.width, shifted);
+        auto spatial_high = spatial_low;
+        for (int64_t h = range.minimum.height; h <= range.maximum.height; h += 16)
+            for (int64_t w = range.minimum.width; w <= range.maximum.width; w += 16)
+            {
+                const auto d = ProfileMetadata(h, w, shifted);
+                spatial_low.window_count = std::min(spatial_low.window_count, d.window_count);
+                spatial_high.window_count = std::max(spatial_high.window_count, d.window_count);
+                spatial_low.max_window_length = std::min(spatial_low.max_window_length, d.max_window_length);
+                spatial_high.max_window_length = std::max(spatial_high.max_window_length, d.max_window_length);
+            }
+        auto temporal_low = ProfileMetadata(16, 16, shifted, (range.minimum.frames - 1) / 4 + 1);
+        auto temporal_high = temporal_low;
+        for (int64_t t = range.minimum.frames; t <= range.maximum.frames; t += 4)
+        {
+            const auto d = ProfileMetadata(16, 16, shifted, (t - 1) / 4 + 1);
+            temporal_low.window_count = std::min(temporal_low.window_count, d.window_count);
+            temporal_high.window_count = std::max(temporal_high.window_count, d.window_count);
+            temporal_low.max_window_length = std::min(temporal_low.max_window_length, d.max_window_length);
+            temporal_high.max_window_length = std::max(temporal_high.max_window_length, d.max_window_length);
+        }
+        low.window_count = spatial_low.window_count * temporal_low.window_count;
+        high.window_count = spatial_high.window_count * temporal_high.window_count;
+        low.max_window_length = (spatial_low.max_window_length - kContextTokens) *
+                                (temporal_low.max_window_length - kContextTokens) + kContextTokens;
+        high.max_window_length = (spatial_high.max_window_length - kContextTokens) *
+                                 (temporal_high.max_window_length - kContextTokens) + kContextTokens;
+        high.video_tokens = ((range.maximum.frames - 1) / 4 + 1) * (range.maximum.height / 16) * (range.maximum.width / 16);
+        for (auto* d : {&low, &high})
+        {
+            d->attention_tokens = d->video_tokens + d->window_count * kContextTokens;
+            d->padded_tokens = d->window_count * d->max_window_length;
+        }
+        return std::pair{low, high};
+    };
+    const auto [normal_min, normal_max] = bounds(false);
+    const auto [shifted_min, shifted_max] = bounds(true);
+    common::ModelProfile profile;
+    profile.min_shapes = DitProfile(range.minimum.height, range.minimum.width, normal_min, shifted_min, (range.minimum.frames - 1) / 4 + 1, rope_pairs);
+    profile.opt_shapes = DitProfile(range.optimum.height, range.optimum.width,
+        ProfileMetadata(range.optimum.height, range.optimum.width, false, (range.optimum.frames - 1) / 4 + 1),
+        ProfileMetadata(range.optimum.height, range.optimum.width, true, (range.optimum.frames - 1) / 4 + 1), (range.optimum.frames - 1) / 4 + 1, rope_pairs);
+    profile.max_shapes = DitProfile(range.maximum.height, range.maximum.width, normal_max, shifted_max, (range.maximum.frames - 1) / 4 + 1, rope_pairs);
+    profile.embed_ep_context = false;
+    const auto constant = [&](const char* name, int64_t low, int64_t high)
+    {
+        if (low == high) profile.free_dimension_overrides.emplace_back(name, low);
+    };
+    constant("latent_dim2", (range.minimum.frames - 1) / 4 + 1, (range.maximum.frames - 1) / 4 + 1);
+    constant("latent_dim3", range.minimum.height / 8, range.maximum.height / 8);
+    constant("latent_dim4", range.minimum.width / 8, range.maximum.width / 8);
+    AddMetadataOverrides(profile, "normal", normal_min, normal_max);
+    AddMetadataOverrides(profile, "shifted", shifted_min, shifted_max);
+    return profile;
+}
+
 inline common::ModelProfile ExactProfile(std::string shapes, std::string cache_subpath)
 {
     common::ModelProfile profile;
@@ -355,7 +447,6 @@ inline common::ModelProfile ExactProfile(std::string shapes, std::string cache_s
     profile.max_shapes = std::move(shapes);
     profile.cache_subpath = std::move(cache_subpath);
     profile.embed_ep_context = false;
-    profile.skip_compile = true;
     return profile;
 }
 

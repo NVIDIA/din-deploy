@@ -138,8 +138,7 @@ struct MetadataBuffers
     std::unique_ptr<common::TensorBuffer<Fp16>> freqs;
     std::unique_ptr<common::TensorBuffer<float>> freqs_fp32;
     MetadataBuffers(common::OrtRunner& r, Ort::IoBinding& io, const char* name, const MetadataDimensions& dimensions,
-                    int64_t latent_height, int64_t latent_width, bool shifted, int64_t temporal, bool version_7b,
-                    bool fp32_rope)
+                    int64_t latent_height, int64_t latent_width, bool shifted, int64_t temporal, bool version_7b)
         : wt(r, {dimensions.video_tokens}, true)
         , ws(r, {dimensions.video_tokens}, true)
         , ct(r, {dimensions.attention_tokens}, true)
@@ -151,18 +150,31 @@ struct MetadataBuffers
         try
         {
             const std::vector<int64_t> shape{dimensions.attention_tokens, version_7b ? 30 : kRopePairs, 2, 2};
-            if (fp32_rope)
+            // Quantized graphs inherit their high-precision source's RoPE type;
+            // the precision selector alone cannot tell FP16 and BF16 bases apart.
+            const std::string frequency_name = std::string(name) + "_freqs";
+            Ort::AllocatorWithDefaultOptions allocator;
+            auto frequency_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+            for (size_t index = 0; index < r.session.GetInputCount(); ++index)
+                if (frequency_name == r.session.GetInputNameAllocated(index, allocator).get())
+                {
+                    frequency_type = r.session.GetInputTypeInfo(index).GetTensorTypeAndShapeInfo().GetElementType();
+                    break;
+                }
+            if (frequency_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
             {
                 freqs_fp32 = std::make_unique<common::TensorBuffer<float>>(r, shape, true);
                 MakeMetadata(latent_height, latent_width, shifted, temporal, version_7b, io, name,
                              wt, ws, ct, cs, pf, pg, valid, *freqs_fp32);
             }
-            else
+            else if (frequency_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
             {
                 freqs = std::make_unique<common::TensorBuffer<Fp16>>(r, shape, true);
                 MakeMetadata(latent_height, latent_width, shifted, temporal, version_7b, io, name,
                              wt, ws, ct, cs, pf, pg, valid, *freqs);
             }
+            else
+                throw std::invalid_argument("SeedVR RoPE input must be FP32 or FP16: " + frequency_name);
         }
         catch (...)
         {
@@ -203,6 +215,12 @@ public:
             shape.target_width > 3840)
             throw std::invalid_argument("Invalid SeedVR source or target dimensions");
         video = frames > 1;
+        if (video)
+        {
+            const auto range = kVideoFrameRange;
+            if (frames < range.min || frames > range.max)
+                throw std::invalid_argument("Video frame count is outside the exported dynamic range");
+        }
         native_vae = config_.vae_backend == "cudnn";
         if (config_.vae_backend != "onnx" && !native_vae)
             throw std::invalid_argument("VAE backend must be onnx or cudnn");
@@ -249,7 +267,6 @@ public:
         const std::string variant = version_7b ? "7b" : "3b";
         const auto normal_profile = ProfileMetadata(padded_height, padded_width, false, latent_frames);
         const auto shifted_profile = ProfileMetadata(padded_height, padded_width, true, latent_frames);
-        const bool fp32_rope = version_7b || config_.transformer_precision == "bf16";
         const fs::path context_path = config_.model_dir / ("seedvr2_" + variant + "_fp16_positive_context.bin");
         const std::vector<Fp16> context_values = LoadContext(context_path);
         const fs::path encoder_path =
@@ -299,13 +316,16 @@ public:
             auto sessions = std::make_unique<SessionBundle>();
             sessions->padded_height = padded_height;
             sessions->padded_width = padded_width;
-            // TODO: TensorRT RTX attention decomposition fails with dynamic spatial shapes;
-            // restore ranged profiles when that path supports them.
+            // VAE tiling/buffers keep exact geometry per instance; the shared
+            // profile below applies only to the DiT.
             auto encoder_profile = ExactProfile(
                 "image:" + (video ? ShapeString({1, 3, static_cast<int64_t>(frames), encoder_height, encoder_width})
                                   : ShapeString({1, 3, encoder_height, encoder_width})),
                 video_prefix + "vae_encoder_" + std::to_string(encoder_width) + "x" + std::to_string(encoder_height));
-            encoder_profile.skip_compile = true;
+            if (video)
+                encoder_profile.free_dimension_overrides = {{"image_dim2", static_cast<int64_t>(frames)},
+                                                           {"image_dim3", encoder_height},
+                                                           {"image_dim4", encoder_width}};
             if (!native_vae)
             {
                 [[maybe_unused]] common::nvtx_scoped_range model_range{encoder_label.c_str()};
@@ -313,31 +333,22 @@ public:
                                                                         config_.ep_cache_dir.string(), ep_context,
                                                                         encoder_profile, stream);
             }
-            auto dit_profile =
-                ExactProfile(DitProfile(static_cast<int64_t>(padded_height), static_cast<int64_t>(padded_width),
-                                        normal_profile, shifted_profile, latent_frames, version_7b ? 30 : kRopePairs),
-                             "dit_" + config_.transformer_precision + "_" + image_size);
-            // The exporter gives each dynamic ONNX input dimension a stable name.
-            // Specializing them at session creation avoids a TensorRT RTX Myelin
-            // shape-inference failure when the DiT uses the full resolution range.
-            dit_profile.free_dimension_overrides = {
-                {"latent_dim3", latent_height},
-                {"latent_dim4", latent_width},
-                {"normal_window_tgt_idx_dim0", normal_profile.video_tokens},
-                {"normal_window_src_idx_dim0", normal_profile.video_tokens},
-                {"normal_concat_tgt_idx_dim0", normal_profile.attention_tokens},
-                {"normal_concat_src_idx_dim0", normal_profile.attention_tokens},
-                {"normal_padded_flat_idx_dim0", normal_profile.attention_tokens},
-                {"normal_padded_gather_idx_dim0", normal_profile.padded_tokens},
-                {"normal_valid_keys_dim0", normal_profile.window_count},
-                {"normal_valid_keys_dim1", normal_profile.max_window_length},
-                {"shifted_window_tgt_idx_dim0", shifted_profile.video_tokens},
-                {"shifted_concat_tgt_idx_dim0", shifted_profile.attention_tokens},
-                {"shifted_concat_src_idx_dim0", shifted_profile.attention_tokens},
-                {"shifted_padded_flat_idx_dim0", shifted_profile.attention_tokens},
-                {"shifted_padded_gather_idx_dim0", shifted_profile.padded_tokens},
-                {"shifted_valid_keys_dim0", shifted_profile.window_count},
-                {"shifted_valid_keys_dim1", shifted_profile.max_window_length}};
+            common::ModelProfile dit_profile;
+            if (video)
+            {
+                dit_profile = RangedVideoDitProfile(version_7b ? 30 : kRopePairs);
+                dit_profile.cache_subpath = "dit_" + config_.transformer_precision + "_video_range";
+            }
+            else
+            {
+                dit_profile = ExactProfile(DitProfile(padded_height, padded_width, normal_profile, shifted_profile,
+                                                     latent_frames, version_7b ? 30 : kRopePairs),
+                                           "dit_" + config_.transformer_precision + "_" + image_size);
+                dit_profile.free_dimension_overrides = {{"latent_dim3", latent_height}, {"latent_dim4", latent_width}};
+                if (video) dit_profile.free_dimension_overrides.emplace_back("latent_dim2", latent_frames);
+                AddMetadataOverrides(dit_profile, "normal", normal_profile, normal_profile);
+                AddMetadataOverrides(dit_profile, "shifted", shifted_profile, shifted_profile);
+            }
             if (!config_.weight_streaming_budget.empty())
             {
                 dit_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
@@ -353,14 +364,19 @@ public:
             if (!native_vae)
             {
                 [[maybe_unused]] common::nvtx_scoped_range model_range{decoder_label.c_str()};
-                sessions->decoder = std::make_unique<common::OrtRunner>(
-                    env_, decoder_path.string(), "trt-rtx", config_.ep_cache_dir.string(), ep_context,
+                auto decoder_profile =
                     ExactProfile("latent:" + (video ? ShapeString({1, kLatentChannels, latent_frames, decoder_height,
                                                                    decoder_width})
                                                     : ShapeString({1, kLatentChannels, decoder_height, decoder_width})),
                                  video_prefix + std::string("vae_decoder_unclamped_") +
-                                     std::to_string(decoder_width * 8) + "x" + std::to_string(decoder_height * 8)),
-                    stream);
+                                     std::to_string(decoder_width * 8) + "x" + std::to_string(decoder_height * 8));
+                if (video)
+                    decoder_profile.free_dimension_overrides = {{"latent_dim2", latent_frames},
+                                                               {"latent_dim3", decoder_height},
+                                                               {"latent_dim4", decoder_width}};
+                sessions->decoder = std::make_unique<common::OrtRunner>(
+                    env_, decoder_path.string(), "trt-rtx", config_.ep_cache_dir.string(), ep_context,
+                    decoder_profile, stream);
             }
             if (!sessions->dit->HasDeviceIo() ||
                 (!native_vae && (!sessions->encoder->HasDeviceIo() || !sessions->decoder->HasDeviceIo())))
@@ -447,9 +463,9 @@ public:
             dit_io_->BindInput("context", context_->BindingValue());
             dit_io_->BindOutput("denoised_latent", velocity_->BindingValue());
             normal_ = std::make_unique<MetadataBuffers>(dit, *dit_io_, "normal", normal_profile, latent_height,
-                                                        latent_width, false, latent_frames, version_7b, fp32_rope);
+                                                        latent_width, false, latent_frames, version_7b);
             shifted_ = std::make_unique<MetadataBuffers>(dit, *dit_io_, "shifted", shifted_profile, latent_height,
-                                                         latent_width, true, latent_frames, version_7b, fp32_rope);
+                                                         latent_width, true, latent_frames, version_7b);
             std::copy(context_values.begin(), context_values.end(), context_->HostData());
             context_->CopyAsyncToDevice();
             timestep_->HostData()[0] = Fp16(1000.0f);

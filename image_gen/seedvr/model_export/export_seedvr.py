@@ -6,8 +6,9 @@
 
 The VAE encoder/decoder are separate ONNX components with dynamic image
 height/width. The DiT is exported as a third component with matching dynamic
-latent height/width. Batch, temporal length (--video-frames, default one),
-and the 58x5120 conditioning tensor are fixed.
+latent height/width. Batch and the 58x5120 conditioning tensor are fixed.
+Images have one frame; video exports always have a bounded dynamic temporal
+axis (T>=5). --video-frames chooses the capture example, not a fixed clip length.
 DiT computation defaults to BF16 with FP16 graph I/O; the VAE remains FP16.
 """
 
@@ -26,6 +27,8 @@ DEFAULT_REPO_ID = "Comfy-Org/SeedVR2"
 CONTEXT_TOKENS = 58
 CONTEXT_WIDTH = 5120
 LATENT_CHANNELS = 16
+# Shared with the C++ kVideoFrameRange contract; video exports need no sidecar.
+VIDEO_FRAME_RANGE = (5, 33)
 DIT_INPUT_NAMES = (
     "latent",
     "timestep",
@@ -689,11 +692,13 @@ def dummy_inputs(
     return latent, timestep, context, condition
 
 
-def dynamic_dit_shapes() -> tuple[object, ...]:
+def dynamic_dit_shapes(max_video_frames: int | None = None) -> tuple[object, ...]:
     """Tie H/W and mark all resolution-dependent metadata lengths dynamic."""
     latent_height = 2 * torch.export.Dim("latent_height", min=1, max=2048)
     latent_width = 2 * torch.export.Dim("latent_width", min=1, max=2048)
     spatial = {3: latent_height, 4: latent_width}
+    if max_video_frames is not None:
+        spatial[2] = torch.export.Dim("latent_frames", min=2, max=(max_video_frames - 1) // 4 + 1)
     auto = torch.export.Dim.AUTO
     metadata_shapes = tuple(
         {0: auto, 1: auto} if name.endswith("_valid_keys") else {0: auto}
@@ -716,7 +721,7 @@ def dit_inputs_with_metadata(
 
 
 @torch.no_grad()
-def verify_eager_adapter(
+def verify_torch_parity(
         diffusion_model: torch.nn.Module,
         adapter: SeedVRDiTExportAdapter,
         inputs: tuple[torch.Tensor, ...],
@@ -733,7 +738,7 @@ def verify_eager_adapter(
     actual = adapter(*inputs)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     maximum_error = (actual.float() - expected.float()).abs().max().item()
-    print(f"Eager adapter parity passed (maximum absolute error {maximum_error:.6g}).")
+    print(f"PyTorch parity passed (maximum absolute error {maximum_error:.6g}).")
 
 
 def validate_metadata_shapes(diffusion_model: torch.nn.Module, device: torch.device, dtype: torch.dtype,
@@ -862,6 +867,7 @@ def capture_and_validate_exported_program(
         inputs: tuple[torch.Tensor, ...],
         device: torch.device,
         dtype: torch.dtype,
+        max_video_frames: int | None = None,
 ) -> torch.export.ExportedProgram:
     if (inputs[DIT_INPUT_NAMES.index("normal_valid_keys")].shape[0] < 2 or
             inputs[DIT_INPUT_NAMES.index("shifted_valid_keys")].shape[0] < 2):
@@ -869,19 +875,20 @@ def capture_and_validate_exported_program(
             "The DiT capture example must produce multiple normal and shifted windows; "
             "use the default 64x96 latent or a larger shape."
         )
-    exported = torch.export.export(adapter, inputs, dynamic_shapes=dynamic_dit_shapes(), strict=False)
+    exported = torch.export.export(adapter, inputs, dynamic_shapes=dynamic_dit_shapes(max_video_frames), strict=False)
     exported_module = exported.module()
     example_height, example_width = inputs[0].shape[3:5]
-    for height, width in (
-            (example_height, example_width),
-            (example_height, example_width + 16),
-    ):
-        shape_inputs = dit_inputs_with_metadata(diffusion_model, device, dtype, inputs[0].shape[2], height, width)
+    cases = [(inputs[0].shape[2], example_height, example_width),
+             (inputs[0].shape[2], example_height, example_width + 16)]
+    if max_video_frames is not None:
+        cases.extend((t, example_height, example_width) for t in (2, 3))
+    for temporal, height, width in cases:
+        shape_inputs = dit_inputs_with_metadata(diffusion_model, device, dtype, temporal, height, width)
         with torch.no_grad():
             expected = adapter(*shape_inputs)
             actual = exported_module(*shape_inputs)
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        print(f"Exported PyTorch program passed at latent {height}x{width}.")
+        print(f"Exported PyTorch program passed at latent T={temporal}, {height}x{width}.")
     return exported
 
 
@@ -899,6 +906,7 @@ def export_vae_components(
         decompose_attention: bool = False,
         video_frames: int = 1,
         opset_version: int = 24,
+        max_video_frames: int = VIDEO_FRAME_RANGE[1],
 ) -> None:
     if image_height < 16 or image_width < 16 or image_height % 16 or image_width % 16:
         raise ValueError("--image-height and --image-width must be multiples of 16 and at least 16.")
@@ -918,6 +926,25 @@ def export_vae_components(
                              image_height // 8, image_width // 8, device=device, dtype=dtype, generator=generator)
         encoder = SeedVRVideoEncoderExportWrapper(vae).eval()
         decoder = SeedVRVideoDecoderExportWrapper(vae).eval()
+    def export_component(wrapper, example, path, input_name, output_name, spatial_multiple):
+        shapes = {spatial_axis: spatial_multiple * torch.export.Dim(input_name + "_height_units", min=1),
+                  spatial_axis + 1: spatial_multiple * torch.export.Dim(input_name + "_width_units", min=1)}
+        if video_frames > 1:
+            latent_frames = torch.export.Dim("latent_frames", min=2, max=(max_video_frames - 1) // 4 + 1)
+            shapes[2] = 4 * latent_frames - 3 if input_name == "image" else latent_frames
+            captured = torch.export.export(wrapper, (example,), dynamic_shapes=(shapes,), strict=False)
+            for frames in (5, 9):
+                size = list(example.shape)
+                size[2] = frames if input_name == "image" else (frames - 1) // 4 + 1
+                value = torch.randn(*size, device=device, dtype=dtype)
+                with torch.no_grad():
+                    torch.testing.assert_close(captured.module()(value), wrapper(value), rtol=2e-3, atol=4e-3)
+            export_onnx(captured, (), path, artifacts_dir / ("vae_encoder" if input_name == "image" else "vae_decoder"),
+                        (input_name,), (output_name,), opset_version=opset_version)
+            name_dynamic_dit_dimensions(path)
+        else:
+            export_onnx(wrapper, (example,), path, artifacts_dir / ("vae_encoder" if input_name == "image" else "vae_decoder"),
+                        (input_name,), (output_name,), dynamic_shapes=(shapes,), opset_version=opset_version)
     with torch.no_grad():
         expected_encoded = encoder(image)
         expected_decoded = decoder(latent)
@@ -935,41 +962,17 @@ def export_vae_components(
     print("TensorRT RTX VAE export patch passed eager parity.")
     if export_encoder:
         with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
-            export_onnx(
-                encoder,
-                (image,),
-                encoder_output,
-                artifacts_dir / "vae_encoder",
-                ("image",),
-                ("latent",),
-                opset_version=opset_version,
-                dynamic_shapes=({
-                    spatial_axis: 16 * torch.export.Dim("image_height_units", min=1),
-                    spatial_axis + 1: 16 * torch.export.Dim("image_width_units", min=1),
-                },),
-            )
+            export_component(encoder, image, encoder_output, "image", "latent", 16)
         print(f"Exported dynamic SeedVR VAE encoder: {encoder_output}")
-        validate_vae_onnx(encoder_output, "image", "latent", opset_version)
+        validate_vae_onnx(encoder_output, "image", "latent", opset_version, video=video_frames > 1)
     if export_decoder:
         with trt_rtx_vae_export_patches(vae, decompose_attention=decompose_attention):
-            export_onnx(
-                decoder,
-                (latent,),
-                decoder_output,
-                artifacts_dir / "vae_decoder",
-                ("latent",),
-                ("image",),
-                opset_version=opset_version,
-                dynamic_shapes=({
-                    spatial_axis: 2 * torch.export.Dim("latent_height_units", min=1),
-                    spatial_axis + 1: 2 * torch.export.Dim("latent_width_units", min=1),
-                },),
-            )
+            export_component(decoder, latent, decoder_output, "latent", "image", 2)
         print(f"Exported dynamic SeedVR VAE decoder: {decoder_output}")
-        validate_vae_onnx(decoder_output, "latent", "image", opset_version)
+        validate_vae_onnx(decoder_output, "latent", "image", opset_version, video=video_frames > 1)
 
 
-def validate_onnx(output_path: Path, temporal: int = 1, expected_attention_count: int = 32) -> None:
+def validate_onnx(output_path: Path, expected_attention_count: int = 32, *, video: bool = False) -> None:
     import onnx
 
     # The 3B external-data model exceeds protobuf's 2 GiB in-memory checker
@@ -987,12 +990,14 @@ def validate_onnx(output_path: Path, temporal: int = 1, expected_attention_count
     tensor_inputs = {value.name: value for value in model.graph.input}
     if set(tensor_inputs) != set(DIT_INPUT_NAMES):
         raise RuntimeError(f"Expected inputs {DIT_INPUT_NAMES}, found {tuple(tensor_inputs)}.")
-    for value in (tensor_inputs["latent"], tensor_inputs["condition"]):
+    for value in (tensor_inputs["latent"], tensor_inputs["condition"], *model.graph.output):
         dims = value.type.tensor_type.shape.dim
         if not all(dims[index].dim_param for index in (3, 4)):
             raise RuntimeError(f"{value.name} does not retain dynamic spatial dimensions.")
-        if dims[2].dim_param or dims[2].dim_value != temporal:
-            raise RuntimeError(f"{value.name} temporal length must remain fixed at {temporal}.")
+        if video and not dims[2].dim_param:
+            raise RuntimeError(f"{value.name} does not retain a dynamic temporal dimension.")
+        if not video and (dims[2].dim_param or dims[2].dim_value != 1):
+            raise RuntimeError(f"{value.name} image temporal length must remain fixed at one.")
     for name in DIT_INPUT_NAMES[4:]:
         if not tensor_inputs[name].type.tensor_type.shape.dim[0].dim_param:
             raise RuntimeError(f"{name} does not retain its dynamic leading dimension.")
@@ -1011,7 +1016,8 @@ def validate_onnx(output_path: Path, temporal: int = 1, expected_attention_count
     print(f"ONNX structural validation passed: {output_path}")
 
 
-def validate_vae_onnx(output_path: Path, input_name: str, output_name: str, opset_version: int = 24) -> None:
+def validate_vae_onnx(output_path: Path, input_name: str, output_name: str, opset_version: int = 24,
+                      *, video: bool = False) -> None:
     import onnx
 
     model = onnx.load(str(output_path), load_external_data=False)
@@ -1023,6 +1029,8 @@ def validate_vae_onnx(output_path: Path, input_name: str, output_name: str, opse
         if name not in values:
             raise RuntimeError(f"Expected {name!r} in {output_path}, found {list(values)}.")
         dims = values[name].type.tensor_type.shape.dim
+        if video and (len(dims) != 5 or not dims[2].dim_param):
+            raise RuntimeError(f"{name} must retain a dynamic video temporal dimension in {output_path}.")
         if not dims[-2].dim_param or not dims[-1].dim_param:
             raise RuntimeError(f"{name} does not retain dynamic spatial dimensions in {output_path}.")
     print(f"VAE ONNX structural validation passed: {output_path}")
@@ -1047,20 +1055,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native-dit-io", action="store_true",
                         help="Keep DiT I/O at its compute dtype; default FP16 boundaries support the C++ pipeline.")
     parser.add_argument(
-        "--model", type=Path, default=None, help="Defaults to seedvr2_3b_fp16.safetensors in --snapshot."
+        "--model", default=None,
+        help="Hugging Face repository slug or local DiT checkpoint (default: Comfy-Org/SeedVR2)."
     )
+    parser.add_argument("--variant", choices=("3b", "7b"), default=None,
+                        help="Checkpoint variant (default: 3b; inferred from local checkpoint filenames).")
     parser.add_argument(
         "--vae", type=Path, default=None, help="Defaults to seedvr2_ema_vae_fp16.safetensors in --snapshot."
     )
     parser.add_argument(
-        "--components",
+        "--components", "--component",
         nargs="+",
         choices=("vae_encoder", "vae_decoder", "dit", "context"),
         default=("vae_encoder", "vae_decoder", "dit"),
         help="Components to export; VAE components can be exported independently of the DiT.",
     )
     parser.add_argument("--output", type=Path, default=None,
-                        help="DiT output path; default: models/SeedVR2-3B-onnx/seedvr2_3b_<dit-dtype>_dit.onnx.")
+                        help="DiT output path; default directory: models/SeedVR2-<variant>[-video]-onnx.")
     parser.add_argument("--vae-encoder-output", type=Path, default=None)
     parser.add_argument("--vae-decoder-output", type=Path, default=None)
     parser.add_argument("--positive-context-output", type=Path, default=None)
@@ -1070,17 +1081,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opset", type=int, default=24,
                         help="ONNX opset version for all models; must be at least 23 for Attention (default: 24).")
     parser.add_argument("--video-frames", type=int, default=1,
-                        help="Export a video clip of 4n+1 frames; default 1 retains the image export. Temporal size is fixed, H/W are dynamic.")
-    parser.add_argument("--latent-height", type=int, default=64, help="Even multi-window example latent height.")
-    parser.add_argument("--latent-width", type=int, default=96, help="Even multi-window example latent width.")
+                        help="Video capture example of 4n+1 frames (>=5); all video exports have dynamic T/H/W. Default 1 exports images.")
+    parser.add_argument("--latent-height", type=int, default=64, help="Even multi-window example latent height (default: 64, representing 512 pixels).")
+    parser.add_argument("--latent-width", type=int, default=64, help="Even multi-window example latent width (default: 64, representing 512 pixels).")
     parser.add_argument(
-        "--image-height", type=int, default=32, help="Example VAE image height; must be a multiple of 16."
+        "--image-height", type=int, default=64, help="Example VAE image height; must be a multiple of 16 (default: 64)."
     )
     parser.add_argument(
-        "--image-width", type=int, default=32, help="Example VAE image width; must be a multiple of 16."
+        "--image-width", type=int, default=64, help="Example VAE image width; must be a multiple of 16 (default: 64)."
     )
     parser.add_argument("--skip-validation", action="store_true")
-    parser.add_argument("--skip-eager-parity", action="store_true")
+    parser.add_argument("--check-torch-parity", action="store_true",
+                        help="Compare the export adapter against the native PyTorch model (off by default).")
     parser.add_argument("--skip-metadata-validation", action="store_true")
     return parser.parse_args()
 
@@ -1092,25 +1104,45 @@ def main() -> None:
     if args.video_frames < 1 or (args.video_frames - 1) % 4:
         raise ValueError("--video-frames must be 4n+1 (1, 5, 9, 13, ...).")
     args.temporal = (args.video_frames - 1) // 4 + 1
+    video = args.video_frames > 1
+    if video and not VIDEO_FRAME_RANGE[0] <= args.video_frames <= VIDEO_FRAME_RANGE[1]:
+        raise ValueError("Video capture length must be 4n+1 in [5,33].")
+    max_video_frames = VIDEO_FRAME_RANGE[1] if video else None
     add_comfyui_to_path(args.comfy_root)
     components = set(args.components)
+    # A repository slug has exactly namespace/name; checkpoint files retain
+    # their path semantics, including snapshot symlinks used by ComfyUI.
+    model_source = args.model or DEFAULT_REPO_ID
+    model_file = Path(model_source).expanduser()
+    model_parts = model_source.split("/")
+    from_repo = (not model_file.is_file() and model_file.suffix.lower() not in (".safetensors", ".pt", ".pth", ".ckpt", ".bin") and
+                 len(model_parts) == 2 and all(model_parts) and "\\" not in model_source and ":" not in model_source)
+    repo_id = model_source if from_repo else DEFAULT_REPO_ID
+    explicit_model = None if from_repo else model_file
+    local_variant = next((v for v in ("3b", "7b") if explicit_model and v in explicit_model.stem.lower()), None)
+    if args.variant and local_variant and args.variant != local_variant:
+        raise ValueError("--variant conflicts with the local checkpoint filename.")
+    variant = args.variant or local_variant or "3b"
+    checkpoint_name = f"seedvr2_{variant}_fp16.safetensors"
     snapshot = args.snapshot or Path()
-    if args.snapshot is None and (({"dit", "context"} & components and args.model is None) or
+    if args.snapshot is None and (({"dit", "context"} & components and explicit_model is None) or
                                   ({"vae_encoder", "vae_decoder"} & components and args.vae is None)):
         from huggingface_hub import snapshot_download
 
         patterns = []
-        if {"dit", "context"} & components and args.model is None:
-            patterns.append("diffusion_models/seedvr2_3b_fp16.safetensors")
+        if {"dit", "context"} & components and explicit_model is None:
+            patterns.append(f"diffusion_models/{checkpoint_name}")
         if {"vae_encoder", "vae_decoder"} & components and args.vae is None:
             patterns.append("vae/seedvr2_ema_vae_fp16.safetensors")
-        snapshot = Path(snapshot_download(repo_id=DEFAULT_REPO_ID, allow_patterns=patterns))
-    model_path = args.model or snapshot / "diffusion_models" / "seedvr2_3b_fp16.safetensors"
+        snapshot = Path(snapshot_download(repo_id=repo_id, allow_patterns=patterns))
+    model_path = explicit_model or snapshot / "diffusion_models" / checkpoint_name
     vae_path = args.vae or snapshot / "vae" / "seedvr2_ema_vae_fp16.safetensors"
     # Preserve the Hugging Face snapshot symlink suffix for ComfyUI's
     # safetensors loader; .resolve() would yield an extensionless blob path.
     model_path = model_path.expanduser().absolute()
-    output_path = (args.output or Path(f"models/SeedVR2-3B-onnx/seedvr2_3b_{args.dit_dtype}_dit.onnx")).expanduser().absolute()
+    default_output = (f"models/SeedVR2-{variant.upper()}-video-onnx/seedvr2_video_dit.onnx" if video else
+                      f"models/SeedVR2-{variant.upper()}-onnx/seedvr2_{variant}_{args.dit_dtype}_dit.onnx")
+    output_path = (args.output or Path(default_output)).expanduser().absolute()
     artifacts_dir = args.artifacts_dir.expanduser().absolute()
     vae_encoder_output = (
         (args.vae_encoder_output or output_path.with_name("seedvr2_ema_vae_encoder.onnx")).expanduser().absolute()
@@ -1119,9 +1151,7 @@ def main() -> None:
         (args.vae_decoder_output or output_path.with_name("seedvr2_ema_vae_decoder.onnx")).expanduser().absolute()
     )
     positive_context_output = (
-        (args.positive_context_output or output_path.with_name(
-            "seedvr2_7b_fp16_positive_context.bin" if output_path.name.startswith("seedvr2_7b_")
-            else "seedvr2_3b_fp16_positive_context.bin"))
+        (args.positive_context_output or output_path.with_name(f"seedvr2_{variant}_fp16_positive_context.bin"))
         .expanduser()
         .absolute()
     )
@@ -1130,9 +1160,6 @@ def main() -> None:
         vae_encoder_output = vae_encoder_output.with_name("seedvr2_video_vae_encoder.onnx")
         vae_decoder_output = vae_decoder_output.with_name("seedvr2_video_vae_decoder.onnx")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest = output_path.parent / "seedvr2_video_frames.txt"
-        if manifest.exists() and int(manifest.read_text()) != args.video_frames:
-            raise ValueError("Use a separate output directory for each video clip length.")
 
     if {"vae_encoder", "vae_decoder"} & components:
         print(f"Loading SeedVR VAE: {vae_path}")
@@ -1152,6 +1179,7 @@ def main() -> None:
             decompose_attention=args.decompose_vae_attention,
             video_frames=args.video_frames,
             opset_version=args.opset,
+            max_video_frames=VIDEO_FRAME_RANGE[1],
         )
     if {"dit", "context"} & components:
         print(f"Loading SeedVR diffusion model: {model_path}")
@@ -1168,17 +1196,17 @@ def main() -> None:
         )
         if not args.skip_metadata_validation:
             validate_metadata_shapes(diffusion_model, device, dtype, args.temporal)
-        if not args.skip_eager_parity:
-            verify_eager_adapter(diffusion_model, adapter, inputs)
-        capture_and_validate_exported_program(adapter, diffusion_model, inputs, device, dtype)
+        if args.check_torch_parity:
+            verify_torch_parity(diffusion_model, adapter, inputs)
+        captured = capture_and_validate_exported_program(adapter, diffusion_model, inputs, device, dtype, max_video_frames)
         export_onnx(
-            adapter,
-            inputs,
+            captured if video else adapter,
+            () if video else inputs,
             output_path,
             artifacts_dir / "dit",
             DIT_INPUT_NAMES,
             ("denoised_latent",),
-            dynamic_dit_shapes(),
+            None if video else dynamic_dit_shapes(),
             opset_version=args.opset,
         )
         if not args.native_dit_io:
@@ -1186,10 +1214,7 @@ def main() -> None:
         name_dynamic_dit_dimensions(output_path)
         print(f"Exported dynamic SeedVR DiT: {output_path}")
         if not args.skip_validation:
-            validate_onnx(output_path, args.temporal, len(diffusion_model.blocks))
-
-    if args.video_frames > 1:
-        manifest.write_text(str(args.video_frames) + "\n")
+            validate_onnx(output_path, len(diffusion_model.blocks), video=video)
 
 
 if __name__ == "__main__":

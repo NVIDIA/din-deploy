@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -467,6 +468,42 @@ Ort::ConstEpDevice FindTensorRTRTXDevice(Ort::Env& env)
     return selected_devices.front();
 }
 
+std::string ModelCacheKey(const std::string& model_path, const ModelProfile& profile)
+{
+    // Version the compilation policy as well as shapes: old contexts may have
+    // used explicit optimization overrides. Ranged profiles deliberately
+    // omit the current execution shape; exact profiles include it in these fields.
+    std::string identity = "ort_compile_api_default_v1";
+    const auto append = [&](const std::string& value)
+    {
+        identity += std::to_string(value.size()) + ":" + value;
+    };
+    append(fs::absolute(model_path).lexically_normal().string());
+    for (const auto& file : {fs::path(model_path), fs::path(model_path + ".data")})
+        if (fs::is_regular_file(file))
+        {
+            append(std::to_string(fs::file_size(file)));
+            append(std::to_string(fs::last_write_time(file).time_since_epoch().count()));
+        }
+    append(profile.min_shapes);
+    append(profile.opt_shapes);
+    append(profile.max_shapes);
+    append(profile.enable_cuda_graph ? "cuda_graph" : "no_cuda_graph");
+    append(profile.embed_ep_context ? "embedded" : "external");
+    for (const auto& [name, value] : profile.free_dimension_overrides)
+    {
+        append(name);
+        append(std::to_string(value));
+    }
+    for (const auto& [name, value] : profile.extra_ep_options)
+    {
+        append(name);
+        append(value);
+    }
+    const auto prefix = profile.cache_subpath.empty() ? fs::path(model_path).stem().string() : profile.cache_subpath;
+    return prefix + ".ortopt_" + std::to_string(std::hash<std::string>{}(identity));
+}
+
 void AppendTensorRTRTXEP(Ort::Env& env, Ort::SessionOptions& options, const std::string& cache_dir,
                          const std::string& model_path, const EpContextOptions& ep_context, const ModelProfile& profile,
                          Ort::SyncStream* compute_stream = nullptr)
@@ -484,9 +521,7 @@ void AppendTensorRTRTXEP(Ort::Env& env, Ort::SessionOptions& options, const std:
         ep_options.Add("enable_cuda_graph", "1");
     }
 
-    const auto stem = fs::path(model_path).stem().string();
-    const auto cache_path =
-        (fs::path(cache_dir) / (profile.cache_subpath.empty() ? stem : profile.cache_subpath)).string();
+    const auto cache_path = (fs::path(cache_dir) / ModelCacheKey(model_path, profile)).string();
     ep_options.Add("nv_runtime_cache_path", cache_path.c_str());
     if (!profile.min_shapes.empty())
     {
@@ -516,11 +551,9 @@ std::string CompiledModelPath(const std::string& model_path, const EpContextOpti
     const fs::path input(model_path);
     const fs::path output_dir(ep_context.output_dir);
     const auto stem = input.stem().string();
-    if (!profile.cache_subpath.empty())
-    {
-        return (output_dir / (stem + "." + profile.cache_subpath + ".embedded.onnx")).string();
-    }
-    return (output_dir / (stem + ".trt_rtx.embedded.onnx")).string();
+    // The EP chooses engine sidecar names. Isolate profiles so their payloads
+    // cannot overwrite one another even when they originate from the same graph.
+    return (output_dir / ModelCacheKey(model_path, profile) / (stem + ".embedded.onnx")).string();
 }
 
 bool IsCompatibleEpContext(Ort::Env& env, const fs::path& model_path)
@@ -582,6 +615,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     fs::create_directories(output_dir);
 
     Ort::SessionOptions compile_session_options;
+    for (const auto& [name, value] : profile.free_dimension_overrides)
+        compile_session_options.AddFreeDimensionOverrideByName(name.c_str(), value);
     AppendTensorRTRTXEP(env, compile_session_options, cache_dir, model_path, ep_context, profile);
 
     Ort::ModelCompilationOptions compile_options(env, compile_session_options);
@@ -600,6 +635,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     {
         throw Ort::Exception(status.GetErrorMessage(), ORT_FAIL);
     }
+    if (!IsCompatibleEpContext(env, output_model_path))
+        throw std::runtime_error("Compilation did not produce a compatible EP-context model: " + output_model_path);
     return output_model_path;
 }
 }  // namespace
@@ -815,7 +852,6 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
 
     if (provider == "trt-rtx")
     {
-        options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
         options_.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
         ep_device = FindTensorRTRTXDevice(env);
         if (!ep_device)
