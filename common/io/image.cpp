@@ -5,9 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
+#include <limits>
+#include <stdexcept>
 
 #include "lodepng.h"
 
@@ -16,123 +15,89 @@ namespace din::io
 namespace
 {
 
-static unsigned char clampAndConvert(float val)
+size_t ImageSize(uint32_t width, uint32_t height, size_t channels)
 {
-    if (val < 0)
-        val = 0;
-    if (val > 255)
-        val = 255;
-    return static_cast<unsigned char>(val);
+    if (!width || !height || size_t(width) > std::numeric_limits<size_t>::max() / height / channels)
+        throw std::invalid_argument("Invalid PNG dimensions");
+    return size_t(width) * height * channels;
 }
 
-unsigned char floatToByte(float value, ImageValueRange range)
+void SavePng(const std::filesystem::path& path, const uint8_t* pixels, uint32_t width, uint32_t height,
+             LodePNGColorType color)
 {
-    if (range == ImageValueRange::MinusOneToOne)
-    {
-        value = value * 127.5f + 127.5f;
-    }
+    if (!pixels)
+        throw std::invalid_argument("Invalid PNG pixels");
+    ImageSize(width, height, color == LCT_RGB ? 3 : 1);
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    const unsigned error = lodepng::encode(path.string(), pixels, width, height, color, 8);
+    if (error)
+        throw std::runtime_error("failed to save PNG " + path.string() + ": " + lodepng_error_text(error));
+}
 
-    return static_cast<unsigned char>(std::lround(std::clamp(value, 0.0f, 255.0f)));
+uint8_t FloatToByte(float value, ImageValueRange range)
+{
+    if (!std::isfinite(value))
+        throw std::invalid_argument("Non-finite PNG pixel value");
+    switch (range)
+    {
+    case ImageValueRange::ZeroTo255:
+        break;
+    case ImageValueRange::MinusOneToOne:
+        value = value * 127.5f + 127.5f;
+        break;
+    default:
+        throw std::invalid_argument("Invalid PNG image value range");
+    }
+    return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 255.0f)));
+}
+
+std::vector<uint8_t> ToBytes(const float* chw_data, uint32_t width, uint32_t height, size_t channels,
+                             ImageValueRange range)
+{
+    if (!chw_data)
+        throw std::invalid_argument("Invalid PNG pixels");
+    std::vector<uint8_t> pixels(ImageSize(width, height, channels));
+    const size_t plane = size_t(width) * height;
+    for (size_t p = 0; p < plane; ++p)
+        for (size_t c = 0; c < channels; ++c)
+            pixels[p * channels + c] = FloatToByte(chw_data[c * plane + p], range);
+    return pixels;
 }
 
 }  // namespace
 
-void loadInputImage(float* pData, const char* imageFileName)
+RgbImage LoadPng(const std::filesystem::path& path)
 {
-    unsigned char* image = nullptr;
-    unsigned int width = 0;
-    unsigned int height = 0;
-    unsigned int error = lodepng_decode32_file(&image, &width, &height, imageFileName);
+    RgbImage image;
+    const unsigned error = lodepng::decode(image.rgb, image.width, image.height, path.string(), LCT_RGB, 8);
     if (error)
-    {
-        std::printf("\nFailed to load the input image: %s. Exiting\n", lodepng_error_text(error));
-        std::exit(EXIT_FAILURE);
-    }
-
-    if (width != image_dim || height != image_dim)
-    {
-        std::printf("\nImage not of right size (%ux%u, expected %ux%u). Exiting\n", width, height, image_dim,
-                    image_dim);
-        std::exit(EXIT_FAILURE);
-    }
-
-    for (unsigned int y = 0; y < height; y++)
-    {
-        for (unsigned int x = 0; x < width; x++)
-        {
-            unsigned char r = image[(y * width + x) * 4 + 0];
-            unsigned char g = image[(y * width + x) * 4 + 1];
-            unsigned char b = image[(y * width + x) * 4 + 2];
-
-            pData[0 * width * height + y * width + x] = static_cast<float>(b);
-            pData[1 * width * height + y * width + x] = static_cast<float>(g);
-            pData[2 * width * height + y * width + x] = static_cast<float>(r);
-        }
-    }
-
-    std::free(image);
+        throw std::runtime_error("failed to load PNG " + path.string() + ": " + lodepng_error_text(error));
+    return image;
 }
 
-void saveOutputImage(float* pData, const char* imageFileName)
+void SaveRgbPng(const std::filesystem::path& path, const uint8_t* rgb, uint32_t width, uint32_t height)
 {
-    unsigned int width = image_dim;
-    unsigned int height = image_dim;
-
-    std::vector<unsigned char> image(width * height * 4);
-    for (unsigned int y = 0; y < height; y++)
-    {
-        for (unsigned int x = 0; x < width; x++)
-        {
-            float b = pData[0 * width * height + y * width + x];
-            float g = pData[1 * width * height + y * width + x];
-            float r = pData[2 * width * height + y * width + x];
-
-            image[(y * width + x) * 4 + 0] = clampAndConvert(r);
-            image[(y * width + x) * 4 + 1] = clampAndConvert(g);
-            image[(y * width + x) * 4 + 2] = clampAndConvert(b);
-            image[(y * width + x) * 4 + 3] = 255;
-        }
-    }
-    auto encode_error = lodepng_encode32_file(imageFileName, image.data(), width, height);
-    if (encode_error != 0)
-    {
-        std::printf("Failed to save output image \"%s\": %u\n", imageFileName, encode_error);
-    }
+    SavePng(path, rgb, width, height, LCT_RGB);
 }
 
-bool SaveRgbFloatImage(const std::string& path, const float* chw_data, size_t height, size_t width,
-                       ImageValueRange range)
+void SaveGrayPng(const std::filesystem::path& path, const uint8_t* gray, uint32_t width, uint32_t height)
 {
-    if (chw_data == nullptr || height == 0 || width == 0)
-    {
-        return false;
-    }
+    SavePng(path, gray, width, height, LCT_GREY);
+}
 
-    const size_t plane_size = height * width;
-    std::vector<unsigned char> image(plane_size * 4);
+void SaveRgbPng(const std::filesystem::path& path, const float* chw_data, uint32_t width, uint32_t height,
+                ImageValueRange range)
+{
+    const auto pixels = ToBytes(chw_data, width, height, 3, range);
+    SaveRgbPng(path, pixels.data(), width, height);
+}
 
-    for (size_t y = 0; y < height; ++y)
-    {
-        for (size_t x = 0; x < width; ++x)
-        {
-            const size_t pixel = y * width + x;
-            const size_t rgba = pixel * 4;
-            image[rgba + 0] = floatToByte(chw_data[pixel], range);
-            image[rgba + 1] = floatToByte(chw_data[plane_size + pixel], range);
-            image[rgba + 2] = floatToByte(chw_data[2 * plane_size + pixel], range);
-            image[rgba + 3] = 255;
-        }
-    }
-
-    const unsigned int error = lodepng_encode32_file(path.c_str(), image.data(), static_cast<unsigned int>(width),
-                                                     static_cast<unsigned int>(height));
-    if (error != 0)
-    {
-        std::printf("Failed to save image to %s: %s\n", path.c_str(), lodepng_error_text(error));
-        return false;
-    }
-
-    return true;
+void SaveGrayPng(const std::filesystem::path& path, const float* gray, uint32_t width, uint32_t height,
+                 ImageValueRange range)
+{
+    const auto pixels = ToBytes(gray, width, height, 1, range);
+    SaveGrayPng(path, pixels.data(), width, height);
 }
 
 }  // namespace din::io

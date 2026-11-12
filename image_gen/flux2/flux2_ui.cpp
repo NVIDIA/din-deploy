@@ -178,9 +178,8 @@ private:
                         std::filesystem::create_directories(config.output_path);
                         const auto file =
                             config.output_path / ("flux2_" + std::to_string(i) + "_" + std::to_string(seed) + ".png");
-                        if (!din::io::SaveRgbFloatImage(file.string(), image.data.data(), image.height, image.width,
-                                                        din::io::ImageValueRange::MinusOneToOne))
-                            throw std::runtime_error("Could not save " + file.string());
+                        din::io::SaveRgbPng(file, image.data.data(), image.width, image.height,
+                                            din::io::ImageValueRange::MinusOneToOne);
                     }
                     std::lock_guard guard(mutex);
                     ready.push_back({std::move(image), seed, 0});

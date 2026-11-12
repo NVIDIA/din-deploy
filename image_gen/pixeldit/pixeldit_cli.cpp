@@ -230,11 +230,8 @@ void save_image(const std::filesystem::path& output_path, const PixelDiTImage& i
     {
         throw std::runtime_error("Backend returned an empty image");
     }
-    if (!din::io::SaveRgbFloatImage(output_path.string(), image.data.data(), image.height, image.width,
-                                    din::io::ImageValueRange::MinusOneToOne))
-    {
-        throw std::runtime_error("Failed to save image to " + output_path.string());
-    }
+    din::io::SaveRgbPng(output_path, image.data.data(), image.width, image.height,
+                        din::io::ImageValueRange::MinusOneToOne);
     std::cout << "Image saved to " << output_path.string() << std::endl;
 }
 
