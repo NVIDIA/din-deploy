@@ -107,15 +107,4 @@ def build_predictor():
     predictor.model.hotstart_delay = 0
     predictor.model.postprocess_batch_size = 1
     predictor.model.batched_grounding_batch_size = 1
-    # The pinned base predictor passes this SAM2-only argument to the multiplex
-    # implementation, whose init_state does not accept it. State offload remains
-    # disabled; fail explicitly if a caller tries to enable it.
-    init_state = predictor.model.init_state
-
-    def multiplex_init_state(*args, offload_state_to_cpu=False, **kwargs):
-        if offload_state_to_cpu:
-            raise ValueError("SAM3.1 multiplex state offload is not supported")
-        return init_state(*args, **kwargs)
-
-    predictor.model.init_state = multiplex_init_state
     return predictor

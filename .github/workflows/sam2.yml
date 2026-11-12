@@ -186,10 +186,10 @@ jobs:
           set -euxo pipefail
           base64 --decode assets/sam2-ci.png.base64 > assets/sam2-ci.png
           mkdir -p "out/${{ matrix.slug }}"
-          chmod +x runtime/din_sam2_cli
-          runtime/din_sam2_cli \
+          chmod +x runtime/din_sam_cli
+          runtime/din_sam_cli \
             assets/sam2-ci.png \
-            assets/sam2-ci-prompt.json \
+            --model sam2 --prompt assets/sam2-ci-prompt.json \
             "out/${{ matrix.slug }}" \
             --model-dir "models/${{ matrix.slug }}" \
             --provider cpu
@@ -246,9 +246,9 @@ jobs:
           )
           [IO.File]::WriteAllBytes("assets/sam2-ci.png", $imageBytes)
           New-Item -ItemType Directory -Force -Path "out/${{ matrix.slug }}" | Out-Null
-          & "runtime/din_sam2_cli.exe" `
+          & "runtime/din_sam_cli.exe" `
             "assets/sam2-ci.png" `
-            "assets/sam2-ci-prompt.json" `
+            --model sam2 --prompt "assets/sam2-ci-prompt.json" `
             "out/${{ matrix.slug }}" `
             --model-dir "models/${{ matrix.slug }}" `
             --provider cpu

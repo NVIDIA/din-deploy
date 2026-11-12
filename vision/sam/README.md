@@ -2,46 +2,114 @@
 
 `din_sam_pipeline` provides one `din::sam::Sam` API for SAM2 and SAM3. The existing
 SAM2 and SAM3 classes are compatibility adapters; inference and temporal state
-updates live in this library. OFX keeps its frame scheduling, result caches and
-offline mask persistence outside the inference core.
+updates live in this library.
 
 ## Source layout
 
 All SAM runtime implementations and export tools live here. `cpp/` contains the shared
 API and family-specific adapters, kernels and tokenizer. `python/` contains both
 exporters and the distinctly named `sam2_modeling.py` and `sam3_modeling.py`.
-Only model exports, verification and their required helpers are published. Local
-tests, fixtures, diagnostics and generated reports are excluded from Git. Export details are in [SAM2](docs/SAM2.md) and [SAM3](docs/SAM3.md).
-Existing CMake target names and family namespaces are retained. Source-qualified
+Only model exports, verification and their required helpers are published.
+Local tests, fixtures, diagnostics and generated reports are excluded from Git.
+Export details are in [SAM2](docs/SAM2.md) and [SAM3](docs/SAM3.md).
+The family library target names and namespaces are retained. `din_sam_cli`
+replaces the two family CLI executables. Source-qualified
 includes use `vision/sam/cpp/`; the old `vision/sam2` and `vision/sam3` trees have
 been removed.
 
+## Command-line inference
+
+Build `din_sam_cli` for both model families. Inputs are PNG files or frame folders
+sorted by filename; encoded video must first be decoded into PNG frames.
+
+```powershell
+din_sam_cli input.png masks --model sam2 --model-dir D:/models/sam2.1_base_plus_onnx --prompt prompt.json --dump-masks
+din_sam_cli frames masks --model sam3 --model-dir D:/models/sam3_onnx --text person --track --dump-masks
+```
+
+`--model` and `--model-dir` are required. SAM2 requires `--prompt` with point/box
+JSON; SAM3 requires `--text`. Folders require either `--track` or `--framewise`.
+`--track` replaces SAM2's `--propagate`; SAM3 tracking remains experimental.
+`--max-frames N` limits a folder to its first N frames (0 means all).
+`--prompt` and `--text` cannot be combined. `--track` and `--framewise` are
+mutually exclusive; without either flag, a single image runs independently.
+
+| Option                                                               | Default                             |
+|----------------------------------------------------------------------|-------------------------------------|
+| `--provider`                                                         | `trt-rtx` (`cpu` is also supported) |
+| `--device`                                                           | `0`                                 |
+| `--ep-cache`                                                         | `artifacts/sam/runtime-cache`       |
+| `--threshold`                                                        | `0.5`, SAM3 only                    |
+| `--track`, `--framewise`, `--dump-masks`                             | Off                                 |
+| `--max-frames`                                                       | `0` (all frames)                    |
+| `--warmup`                                                           | `0`                                 |
+| `--repeat`                                                           | `1`                                 |
+| `--diagnostic-dir`, `--diagnostic-decoder`, `--diagnostic-graph-dir` | Empty, SAM3 only                    |
+
+Both families always write `run.json`. Add `--dump-masks` to write six-digit frame
+names with `_combined.png`, `_idN.png`, `_labels.npy`, and instance metadata JSON.
+SAM2 produces at most one instance. This replaces its `frame_NNNNNN_fast.png`
+naming; SAM3 mask writing is now optional too. Instance metadata contains IDs,
+scores and pixel XYXY boxes; SAM2/tracking boxes are computed from the masks.
+
+`--provider cpu|trt-rtx` and `--device N` configure the shared runtime. Use CPU
+compatible FP32 bundles for CPU inference. `--ep-cache PATH` selects one root (default `artifacts/sam/runtime-cache`).
+Family subdirectories isolate SAM2/SAM3;
+the runtime further separates graph caches and contexts by model identity and GPU.
+The unused SAM2 `--ep-context-dir` option has been removed; context paths derive
+from the cache root. Existing caches in the old family CLI layouts are not moved.
+
+Timing is collected automatically for both families. `run.json` and console
+output separate session loading, prompt setup, warmup, mean inference latency,
+and total processing time/FPS. Session loading includes the runtime's internal
+warmup and CUDA graph setup. `--warmup N` performs additional independent runs on
+the first image and does not seed tracking. `--repeat N` repeats independent
+inference per image; tracking requires repeat=1. Per-frame records contain loading,
+inference and output-conversion/writing wall times. Inference includes upload,
+mask resize/download and completion, even without `--dump-masks`. Processing FPS
+includes frame I/O and all repeats, excludes setup/warmup/report writing, and
+counts each source frame once. First-image decoding belongs to
+`input_setup_seconds`; it is reused for warmup and the first measured frame.
+These are synchronous host measurements, not per-graph GPU timings; the old
+SAM3 `--profile` option is replaced by this common report.
+
+SAM3 retains `--threshold` for detection confidence and the optional
+`--diagnostic-dir`, `--diagnostic-decoder`, and `--diagnostic-graph-dir` accuracy
+diagnostics. Mask probabilities use a fixed 0.5 cutoff for both families.
+
 ## Setup and models
 
-Use the project's CLion CMake profile and configured `modelopt` Python interpreter.
-The prepared Windows bundles are:
+Use a configured CMake build directory for your platform and a Python environment
+with the family export dependencies. The model paths below are explicit examples;
+the CLI has no default model family or model directory.
 
-- `D:/models/sam2.1_base_plus_onnx`: existing FP16 graph interfaces.
-- `D:/models/Sam3`: existing FP32 interfaces and internal BF16 attention.
-- Corresponding directories with `_cpu_fp32` appended: synchronous FP32 CPU inference.
+The current native runtime accepts SAM2 bundles with `dtype=float16` or
+`dtype=float32`, and SAM3.1 bundles with `dtype=float32`. The existing example
+bundles are `D:/models/sam2.1_base_plus_onnx` and `D:/models/sam3_onnx`.
+Full BF16 bundles are supported by export and structural verification, but the
+native runtime currently rejects their precision contract. For CPU inference,
+export FP32 with `--cpu-compatible` and pass `--provider cpu` to the CLI.
 
 Both families require `attention_contract.version=1` and seven fixed spatial
 memory inputs. SAM3 additionally requires sixteen pointer histories and
-`memory_boundary_version=2`. These are the default canonical bundles. Previous deployments are preserved under
-`D:/models/backups`; `D:/models/sam_bundle_promotion.json` records their exact location.
+`memory_boundary_version=2`. Pass `--static-memory` when exporting GPU bundles
+for this runtime; the exporter flag is off by default. `--cpu-compatible` implies
+`--static-memory` and requires `--dtype float32`.
 
-For new source exports, the model preparation helper reuses weights and existing native ONNX `Attention`
-operators. It adds boolean history validity at attention normalization; it does
-not replace attention with a quadratic score/mask graph or change precision.
+Export final bundles directly with native ONNX `Attention` operators and boolean
+history validity inputs:
 
 ```powershell
-python vision/sam/python/prepare_static_sam.py sam2 path/to/unmodified_sam2_export D:/models/new_sam2_bundle
-python vision/sam/python/prepare_static_sam.py sam3 path/to/corrected_unpadded_sam3_export D:/models/new_sam3_bundle
+python vision/sam/python/export_sam2_onnx.py --model facebook/sam2.1-hiera-base-plus --device cuda --static-memory --output D:/models/new_sam2_bundle
+python vision/sam/python/export_sam3_onnx.py --static-memory --output D:/models/new_sam3_bundle
 ```
 
-The original exporters also accept `--static-memory`. Keep the existing
-BF16-attention conversion step for freshly exported SAM3 GPU attention. A plain
-FP32 re-export is not equivalent to the deployed mixed-precision policy.
+Both exporters accept `--static-memory` and default to BF16 (`--dtype bfloat16`),
+the preferred GPU precision. Full BF16 exports use
+`D:/models/sam2.1_base_plus_bf16` and `D:/models/sam3.1_bf16`. FP32 is required
+for CPU inference and numerical references (`--dtype float32`); FP16 (`--dtype float16`) comes with quality tradeoffs.
+Neither exporter inserts
+attention-only precision casts into other precisions.
 
 The installed ORT CPU attention implementation requires an explicit query axis
 in its mask. `--cpu-compatible` creates a CPU-only compatibility variant using
@@ -63,10 +131,10 @@ objects. It may allocate and is a setup operation.
 
 The destination state is explicit:
 
-| Previous state | Behavior |
-|---|---|
-| `nullptr` | Initialize destination using the supplied `Initialization` |
-| Same as destination | Propagate in place |
+| Previous state           | Behavior                                                               |
+|--------------------------|------------------------------------------------------------------------|
+| `nullptr`                | Initialize destination using the supplied `Initialization`             |
+| Same as destination      | Propagate in place                                                     |
 | A different leased state | Preserve previous state; copy required history and advance destination |
 
 State references expire when their lease is released. `Sam` must outlive its
@@ -99,7 +167,7 @@ using namespace din::sam;
 
 SamConfig config;
 config.model = ModelFamily::Sam3;
-config.model_dir = "D:/models/Sam3";
+config.model_dir = "D:/models/sam3_onnx";
 config.cache_dir = "sam-runtime-cache";
 config.device = deviceOrdinal;
 config.stream = videoStream; // Borrowed; must outlive Sam.
@@ -182,14 +250,15 @@ their queued uses; SAM completion does not cover later downstream consumer work.
 ## Export and verification
 
 See [SAM2](docs/SAM2.md) and [SAM3](docs/SAM3.md) for export commands. The Python
-entry points are the two exporters and `verify_sam_onnx.py`; source preparation,
-fixed-capacity conversion and attention casting support those export workflows.
+entry points are the two exporters, `prepare_sam3.py` for source/checkpoint
+preparation, and `verify_sam_onnx.py`. Exporters produce fixed-capacity GPU or
+CPU-compatible bundles directly.
 Model wrappers, tokenization, antialias resize and ONNX lowering are required
 export helpers rather than standalone development tools.
 
 ```powershell
 python vision/sam/python/verify_sam_onnx.py D:/models/sam2.1_base_plus_onnx
-python vision/sam/python/verify_sam_onnx.py D:/models/Sam3
+python vision/sam/python/verify_sam_onnx.py D:/models/sam3_onnx
 ```
 
 The verifier checks every graph and external weight sidecar without changing the
@@ -197,6 +266,9 @@ bundle. For an FP32 CPU bundle with saved export fixtures, add `--fixtures` to
 compare ONNX Runtime outputs with the saved PyTorch outputs. This is a separate
 numerical check; structural verification alone does not establish model parity.
 An optional `--report artifacts/sam/verification.json` saves the results.
+Reports must be outside the model directory. By default every graph in
+`metadata.json` is checked; `--graphs name [name ...]` selects a subset.
+Fixture comparison uses `--atol 0.002 --rtol 0.002` by default and runs on CPU.
 
 Unit/integration tests, experiment scripts, profiling tools and validation
 bookkeeping stay local and untracked. They are not required to export, verify

@@ -41,6 +41,10 @@ DTYPE_BY_NAME = {
 
 def main() -> None:
     args = parse_args()
+    if args.cpu_compatible:
+        if args.dtype != "float32":
+            raise ValueError("--cpu-compatible requires --dtype float32")
+        args.static_memory = True
     if args.image_size != 1024:
         raise ValueError("This exporter is intentionally static-spatial; --image-size must be 1024")
     if args.max_points < 1:
@@ -49,6 +53,12 @@ def main() -> None:
     unknown_graphs = sorted(set(graphs) - set(GRAPH_NAMES))
     if unknown_graphs:
         raise ValueError(f"Unknown graph names: {unknown_graphs}. Valid names: {GRAPH_NAMES}")
+
+    metadata_path = args.output / "metadata.json"
+    if not args.clean and metadata_path.exists():
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if existing["dtype"] != args.dtype or existing["model"] != args.model:
+            raise ValueError("Existing export has incompatible model/precision; use a new output directory")
 
     if args.clean and args.output.exists():
         shutil.rmtree(args.output)
@@ -59,7 +69,8 @@ def main() -> None:
         from sam2.build_sam import build_sam2_hf
 
         model = build_sam2_hf(args.model, device=args.device).eval()
-        model = model.to(device=args.device, dtype=DTYPE_BY_NAME[args.dtype])
+        model = model.to(device=args.device)
+        {"bfloat16": model.bfloat16, "float16": model.half, "float32": model.float}[args.dtype]()
         if args.dtype == "float16":
             patch_sam2_fpn_neck_for_fp16_onnx()
     if "image_preprocess" in graphs:
@@ -266,12 +277,16 @@ def export_onnx(
         optimize=True,
         external_data=False,
         dynamic_shapes=dynamic_shapes,
+        verbose=False,
     )
     if path.stem == "memory_attention" and args.static_memory:
         from static_attention import specialize_memory_attention
-        # TODO: Investigate alternative I/O precision only after sequence parity
-        # and NVIDIA-provider/portable-consumer validation. Preserve FP16 here.
         args.attention_contract = specialize_memory_attention(path, "sam2")
+        if args.cpu_compatible:
+            from static_attention import cpu_mask_compatibility
+
+            cpu_mask_compatibility(path, "sam2")
+    onnx.checker.check_model(str(path), full_check=True)
     print(f"Exported {path}")
 
 
@@ -336,6 +351,8 @@ def write_metadata(model: torch.nn.Module | None, args: argparse.Namespace, grap
         metadata["attention_contract"] = args.attention_contract
     elif "attention_contract" in existing:
         metadata["attention_contract"] = existing["attention_contract"]
+    if args.cpu_compatible:
+        metadata["cpu_attention_query_chunk"] = 128
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
@@ -354,7 +371,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-input-size", type=int, default=4096)
     parser.add_argument("--opset", type=int, default=23)
     parser.add_argument("--static-memory", action="store_true", help="Export fixed history validity inputs")
-    parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
+    parser.add_argument("--cpu-compatible", action="store_true", help="Export a fixed-history FP32 CPU bundle")
+    parser.add_argument("--dtype", choices=("bfloat16", "float32", "float16"), default="bfloat16",
+                        help="BF16 is preferred; FP32 is required for CPU/reference use; FP16 has quality tradeoffs")
     parser.add_argument("--clean", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 

@@ -48,8 +48,20 @@ def expand_attention_masks(path):
     return changed
 
 
+def fixture_array(value):
+    """Keep BF16 fixture bytes without converting them to FP32."""
+    import torch
+
+    value = value.detach().cpu()
+    if value.dtype == torch.bfloat16:
+        import ml_dtypes
+
+        return value.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+    return value.numpy()
+
+
 def export_graph(module, inputs, path, input_names, output_names, fixtures_only=False, opset_version=23,
-                 static_memory=False):
+                 static_memory=False, cpu_compatible=False):
     import onnx
     import torch
 
@@ -115,25 +127,27 @@ def export_graph(module, inputs, path, input_names, output_names, fixtures_only=
 
         lower_sequences(path)
         expand_attention_masks(path)
-    onnx.checker.check_model(str(path))
+    onnx.checker.check_model(str(path), full_check=True)
     import numpy as np
 
-    np.savez(path.with_suffix(".inputs.npz"), **{k: v.cpu().numpy() for k, v in zip(input_names, inputs, strict=True)})
+    np.savez(path.with_suffix(".inputs.npz"), **{k: fixture_array(v) for k, v in zip(input_names, inputs, strict=True)})
     np.savez(
-        path.with_suffix(".outputs.npz"), **{k: v.cpu().numpy() for k, v in zip(output_names, expected, strict=True)}
+        path.with_suffix(".outputs.npz"), **{k: fixture_array(v) for k, v in zip(output_names, expected, strict=True)}
     )
     raw_dir = path.parent / (path.stem + ".fixtures")
     raw_dir.mkdir(exist_ok=True)
     for names, values in ((input_names, inputs), (output_names, expected)):
         for name, value in zip(names, values, strict=True):
-            value.cpu().numpy().tofile(raw_dir / (name + ".bin"))
+            fixture_array(value).tofile(raw_dir / (name + ".bin"))
     if static_memory and path.stem == "memory_attention":
         from static_attention import specialize_fixtures, specialize_memory_attention
-        # TODO: Investigate alternative I/O precision after sequence-parity and
-        # NVIDIA-provider/portable-consumer validation; preserve FP32 state now.
         if not any(value.name == "memory_valid" for value in onnx.load(path, load_external_data=False).graph.input):
             specialize_memory_attention(path, "sam3")
         specialize_fixtures(path, "sam3")
+        if cpu_compatible and not fixtures_only:
+            from static_attention import cpu_mask_compatibility
+
+            cpu_mask_compatibility(path, "sam3")
     graph = onnx.load(path, load_external_data=False).graph
     if path.stem in ('seed_memory', 'tracking_memory') and not any(
         'valid' in node.input for node in graph.node
@@ -164,7 +178,7 @@ def export_graph(module, inputs, path, input_names, output_names, fixtures_only=
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("artifacts/sam3/onnx-fp32"))
+    parser.add_argument("--output", type=Path, default=Path("artifacts/sam3/onnx-bf16"))
     graph_names = [
         "image_preprocess",
         "text_encoder",
@@ -179,12 +193,19 @@ def main():
     ]
     parser.add_argument("--graphs", nargs="+", choices=graph_names, default=graph_names)
     parser.add_argument("--fixtures-only", action="store_true", help="Regenerate PyTorch fixtures for existing graphs")
+    parser.add_argument("--dtype", choices=("bfloat16", "float32", "float16"), default="bfloat16",
+                        help="BF16 is preferred; FP32 is required for CPU/reference use; FP16 has quality tradeoffs")
     parser.add_argument("--opset", type=int, default=23, help="ONNX opset (23+ preserves native attention)")
     parser.add_argument("--static-memory", action="store_true", help="Export fixed 7/16 history capacities with validity inputs")
+    parser.add_argument("--cpu-compatible", action="store_true", help="Export a fixed-history FP32 CPU bundle")
     parser.add_argument(
         "--fixture-image", type=Path, help="Use a real RGB image for graph reference/calibration inputs"
     )
     args = parser.parse_args()
+    if args.cpu_compatible:
+        if args.dtype != "float32":
+            parser.error("--cpu-compatible requires --dtype float32")
+        args.static_memory = True
     import torch
 
     from export_tokenizer import export_tokenizer
@@ -203,6 +224,9 @@ def main():
 
     predictor = build_predictor()
     model = predictor.model
+    dtype = getattr(torch, args.dtype)
+    # Module precision helpers retain complex rotary buffers.
+    {"bfloat16": model.bfloat16, "float16": model.half, "float32": model.float}[args.dtype]()
     args.output.mkdir(parents=True, exist_ok=True)
     metadata_path = args.output / "metadata.json"
     metadata = {
@@ -216,7 +240,7 @@ def main():
         },
         "model_family": "sam3.1",
         **LOCK,
-        "dtype": "float32",
+        "dtype": args.dtype,
         "image_size": 1008,
         "backbone_stride": 14,
         "max_objects": 16,
@@ -250,7 +274,9 @@ def main():
             if previous[key] != metadata[key]:
                 raise ValueError(f"Existing export has incompatible {key}; use a new output directory")
         metadata["graphs"] = previous["graphs"]
-    with torch.inference_mode(), torch.autocast("cuda", enabled=False):
+    if args.cpu_compatible:
+        metadata["cpu_attention_query_chunk"] = 128
+    with torch.inference_mode(), torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
         text_encoder = TextEncoder(model.detector.backbone)
         tokenizer = text_encoder.text.tokenizer
         token_ids = tokenizer(["bicycle"], context_length=text_encoder.text.context_length).cuda()
@@ -260,7 +286,7 @@ def main():
         jobs = {}
         if "image_preprocess" in args.graphs:
             jobs["image_preprocess"] = (
-                ImagePreprocess(),
+                ImagePreprocess(dtype),
                 (torch.zeros(1, 720, 1280, 3, dtype=torch.uint8, device="cuda"),),
                 ["image_rgb"],
                 ["image"],
@@ -268,13 +294,13 @@ def main():
         if "text_encoder" in args.graphs:
             jobs["text_encoder"] = (text_encoder, (token_ids,), ["token_ids"], ["language_features", "language_mask"])
         if any(name in args.graphs for name in graph_names if name not in ("image_preprocess", "text_encoder")):
-            image = torch.zeros(1, 3, 1008, 1008, device="cuda")
+            image = torch.zeros(1, 3, 1008, 1008, device="cuda", dtype=dtype)
             if args.fixture_image:
                 import numpy as np
                 from PIL import Image
 
                 rgb = torch.from_numpy(np.array(Image.open(args.fixture_image).convert("RGB"))).cuda().unsqueeze(0)
-                image = ImagePreprocess()(rgb)[0]
+                image = ImagePreprocess(dtype)(rgb)[0]
             vision = VisionEncoder(model.detector.backbone)
             visual = vision(image)
             levels = len(visual) // 6
@@ -299,7 +325,7 @@ def main():
                 memory = MemoryEncoder(tracker)
                 jobs["memory_encoder"] = (
                     memory,
-                    (visual[4 * levels + levels - 1], torch.zeros(1, 32, 1008, 1008, device="cuda")),
+                    (visual[4 * levels + levels - 1], torch.zeros(1, 32, 1008, 1008, device="cuda", dtype=dtype)),
                     ["image_features", "masks"],
                     ["memory_features", "memory_position"],
                 )
@@ -367,7 +393,7 @@ def main():
                 raise ValueError("Unsupported pointer temporal projection")
             (args.output / "temporal_constants.json").write_text(json.dumps(temporal_constants), encoding="utf-8")
             metadata["temporal_constants"] = "temporal_constants.json"
-            valid = torch.ones(16, device="cuda")
+            valid = torch.ones(16, device="cuda", dtype=dtype)
             interactive = visual[2 * levels : 3 * levels]
             propagation = visual[4 * levels : 5 * levels]
             if "seed_decoder" in args.graphs:
@@ -375,7 +401,8 @@ def main():
                     SeedDecoder(tracker),
                     (
                         *interactive,
-                        torch.zeros(16, 1, tracker.input_mask_size, tracker.input_mask_size, device="cuda"),
+                        torch.zeros(16, 1, tracker.input_mask_size, tracker.input_mask_size, device="cuda",
+                                    dtype=dtype),
                         valid,
                     ),
                     ["feature_0", "feature_1", "feature_2", "masks", "valid"],
@@ -386,8 +413,8 @@ def main():
                     SeedMemory(tracker),
                     (
                         propagation[2],
-                        torch.zeros(16, 1, tracker.image_size, tracker.image_size, device="cuda"),
-                        torch.zeros(16, 1, device="cuda"),
+                        torch.zeros(16, 1, tracker.image_size, tracker.image_size, device="cuda", dtype=dtype),
+                        torch.zeros(16, 1, device="cuda", dtype=dtype),
                         valid,
                         valid.clone(),  # Distinct input storage: conditioning is not an alias of validity.
                     ),
@@ -406,8 +433,8 @@ def main():
                     TrackingMemory(tracker),
                     (
                         propagation[2],
-                        torch.zeros(16, 1, 288, 288, device="cuda"),
-                        torch.zeros(16, 1, device="cuda"),
+                        torch.zeros(16, 1, 288, 288, device="cuda", dtype=dtype),
+                        torch.zeros(16, 1, device="cuda", dtype=dtype),
                         valid,
                         torch.zeros_like(valid),  # Tracking frames are valid but not conditioning frames.
                     ),
@@ -415,8 +442,8 @@ def main():
                     ["memory_features", "memory_position"],
                 )
             if "memory_attention" in args.graphs:
-                memories = [torch.zeros(5184 * 2, 1, 256, device="cuda") for _ in range(4)]
-                pointers = [torch.zeros(16 * 2, 1, 256, device="cuda") for _ in range(2)]
+                memories = [torch.zeros(5184 * 2, 1, 256, device="cuda", dtype=dtype) for _ in range(4)]
+                pointers = [torch.zeros(16 * 2, 1, 256, device="cuda", dtype=dtype) for _ in range(2)]
                 jobs["memory_attention"] = (
                     MemoryAttention(tracker),
                     (propagation[2], visual[6 * levels - 1], *memories, *pointers),
@@ -436,7 +463,7 @@ def main():
             start = time.perf_counter()
             contract = export_graph(
                 module, inputs, args.output / f"{name}.onnx", in_names, out_names,
-                args.fixtures_only, args.opset, static_memory=args.static_memory
+                args.fixtures_only, args.opset, static_memory=args.static_memory, cpu_compatible=args.cpu_compatible
             )
             metadata["graphs"][name] = contract
             if name == "memory_attention" and args.static_memory:

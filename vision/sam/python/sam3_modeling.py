@@ -8,6 +8,34 @@ import torch
 from torch import nn
 
 
+def prepare_detector_for_onnx(detector):
+    """Adapt decoder operations that the pinned upstream cannot export directly."""
+    from sam3.model.decoder import TransformerDecoderLayer
+    from sam3.model.maskformer_segmentation import MaskPredictor
+
+    def forward_ffn(layer, tgt):
+        tgt2 = layer.linear2(layer.dropout3(layer.activation(layer.linear1(tgt))))
+        return layer.norm3(tgt + layer.dropout4(tgt2))
+
+    def predict_masks(layer, obj_queries, pixel_embed):
+        # ONNX Einsum at opset 23 excludes BF16. This contraction is a MatMul
+        # over channels and retains BF16 arithmetic without attention changes.
+        embeddings = layer.mask_embed(obj_queries)
+        pixels = pixel_embed.flatten(-2)
+        return torch.matmul(embeddings, pixels).reshape(*embeddings.shape[:-1], *pixel_embed.shape[-2:])
+
+    dtype = next(detector.parameters()).dtype
+    if dtype != torch.float32:
+        # Box refinement promotes coordinates to FP32 after its first layer.
+        # Start there too so ONNX Stack receives consistent coordinate types.
+        detector.transformer.decoder.reference_points.float()
+        for layer in detector.modules():
+            if isinstance(layer, TransformerDecoderLayer):
+                layer.forward_ffn = types.MethodType(forward_ffn, layer)
+            if dtype == torch.bfloat16 and isinstance(layer, MaskPredictor):
+                layer.forward = types.MethodType(predict_masks, layer)
+
+
 class TextEncoder(nn.Module):
     def __init__(self, backbone):
         super().__init__()
@@ -39,6 +67,7 @@ class ConceptDetector(nn.Module):
     def __init__(self, detector, levels):
         super().__init__()
         self.detector = detector
+        prepare_detector_for_onnx(detector)
         self.levels = levels
         self.detector.geometry_encoder = EmptyGeometry(detector.geometry_encoder)
         decoder = detector.transformer.decoder
@@ -74,7 +103,9 @@ class ConceptDetector(nn.Module):
             input_points_mask=None,
         )
         result = self.detector.forward_grounding(backbone, stage, None, self.detector._get_dummy_prompt())
-        return result["pred_masks"], result["pred_boxes_xyxy"], result["pred_logits"], result["presence_logit_dec"]
+        return tuple(result[name].to(language_features.dtype) for name in (
+            "pred_masks", "pred_boxes_xyxy", "pred_logits", "presence_logit_dec"
+        ))
 
 
 class EmptyGeometry(nn.Module):
@@ -98,12 +129,16 @@ class EmptyGeometry(nn.Module):
 
 
 class ImagePreprocess(nn.Module):
+    def __init__(self, dtype=torch.float32):
+        super().__init__()
+        self.dtype = dtype
+
     def forward(self, image_rgb):
         image = image_rgb.float().permute(0, 3, 1, 2)
         image = torch.nn.functional.interpolate(
             image, size=(1008, 1008), mode="bilinear", align_corners=False, antialias=True
         )
-        return (image.round().clamp(0, 255) / 127.5 - 1,)
+        return ((image.round().clamp(0, 255) / 127.5 - 1).to(self.dtype),)
 
 
 class FixedBucket:
@@ -137,7 +172,7 @@ class SeedDecoder(nn.Module):
         high = [tracker.sam_mask_decoder.conv_s0(feature_0), tracker.sam_mask_decoder.conv_s1(feature_1)]
         feature = feature_2 + tracker.interactivity_no_mem_embed.reshape(1, 256, 1, 1)
         out = tracker._use_mask_as_output(feature, high, masks, FixedBucket(valid))
-        return out["low_res_masks"], out["obj_ptr"], out["object_score_logits"]
+        return tuple(out[name].to(feature_0.dtype) for name in ("low_res_masks", "obj_ptr", "object_score_logits"))
 
 
 class TrackingDecoder(nn.Module):
@@ -151,7 +186,7 @@ class TrackingDecoder(nn.Module):
         out = tracker._forward_sam_heads(
             conditioned, propagation_high_res_features=high, multiplex_state=FixedBucket(valid), multimask_output=True
         )
-        return out["low_res_masks"], out["obj_ptr"], out["object_score_logits"]
+        return tuple(out[name].to(conditioned.dtype) for name in ("low_res_masks", "obj_ptr", "object_score_logits"))
 
 
 class TrackingMemory(nn.Module):
@@ -221,7 +256,7 @@ class MemoryAttention(nn.Module):
             memory_pos=torch.cat([memory_position, pointer_position], dim=0),
             num_obj_ptr_tokens=object_pointers.shape[0],
         )
-        return (out["memory"].permute(1, 2, 0).reshape(1, 256, 72, 72),)
+        return (out["memory"].permute(1, 2, 0).reshape(1, 256, 72, 72).to(image_features.dtype),)
 
 
 class MemoryEncoder(nn.Module):

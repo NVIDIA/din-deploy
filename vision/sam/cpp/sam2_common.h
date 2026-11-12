@@ -9,64 +9,57 @@
 #include <string>
 #include <vector>
 
+#include "image.h"
+
 namespace din::sam2
 {
-
-struct PromptOptimizationShapes
-{
-    std::vector<int64_t> point_coords{1, 16, 2};
-    std::vector<int64_t> point_labels{1, 16};
-    std::vector<int64_t> input_masks{1, 1, 256, 256};
-    std::vector<int64_t> has_input_masks{1, 1, 1, 1};
-};
-
-struct DecoderOptimizationShapes
-{
-    std::vector<int64_t> image_features_0{1, 32, 256, 256};
-    std::vector<int64_t> image_features_1{1, 64, 128, 128};
-};
-
-struct Sam2Config
-{
-    int64_t image_size = 1024;
-    int64_t max_points = 16;
-    int64_t max_memory_frames = 7;
-    int64_t hidden_dim = 256;
-    int64_t memory_dim = 64;
-    int64_t max_input_size = 4096;
-    std::string dtype = "float16";
-    std::string spatial_contract = "static_1024";
-    PromptOptimizationShapes prompt_optimization_shapes;
-    DecoderOptimizationShapes decoder_optimization_shapes;
-
-    [[nodiscard]] int64_t embedding_size() const
+    struct PromptOptimizationShapes
     {
-        return image_size / 16;
-    }
+        std::vector<int64_t> point_coords{1, 16, 2};
+        std::vector<int64_t> point_labels{1, 16};
+        std::vector<int64_t> input_masks{1, 1, 256, 256};
+        std::vector<int64_t> has_input_masks{1, 1, 1, 1};
+    };
 
-    [[nodiscard]] int64_t low_res_mask_size() const
+    struct DecoderOptimizationShapes
     {
-        return image_size / 4;
-    }
+        std::vector<int64_t> image_features_0{1, 32, 256, 256};
+        std::vector<int64_t> image_features_1{1, 64, 128, 128};
+    };
 
-    [[nodiscard]] int64_t tokens() const
+    struct Sam2Config
     {
-        const int64_t size = embedding_size();
-        return size * size;
-    }
-};
+        int64_t image_size = 1024;
+        int64_t max_points = 16;
+        int64_t max_memory_frames = 7;
+        int64_t hidden_dim = 256;
+        int64_t memory_dim = 64;
+        int64_t max_input_size = 4096;
+        std::string dtype = "float16";
+        std::string spatial_contract = "static_1024";
+        PromptOptimizationShapes prompt_optimization_shapes;
+        DecoderOptimizationShapes decoder_optimization_shapes;
 
-struct Image
-{
-    uint32_t width = 0;
-    uint32_t height = 0;
-    std::vector<uint8_t> rgb;
-};
+        [[nodiscard]] int64_t embedding_size() const
+        {
+            return image_size / 16;
+        }
 
-struct Prompt
-{
-    std::vector<float> coords;
-    std::vector<int32_t> labels;
-};
+        [[nodiscard]] int64_t low_res_mask_size() const
+        {
+            return image_size / 4;
+        }
 
-}  // namespace din::sam2
+        [[nodiscard]] int64_t tokens() const
+        {
+            const int64_t size = embedding_size();
+            return size * size;
+        }
+    };
+
+    struct Prompt
+    {
+        std::vector<float> coords;
+        std::vector<int32_t> labels;
+    };
+} // namespace din::sam2
