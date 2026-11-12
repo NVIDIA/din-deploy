@@ -12,17 +12,13 @@
 #include <string>
 #include <vector>
 
+#include "asr_common.h"
 #include "audio.h"
 #include "ort_session.h"
 #include "tokenizer.h"
 #include <onnxruntime_cxx_api.h>
 
-// --- timing helper -------------------------------
-
-inline double SecondsSince(std::chrono::steady_clock::time_point start)
-{
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-}
+using din::asr::common::SecondsSince;
 
 namespace din::asr::whisper
 {

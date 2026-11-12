@@ -65,8 +65,12 @@ jobs:
           elif [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             force=true
           elif git diff --quiet "$BASE_SHA" "$SOURCE_REF" -- \
-            'asr/rnnt/python/*.py' \
-            'asr/rnnt/python/**/*.py' \
+            'asr/parakeet/model_export/**' \
+            'asr/nemotron/model_export/**' \
+            'asr/parakeet/requirements.txt' \
+            'asr/nemotron/requirements.txt' \
+            'common/model_export/nemo_export.py' \
+            'common/model_export/requirements-nemo.txt' \
             '.github/workflows/export-nvidia-asr-model.yml' \
             '.github/workflows/nvidia-asr.yml'; then
             force=false
@@ -194,11 +198,7 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install \
-            onnx \
-            onnxscript \
-            soundfile \
-            "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"
+          python -m pip install -r common/model_export/requirements-nemo.txt
 
       - name: Export NVIDIA ASR ONNX
         if: steps.selection.outputs.export == 'true'
@@ -211,7 +211,6 @@ jobs:
           MODEL_SLUG: ${{ inputs.model_slug }}
           MODEL_TYPE: ${{ inputs.model_type }}
           PRECISION: ${{ inputs.precision }}
-          PYTHONPATH: asr/rnnt/python
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -uo pipefail
@@ -227,7 +226,7 @@ jobs:
             dtype="$(export_dtype "$1")"
             case "$MODEL_TYPE" in
               parakeet)
-                python asr/rnnt/python/tools/export_parakeet_tdt_onnx.py \
+                python asr/parakeet/model_export/export_parakeet.py \
                   --model "$MODEL_ID" \
                   --output "$MODEL_OUTPUT" \
                   --device cpu \
@@ -235,7 +234,7 @@ jobs:
                   --external-data
                 ;;
               nemotron)
-                python asr/rnnt/python/tools/export_nemotron_onnx.py \
+                python asr/nemotron/model_export/export_nemotron.py \
                   --model "$MODEL_ID" \
                   --output "$MODEL_OUTPUT" \
                   --device cpu \

@@ -1,5 +1,4 @@
-# Whisper speech-to-text. Follows the asr/rnnt layering: a processing library
-# (din_asr_whisper) plus a thin CLI (din_asr_whisper)
+# Whisper speech-to-text: a processing library plus a thin CLI.
 
 # Optional CUDA greedy-argmax kernel for the TRT-RTX decode path. When CUDA is
 # unavailable the pipeline falls back to a pinned-host CPU argmax (DIN_WHISPER_CUDA
@@ -23,6 +22,7 @@ target_include_directories(din_asr_whisper
 
 target_link_libraries(din_asr_whisper
     PUBLIC
+        din_asr_common
         din_common_ort
         din_common_io
         nlohmann_json::nlohmann_json
