@@ -64,7 +64,7 @@ Use the model-specific README for the exporter command and CLI arguments.
 Create a Python environment and install the repository plus the extra required by the model you plan to export:
 
 ```bash
-python -m pip install -e ".[parakeet]"  # or .[nemotron] / .[flux]
+python -m pip install -e ".[parakeet]"  # or .[nemotron] / .[flux] / .[pixeldit]
 ```
 
 The base `pyproject.toml` contains common exporter dependencies; the optional extras add the model-family dependencies. Export the model to a directory, then pass that directory to the corresponding CLI with `--model-dir`.

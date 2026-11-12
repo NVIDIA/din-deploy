@@ -3,8 +3,8 @@
 
 #!/usr/bin/env python3
 """
-Verify PixelDiT T2I ONNX graphs: run the vendored PyTorch pipeline and the ONNX Runtime pipeline
-(TensorRT RTX by default) and compare them.
+Verify PixelDiT T2I ONNX graphs: run the PyTorch pipeline (PixDiT_T2I from the `pixeldit` package,
+unpatched) and the ONNX Runtime pipeline (TensorRT RTX by default) and compare them.
 
 Checks:
     --validate_only    ONNX structure + dummy run of each graph, then exit
@@ -34,7 +34,13 @@ import torch.nn.functional as F
 from PIL import Image as PILImage
 
 from pixeldit import pipeline as P
-from pixeldit.weights import DEFAULT_MODEL_NAME, DEFAULT_TEXT_ENCODER_NAME, load_gemma_text_encoder, load_pixeldit
+from pixeldit.weights import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_TEXT_ENCODER_NAME,
+    dit_callable,
+    load_gemma_text_encoder,
+    load_pixeldit,
+)
 
 EP_NAME = "nv_tensorrt_rtx"
 _REGISTERED_EP_NAME: str | None = None
@@ -408,9 +414,8 @@ def main():
     print(f"Loading tokenizer + Gemma from {args.text_encoder_name}...")
     tokenizer, text_encoder = load_gemma_text_encoder(args.text_encoder_name, device, args.local_files_only)
 
-    print(f"Loading PixelDiT from {args.model_name} (bf16)...")
-    dit = load_pixeldit(args.model_name, device, torch.bfloat16, args.local_files_only)
-    dit.set_image_size(height, width)
+    print(f"Loading PixelDiT from {args.model_name} (bf16, upstream pixeldit package)...")
+    dit = dit_callable(load_pixeldit(args.model_name, device, torch.bfloat16, args.local_files_only))
 
     encode_torch = torch_encode_fn(text_encoder)
     te_runner, tr_runner = runners.get("text_encoder"), runners.get("transformer")

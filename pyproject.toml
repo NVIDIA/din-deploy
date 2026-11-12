@@ -64,6 +64,12 @@ flux = [
     "pillow",
     "transformers",
 ]
+pixeldit = [
+    # Upstream PixelDiT model definitions (imported as pixdit_core), pinned to the commit the export patches in
+    # image_gen/pixeldit/model_export/pixeldit/upstream_patch.py (UPSTREAM_COMMIT) were validated against.
+    "pixeldit @ git+https://github.com/NVlabs/PixelDiT@f7d7c35f71893d81c6e71d2576ea80601a1e8529",
+    "transformers",
+]
 
 [project.scripts]
 parakeet-tdt = "rnnt.parakeet_tdt.cli:main"

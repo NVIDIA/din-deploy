@@ -9,7 +9,7 @@ CLI image generation with ONNX Runtime.
 | PixelDiT-1300M-1024px | `nvidia/PixelDiT-1300M-1024px` | FP32 (runs in BF16) | BF16 weights, FP32 I/O |
 | Gemma-2-2B-IT (text encoder) | `Efficient-Large-Model/gemma-2-2b-it` | BF16 | BF16 weights, FP32 I/O |
 
-PixelDiT generates pixels directly, so there is no VAE. The model code is vendored in `model_export/pixeldit/`, so the [NVlabs/PixelDiT](https://github.com/NVlabs/PixelDiT) repo is not needed to export or verify.
+PixelDiT generates pixels directly, so there is no VAE. The DiT model code comes from the `pixeldit` pip package, installed from [NVlabs/PixelDiT](https://github.com/NVlabs/PixelDiT).
 
 ## Pipeline
 
@@ -37,10 +37,15 @@ DirectX and Vulkan processing are not implemented yet. `--provider cpu` is not s
 
 ## Export
 
+Install the export dependencies first, from the repository root. The `pixeldit` extra adds `pixeldit`, upstream's PixelDiT model package, to the common exporter dependencies (see [Requirements](../../README.md#requirements)). Export and verify run on the GPU, so install a CUDA build of PyTorch first (see [pytorch.org](https://pytorch.org/get-started/locally/)).
+
 ```bash
-cd model_export
+python -m pip install -e ".[pixeldit]"
+cd image_gen/pixeldit/model_export
 python export_pixeldit.py --output ./models/PixelDiT-1300M-1024px-onnx
 ```
+
+The DiT is upstream's `PixDiT_T2I` (imported as `pixdit_core`; the local `model_export/pixeldit/` folder holds din-deploy's export helpers). `export_pixeldit.py` patches it only while exporting: complex-valued RoPE has no ONNX lowering, and TensorRT RTX rejects the `Col2Im` op that `F.fold` exports to. See `model_export/pixeldit/upstream_patch.py` for the details. `test_upstream_patch.py` checks the patches on a small random model.
 
 An export contains `text_encoder/model.onnx`, `transformer/model.onnx`, `tokenizer/tokenizer.json`, and `pipeline_config.json`.
 
@@ -52,7 +57,7 @@ Shapes are static. `--height` and `--width` (default 1024, multiples of 16) set 
 python verify_pixeldit.py --onnx_dir ./models/PixelDiT-1300M-1024px-onnx --provider trt-rtx
 ```
 
-Compares each ONNX model running on TensorRT RTX with the vendored PyTorch model, then generates one image with each and saves `pytorch_output.png`, `ort_output.png`, and `comparison.png`. Pass `--validate_only` to only check the graphs.
+Compares each ONNX model running on TensorRT RTX with the upstream PyTorch model from `pixeldit` (unpatched), then generates one image with each and saves `pytorch_output.png`, `ort_output.png`, and `comparison.png`. Pass `--validate_only` to only check the graphs.
 
 Per-model checks decide pass or fail. The image check only fails on broken output: 50-step BF16 sampling amplifies tiny rounding differences, so correct runs can differ in fine detail, or with some seeds in composition. Compare the images visually.
 
