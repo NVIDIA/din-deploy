@@ -49,7 +49,9 @@ CliConfig ParseArgs(int argc, char* argv[])
         .scan<'i', int>()
         .help("Video window T=4n+1 in [5,33]. Fixed at pipeline construction.");
     parser.add_argument("--precompile-only").default_value(false).implicit_value(true)
-        .help("Prepare/cache video models without inference using the built-in dynamic DiT profile.");
+          .help("Prepare video models without inference; dynamic contexts persist, static contexts are temporary.");
+    parser.add_argument("--shape-mode").default_value(std::string{"dynamic"})
+          .help("dynamic: reuse ranged EP contexts; static: rebuild exact EP contexts. Both reuse JIT cache.");
     parser.add_argument("--vae-backend").default_value(config.vae_backend).help("VAE backend: onnx or cudnn.");
     parser.add_argument("--vae-weights")
         .default_value(std::string{})
@@ -139,6 +141,7 @@ CliConfig ParseArgs(int argc, char* argv[])
         throw std::invalid_argument("--video-frames requires a video frame directory");
     config.video_frames = static_cast<size_t>(video_frames);
     config.precompile_only = parser.get<bool>("--precompile-only");
+    config.shape_mode = din::seedvr::ParseShapeMode(parser.get<std::string>("--shape-mode"));
     config.vae_backend = parser.get<std::string>("--vae-backend");
     config.vae_weights_dir = parser.get<std::string>("--vae-weights");
     const auto autotune = parser.get<std::string>("--vae-autotune");

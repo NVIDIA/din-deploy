@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -92,13 +93,22 @@ struct ModelProfile
     // engines larger than ~2 GB, which overflow the protobuf size limit when
     // embedded; the engine is then written as a sidecar file instead.
     bool embed_ep_context = true;
+    // Load an existing EP-context model directly instead of compiling the source model.
+    bool skip_compile = false;
     std::vector<std::pair<std::string, std::string>> extra_ep_options;
     // Named ONNX symbolic dimensions fixed at session creation.
     std::vector<std::pair<std::string, int64_t>> free_dimension_overrides;
+    // Opt-in readable cache namespace. Empty preserves legacy hashed caches.
+    std::string stable_cache_path;
+    // Rebuild EP context for each runner, in an automatically removed workspace.
+    bool force_recompile = false;
 };
 
 class OrtRunner
 {
+    // Declared before session so cleanup runs after the session releases sidecars.
+    std::shared_ptr<void> temporary_context_;
+
 public:
     OrtRunner(Ort::Env& env, const std::string& model_path, const std::string& provider, const std::string& cache_dir,
               const EpContextOptions& ep_context, const ModelProfile& profile = {},

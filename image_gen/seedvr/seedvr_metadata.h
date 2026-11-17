@@ -19,6 +19,7 @@
 #include <functional>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -349,31 +350,14 @@ inline std::string DitProfile(int64_t image_height, int64_t image_width, const M
            pack("normal", normal) + "," + pack("shifted", shifted);
 }
 
-inline void AddMetadataOverrides(common::ModelProfile& profile, std::string_view prefix,
-                                 const MetadataDimensions& minimum, const MetadataDimensions& maximum)
-{
-    const auto add = [&](std::string_view suffix, int64_t low, int64_t high)
-    {
-        if (low == high)
-            profile.free_dimension_overrides.emplace_back(std::string(prefix) + std::string(suffix), low);
-    };
-    add("_window_tgt_idx_dim0", minimum.video_tokens, maximum.video_tokens);
-    add("_window_src_idx_dim0", minimum.video_tokens, maximum.video_tokens);
-    add("_concat_tgt_idx_dim0", minimum.attention_tokens, maximum.attention_tokens);
-    add("_concat_src_idx_dim0", minimum.attention_tokens, maximum.attention_tokens);
-    add("_padded_flat_idx_dim0", minimum.attention_tokens, maximum.attention_tokens);
-    add("_padded_gather_idx_dim0", minimum.padded_tokens, maximum.padded_tokens);
-    add("_valid_keys_dim0", minimum.window_count, maximum.window_count);
-    add("_valid_keys_dim1", minimum.max_window_length, maximum.max_window_length);
-}
-
-inline common::ModelProfile RangedVideoDitProfile(int64_t rope_pairs = kRopePairs)
+inline common::ModelProfile RangedDitProfile(bool video, int64_t rope_pairs = kRopePairs)
 {
     struct Shape { int64_t frames, height, width; };
     const struct { Shape minimum, optimum, maximum; } range{
-        {static_cast<int64_t>(kVideoFrameRange.min), kProfileMinImageSize, kProfileMinImageSize},
-        {static_cast<int64_t>(kVideoFrameRange.min), 720, 1280},
-        {static_cast<int64_t>(kVideoFrameRange.max), kProfileMaxLongSide, kProfileMaxLongSide}};
+        {video ? static_cast<int64_t>(kVideoFrameRange.min) : 1, kProfileMinImageSize, kProfileMinImageSize},
+        {video ? static_cast<int64_t>(kVideoFrameRange.min) : 1, 720, 1280},
+        {video ? static_cast<int64_t>(kVideoFrameRange.max) : 1, kProfileMaxLongSide, kProfileMaxLongSide}
+    };
     // A rectangular envelope covers both 4K orientations with one context.
     // Actual requests still obey the existing long/short-side limits.
     const auto bounds = [&](bool shifted)
@@ -418,8 +402,25 @@ inline common::ModelProfile RangedVideoDitProfile(int64_t rope_pairs = kRopePair
         }
         return std::pair{low, high};
     };
-    const auto [normal_min, normal_max] = bounds(false);
-    const auto [shifted_min, shifted_max] = bounds(true);
+    const auto calculate_bounds = [&]
+    {
+        const auto [normal_min, normal_max] = bounds(false);
+        const auto [shifted_min, shifted_max] = bounds(true);
+        return std::array{normal_min, normal_max, shifted_min, shifted_max};
+    };
+    // Geometry bounds depend only on image/video mode, not the current shape,
+    // model precision or RoPE width. Scan once per mode across pipeline instances.
+    const auto& [normal_min, normal_max, shifted_min, shifted_max] =
+        [&]() -> const std::array<MetadataDimensions, 4>&
+        {
+            if (video)
+            {
+                static const auto value = calculate_bounds();
+                return value;
+            }
+            static const auto value = calculate_bounds();
+            return value;
+        }();
     common::ModelProfile profile;
     profile.min_shapes = DitProfile(range.minimum.height, range.minimum.width, normal_min, shifted_min, (range.minimum.frames - 1) / 4 + 1, rope_pairs);
     profile.opt_shapes = DitProfile(range.optimum.height, range.optimum.width,
@@ -427,27 +428,92 @@ inline common::ModelProfile RangedVideoDitProfile(int64_t rope_pairs = kRopePair
         ProfileMetadata(range.optimum.height, range.optimum.width, true, (range.optimum.frames - 1) / 4 + 1), (range.optimum.frames - 1) / 4 + 1, rope_pairs);
     profile.max_shapes = DitProfile(range.maximum.height, range.maximum.width, normal_max, shifted_max, (range.maximum.frames - 1) / 4 + 1, rope_pairs);
     profile.embed_ep_context = false;
-    const auto constant = [&](const char* name, int64_t low, int64_t high)
-    {
-        if (low == high) profile.free_dimension_overrides.emplace_back(name, low);
-    };
-    constant("latent_dim2", (range.minimum.frames - 1) / 4 + 1, (range.maximum.frames - 1) / 4 + 1);
-    constant("latent_dim3", range.minimum.height / 8, range.maximum.height / 8);
-    constant("latent_dim4", range.minimum.width / 8, range.maximum.width / 8);
-    AddMetadataOverrides(profile, "normal", normal_min, normal_max);
-    AddMetadataOverrides(profile, "shifted", shifted_min, shifted_max);
+    profile.cache_subpath = std::string(video ? "video_" : "image_") + "dit_range_v1";
     return profile;
 }
 
-inline common::ModelProfile ExactProfile(std::string shapes, std::string cache_subpath)
+inline common::ModelProfile RangedVaeProfile(bool video, bool encode)
 {
+    const auto shape = [&](int64_t frames, int64_t height, int64_t width)
+    {
+        if (!encode)
+        {
+            frames = (frames - 1) / 4 + 1;
+            height /= 8;
+            width /= 8;
+        }
+        const int64_t channels = encode ? 3 : kLatentChannels;
+        return std::string(encode ? "image:" : "latent:") +
+        (video
+             ? ShapeString({1, channels, frames, height, width})
+             : ShapeString({1, channels, height, width}));
+    };
     common::ModelProfile profile;
-    profile.min_shapes = shapes;
-    profile.opt_shapes = shapes;
-    profile.max_shapes = std::move(shapes);
-    profile.cache_subpath = std::move(cache_subpath);
+    const int64_t min_frames = video ? kVideoFrameRange.min : 1;
+    const int64_t max_frames = video ? kVideoFrameRange.max : 1;
+    profile.min_shapes = shape(min_frames, kProfileMinImageSize, kProfileMinImageSize);
+    profile.opt_shapes = shape(min_frames, 720, 1280);
+    // The square envelope includes landscape and portrait 4K. Pipeline requests
+    // still enforce the long/short-side limits and valid padded/temporal steps.
+    profile.max_shapes = shape(max_frames, kProfileMaxLongSide, kProfileMaxLongSide);
+    profile.cache_subpath = std::string(video ? "video_" : "image_") +
+        (encode ? "vae_encoder_range_v1" : "vae_decoder_range_v1");
     profile.embed_ep_context = false;
     return profile;
+}
+
+// Exported DiT/video VAE symbols use the first input sharing a dimension:
+// <input>_dim<axis>. Adding every input alias also covers shared metadata axes.
+inline common::ModelProfile ExactProfile(std::string shapes)
+{
+    common::ModelProfile profile;
+    profile.min_shapes = profile.opt_shapes = profile.max_shapes = shapes;
+    profile.embed_ep_context = false;
+    profile.force_recompile = true;
+    std::istringstream inputs(shapes);
+    for (std::string input; std::getline(inputs, input, ',');)
+    {
+        const auto colon = input.find(':');
+        const auto name = input.substr(0, colon);
+        std::istringstream dimensions(input.substr(colon + 1));
+        size_t axis = 0;
+        for (std::string dimension; std::getline(dimensions, dimension, 'x'); ++axis)
+            profile.free_dimension_overrides.emplace_back(name + "_dim" + std::to_string(axis),
+                                                          std::stoll(dimension));
+    }
+    return profile;
+}
+
+inline common::ModelProfile ExactVaeProfile(bool video, bool encode, int64_t frames, int64_t height, int64_t width)
+{
+    // Decoder arguments are already latent dimensions (including tile geometry).
+    const auto name = encode ? "image" : "latent";
+    const int64_t channels = encode ? 3 : kLatentChannels;
+    auto profile = ExactProfile(std::string(name) + ":" +
+        (video ? ShapeString({1, channels, frames, height, width}) : ShapeString({1, channels, height, width})));
+    if (!video)
+    {
+        // Image VAEs retain torch.export's derived symbolic names.
+        const std::string multiple = encode ? "16*" : "2*";
+        profile.free_dimension_overrides.emplace_back(multiple + name + "_height_units", height);
+        profile.free_dimension_overrides.emplace_back(multiple + name + "_width_units", width);
+    }
+    return profile;
+}
+
+inline common::ModelProfile ExactDitProfile(int64_t height, int64_t width, int64_t latent_frames,
+                                            int64_t rope_pairs = kRopePairs)
+{
+    return ExactProfile(DitProfile(height, width, ProfileMetadata(height, width, false, latent_frames),
+                                   ProfileMetadata(height, width, true, latent_frames), latent_frames, rope_pairs));
+}
+
+inline void ConfigureCache(common::ModelProfile& profile, const fs::path& model)
+{
+    // Precision and image/video variants are part of the model filename. Neither
+    // execution shape nor ranged/static policy belongs in this namespace.
+    profile.stable_cache_path = (fs::absolute(model).lexically_normal().parent_path().filename() / model.stem()).
+        generic_string();
 }
 
 inline void RequireFile(const fs::path& path)

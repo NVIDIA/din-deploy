@@ -7,11 +7,12 @@ Start by [exporting models](#export), then [build and run the CLI](#build-and-ru
 The same pipeline supports single images and folders of video frames.
 
 > [!IMPORTANT]
-> Runtime shapes are fixed at pipeline construction. All frames in a video folder
-> must have identical dimensions. The CLI reads dimensions and clip length before
-> creating the pipeline. Create a new pipeline when changing dimensions or clip
-> length. ONNX spatial axes are symbolic, but runtime profiles and caches are
-> specialized to the chosen shape.
+> Tensor storage and bindings are fixed at pipeline construction. All frames in a
+> video folder must have identical dimensions. Create a new pipeline when changing
+> dimensions or clip length. In default dynamic mode, the ONNX VAE and DiT compiled context cache is reused
+> across supported resolutions, video lengths and VAE tile sizes through ranged
+> profiles. Each pipeline owns its runtime sessions and bindings, but does not
+> need a separate compiled context for each execution shape.
 
 ## Export
 
@@ -92,8 +93,8 @@ This optional check is off by default; captured-program and ONNX structural chec
 
 ### Optional image DiT quantization
 
-The quantization scripts currently use an FP16 source DiT. Export that variant
-explicitly, check it numerically, then create the desired quantized variant:
+The quantizer accepts an FP16 or BF16 source DiT. For an FP16 image source,
+export that variant explicitly, check it numerically, then quantize it:
 
 ```powershell
 python image_gen/seedvr/model_export/export_seedvr.py --comfy-root external/ComfyUI --dit-dtype fp16 --components dit context --output models/SeedVR2-3B-onnx/seedvr2_3b_fp16_dit.onnx
@@ -115,6 +116,17 @@ NVFP4 additionally requires `comfy-kitchen`, installed with the ComfyUI dependen
 
 VAE and conditioning stay FP16. Quantized variants require compatible hardware and provider support. 
 NVFP4 uses a TensorRT-specific quantization operator.
+
+For NVFP4 video, quantize the existing BF16 video DiT instead of the image
+export. Its dynamic temporal and spatial axes remain intact:
+
+```powershell
+python image_gen/seedvr/model_export/quantize_onnx.py --quant nvfp4 --input models/SeedVR2-3B-video-onnx/seedvr2_video_dit.onnx
+```
+
+This writes `seedvr2_video_nvfp4_dit.onnx` and its external data beside the
+source. The checkpoint download uses the global Hugging Face cache (`HF_HOME`);
+the VAE and positive context are reused. Run with `--transformer-precision nvfp4`.
 
 ## Build and run
 
@@ -138,23 +150,60 @@ Changing the execution window requires a new pipeline instance and forces recomp
 
 ### Runtime options
 
-| Option | Behavior |
-|---|---|
-| `--scale FLOAT` | Output scaling factor; default `2` |
-| `--seed N` | Starting-noise seed; default `0` |
-| `--rng cpu-std\|cuda-philox\|cpu-philox` | Noise generator; default `cpu-std` |
-| `--transformer-precision bf16\|fp16\|fp8_wo\|nvfp4` | DiT selection; default `bf16`; quantized variants are image-only |
-| `--video-frames N` | Fix a video window at load time; default five; accepts `5,9,...,33` |
-| `--precompile-only` | Prepare video contexts without inference; DiT always uses the built-in dynamic profile |
-| `--ws 50%` | DiT weight-streaming budget; default `off` |
-| `--color-correction lab\|none` | Default `lab`: retain generated detail while correcting low-frequency color and matching CIELAB histograms |
-| `--latent-noise-scale FLOAT` | Conditioning-latent noise in `[0,1]`; default `0` |
-| `--ep-cache PATH` | TensorRT RTX runtime-cache directory |
-| `--ep-context-dir PATH` | Compiled-context directory |
+| Option                                              | Behavior                                                                                                                                        |
+|-----------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--scale FLOAT`                                     | Output scaling factor; default `2`                                                                                                              |
+| `--seed N`                                          | Starting-noise seed; default `0`                                                                                                                |
+| `--rng cpu-std\|cuda-philox\|cpu-philox`            | Noise generator; default `cpu-std`                                                                                                              |
+| `--transformer-precision bf16\|fp16\|fp8_wo\|nvfp4` | DiT selection; default `bf16`; video supports `bf16`, `fp16` and `nvfp4`; `fp8_wo` is image-only                                                |
+| `--video-frames N`                                  | Fix a video window at load time; default five; accepts `5,9,...,33`                                                                             |
+| `--shape-mode dynamic\|static`                      | Default `dynamic`: reuse ranged EP contexts; `static`: rebuild exact VAE/DiT contexts at pipeline construction. Both reuse persistent JIT cache |
+| `--precompile-only`                                 | Prepare video contexts without inference; dynamic contexts persist, static contexts are removed on exit                                         |
+| `--ws 50%`                                          | DiT weight-streaming budget; default `off`                                                                                                      |
+| `--color-correction lab\|none`                      | Default `lab`: retain generated detail while correcting low-frequency color and matching CIELAB histograms                                      |
+| `--latent-noise-scale FLOAT`                        | Conditioning-latent noise in `[0,1]`; default `0`                                                                                               |
+| `--ep-cache PATH`                                   | TensorRT RTX runtime-cache directory                                                                                                            |
+| `--ep-context-dir PATH`                             | Compiled-context directory                                                                                                                      |
 
-Weight streaming applies to the DiT. Cached engines/contexts are specific to model
-and execution shape. Use separate caches or clear affected entries when replacing
-model files. LAB correction requires additional scratch memory.
+Weight streaming applies to the DiT. Dynamic cached contexts are specific to the model,
+precision, image/video export, profile and provider options. Each ONNX VAE encoder,
+VAE decoder and DiT uses one ranged context for padded spatial dimensions from
+32 to 3840 (multiples of 16). Valid requests must fit 3840x2160 or its portrait
+orientation. Video windows remain `5,9,...,33` frames. Decoder latent dimensions
+are image dimensions divided by eight. Batch and channel counts remain fixed.
+The native cuDNN VAE still prepares shape-specific plans; it does not use EP
+contexts. LAB correction requires additional scratch memory.
+
+Static mode fixes every ONNX input dimension, including temporal and attention
+metadata axes. VAE dimensions use the configured tile shape when tiling is enabled.
+Each pipeline construction compiles fresh EP contexts in unique temporary
+workspaces, cleaned up after its sessions are destroyed. Inference calls reuse
+those sessions.
+
+Both modes use readable `<model-directory-name>/<model-stem>` cache directories,
+without shape hashes. Dynamic contexts have a validation manifest covering model
+path/size/timestamps, profiles and compiler options, plus ORT/EP compatibility
+checks. A stale entry is rebuilt in place. Existing hashed caches are untouched.
+The JIT file `runtime.cache` is shared across shapes and both modes. TensorRT
+validates its environment compatibility and decides which kernels can be reused;
+different shapes can still require additional JIT compilation.
+
+Shared JIT files require the accompanying TensorRT-RTX-EP-ABI changes. Configure
+the build to use that checkout, for example:
+
+```powershell
+cmake --preset windows-arm64 -DONNXRUNTIME_TRT_RTX_EP_SOURCE_DIR=D:/repos/TensorRT-RTX-EP-ABI
+```
+
+The EP shares cache ownership across partitions in the same CUDA context and
+saves atomically at final release. There is no coordination between processes.
+Cache roots must be writable. Compilation and ORT session-load times are printed separately from
+the inference stage timings below. Precompilation does not warm inference JIT kernels.
+
+Set `DIN_SEEDVR_TIMING=1` to print CUDA-event timings for the VAE encoder, DiT,
+and VAE decoder on each inference. Events use the pipeline's compute stream and
+its existing final synchronization. Exclude initial compilation and CUDA graph
+capture runs when comparing steady-state performance.
 
 ## VAE tiling
 

@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ort_session.h"
+#include "ep_cache_policy.h"
 
 #include <cuda.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -521,8 +523,18 @@ void AppendTensorRTRTXEP(Ort::Env& env, Ort::SessionOptions& options, const std:
         ep_options.Add("enable_cuda_graph", "1");
     }
 
-    const auto cache_path = (fs::path(cache_dir) / ModelCacheKey(model_path, profile)).string();
-    ep_options.Add("nv_runtime_cache_path", cache_path.c_str());
+    if (!profile.stable_cache_path.empty())
+    {
+        if (cache_dir.empty()) throw std::invalid_argument("Persistent JIT cache directory must not be empty");
+        const auto cache_path = fs::absolute(fs::path(cache_dir) / cache::Namespace(profile) / "runtime.cache").
+            string();
+        ep_options.Add("nv_runtime_cache_file", cache_path.c_str());
+    }
+    else
+    {
+        const auto cache_path = (fs::path(cache_dir) / ModelCacheKey(model_path, profile)).string();
+        ep_options.Add("nv_runtime_cache_path", cache_path.c_str());
+    }
     if (!profile.min_shapes.empty())
     {
         ep_options.Add("nv_profile_min_shapes", profile.min_shapes.c_str());
@@ -553,7 +565,10 @@ std::string CompiledModelPath(const std::string& model_path, const EpContextOpti
     const auto stem = input.stem().string();
     // The EP chooses engine sidecar names. Isolate profiles so their payloads
     // cannot overwrite one another even when they originate from the same graph.
-    return (output_dir / ModelCacheKey(model_path, profile) / (stem + ".embedded.onnx")).string();
+    return (output_dir / (profile.stable_cache_path.empty()
+                              ? fs::path(ModelCacheKey(model_path, profile))
+                              : cache::Namespace(profile)) /
+        (stem + ".embedded.onnx")).string();
 }
 
 bool IsCompatibleEpContext(Ort::Env& env, const fs::path& model_path)
@@ -595,10 +610,14 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
 {
     DIN_NVTX_FUNC_RANGE();
     const auto output_model_path = CompiledModelPath(model_path, ep_context, profile);
+    const auto manifest = fs::path(output_model_path + ".manifest");
+    const auto identity = profile.stable_cache_path.empty() ? std::string{} : cache::Identity(model_path, profile);
     if (fs::exists(output_model_path))
     {
-        if (IsCompatibleEpContext(env, output_model_path))
+        if (cache::CanReuseContext(profile, manifest, identity) &&
+            IsCompatibleEpContext(env, output_model_path))
         {
+            std::cout << "Reusing EP context: " << output_model_path << '\n';
             return output_model_path;
         }
 
@@ -613,6 +632,9 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     const auto output_dir = fs::absolute(output_model.parent_path());
     const auto output_model_abs = output_dir / output_model.filename();
     fs::create_directories(output_dir);
+    fs::remove(manifest);
+    const auto compile_start = std::chrono::steady_clock::now();
+    std::cout << "Compiling EP context: " << output_model_path << std::endl;
 
     Ort::SessionOptions compile_session_options;
     for (const auto& [name, value] : profile.free_dimension_overrides)
@@ -637,6 +659,15 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     }
     if (!IsCompatibleEpContext(env, output_model_path))
         throw std::runtime_error("Compilation did not produce a compatible EP-context model: " + output_model_path);
+    if (!profile.stable_cache_path.empty())
+    {
+        std::ofstream output(manifest, std::ios::binary | std::ios::trunc);
+        output << identity;
+        output.close();
+        if (!output) throw std::runtime_error("Could not save EP context manifest: " + manifest.string());
+    }
+    std::cout << "EP compilation ms: " << std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - compile_start).count() << " (" << model_path << ")" << std::endl;
     return output_model_path;
 }
 }  // namespace
@@ -872,7 +903,15 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
         if (!profile.skip_compile)
         {
             [[maybe_unused]] din::common::nvtx_scoped_range range{"load_or_compile_ep_context"};
-            session_model_path = CompileEpContextModel(env, model_path, cache_dir, ep_context, profile);
+            auto output = ep_context;
+            if (profile.force_recompile)
+            {
+                auto workspace = std::make_shared<cache::TemporaryDirectory>(
+                    output.output_dir.empty() ? fs::temp_directory_path() : fs::path(output.output_dir));
+                output.output_dir = workspace->path.string();
+                temporary_context_ = std::move(workspace);
+            }
+            session_model_path = CompileEpContextModel(env, model_path, cache_dir, output, profile);
         }
         for (const auto& [name, value] : profile.free_dimension_overrides)
         {
@@ -889,6 +928,7 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
         throw std::runtime_error("unsupported provider: " + provider);
     }
 
+    const auto load_start = std::chrono::steady_clock::now();
 #ifdef _WIN32
     const auto wide = ToOrtPathString(session_model_path);
     {
@@ -901,6 +941,9 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
         session = Ort::Session(env, session_model_path.c_str(), options_);
     }
 #endif
+    if (!profile.stable_cache_path.empty())
+        std::cout << "ORT session load ms: " << std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - load_start).count() << " (" << model_path << ")" << std::endl;
 }
 
 bool OrtRunner::HasDeviceIo() const

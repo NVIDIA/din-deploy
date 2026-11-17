@@ -245,14 +245,20 @@ def convert(input_path: Path, output_path: Path, checkpoint_path: Path, quant: s
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_MODEL_DIR / "seedvr2_3b_fp16_dit.onnx",
-                        help="Unquantized DiT; default: models/SeedVR2-3B-onnx/seedvr2_3b_fp16_dit.onnx")
-    parser.add_argument("--output", type=Path, help="Default: seedvr2_3b_<quant>_dit.onnx beside the input; writes <filename>.data alongside it")
+                        help="Unquantized FP16/BF16 image or video DiT; default: models/SeedVR2-3B-onnx/seedvr2_3b_fp16_dit.onnx")
+    parser.add_argument("--output", type=Path,
+                        help="Default: seedvr2_3b_<quant>_dit.onnx for images or seedvr2_video_<quant>_dit.onnx for video; writes <filename>.data alongside it")
     parser.add_argument("--quant", choices=FILES, required=True)
     parser.add_argument("--checkpoint", type=Path, help="Local safetensors; otherwise use the global HF cache")
     parser.add_argument("--revision", default=REVISION, help="Comfy-Org/SeedVR2 revision for download")
     args = parser.parse_args()
     if args.output is None:
-        args.output = args.input.parent / f"seedvr2_3b_{args.quant}_dit.onnx"
+        source = onnx.load(args.input, load_external_data=False)
+        latent = next(value for value in source.graph.input if value.name == "latent")
+        dimensions = latent.type.tensor_type.shape.dim
+        video = len(dimensions) == 5 and (bool(dimensions[2].dim_param) or dimensions[2].dim_value > 1)
+        prefix = "seedvr2_video" if video else "seedvr2_3b"
+        args.output = args.input.parent / f"{prefix}_{args.quant}_dit.onnx"
     checkpoint = args.checkpoint
     if checkpoint is None:
         from huggingface_hub import hf_hub_download

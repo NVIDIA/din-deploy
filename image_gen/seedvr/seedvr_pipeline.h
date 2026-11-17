@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 
 #include "rng.h"
@@ -13,6 +14,15 @@
 
 namespace din::seedvr
 {
+enum class ShapeMode { Dynamic, Static };
+
+inline ShapeMode ParseShapeMode(const std::string& value)
+{
+    if (value == "dynamic") return ShapeMode::Dynamic;
+    if (value == "static") return ShapeMode::Static;
+    throw std::invalid_argument("--shape-mode must be dynamic or static");
+}
+
 struct ModelConfig
 {
     std::filesystem::path model_dir = "models/SeedVR2-3B-onnx";
@@ -31,6 +41,7 @@ struct ModelConfig
     int vae_encoder_overlap = 64;
     int vae_decoder_tile_size = 0;
     int vae_decoder_overlap = 64;
+    ShapeMode shape_mode = ShapeMode::Dynamic;
 };
 struct ImageShape
 {

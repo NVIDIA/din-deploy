@@ -11,8 +11,13 @@ set(cuDNN_ROOT "${_cuDNN_DEFAULT_ROOT}" CACHE PATH "cuDNN SDK installation root"
 
 find_package(CUDAToolkit QUIET)
 find_path(cuDNN_INCLUDE_DIR cudnn.h HINTS "${cuDNN_ROOT}" PATH_SUFFIXES include)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+    set(_cuDNN_ARCH_SUFFIX arm64)
+else ()
+    set(_cuDNN_ARCH_SUFFIX x64)
+endif ()
 find_library(cuDNN_LIBRARY NAMES cudnn cudnn64_9
-    HINTS "${cuDNN_ROOT}" PATH_SUFFIXES lib lib/x64 lib64)
+        HINTS "${cuDNN_ROOT}" PATH_SUFFIXES lib lib/${_cuDNN_ARCH_SUFFIX} lib64)
 
 if(EXISTS "${cuDNN_INCLUDE_DIR}/cudnn_version.h")
     file(READ "${cuDNN_INCLUDE_DIR}/cudnn_version.h" _cuDNN_HEADER)
@@ -29,7 +34,7 @@ if(WIN32)
     get_filename_component(_cuDNN_LIBRARY_DIR "${cuDNN_LIBRARY}" DIRECTORY)
     find_file(cuDNN_RUNTIME_LIBRARY "cudnn64_${_cuDNN_MAJOR}.dll"
         HINTS "${cuDNN_ROOT}" "${_cuDNN_LIBRARY_DIR}/.." "${_cuDNN_LIBRARY_DIR}/../.."
-        PATH_SUFFIXES bin bin/x64 lib lib/x64)
+            PATH_SUFFIXES bin bin/x64 lib lib/x64 bin/arm64 lib/arm64)
     list(APPEND _cuDNN_REQUIRED_VARS cuDNN_RUNTIME_LIBRARY)
 endif()
 

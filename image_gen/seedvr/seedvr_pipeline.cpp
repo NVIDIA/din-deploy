@@ -14,6 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -43,6 +44,52 @@ inline constexpr size_t DivRoundUp(size_t value, size_t divisor)
 }
 
 using NativeVaeRun = std::function<void(const void*, void*, int, int)>;
+// Optional per-component GPU timing. Read events after the pipeline's existing
+// stream synchronization, without introducing synchronization between stages.
+class StageTiming
+{
+public:
+    StageTiming()
+    {
+        const char* value = std::getenv("DIN_SEEDVR_TIMING");
+        enabled_ = value && std::string_view(value) == "1";
+    }
+
+    ~StageTiming()
+    {
+        for (auto event : events_)
+            if (event) cudaEventDestroy(event);
+    }
+
+    StageTiming(const StageTiming&) = delete;
+    StageTiming& operator=(const StageTiming&) = delete;
+
+    void Record(size_t index, cudaStream_t stream)
+    {
+        if (!enabled_) return;
+        SEEDVR_CUDA_CHECK(cudaEventCreate(&events_[index]));
+        SEEDVR_CUDA_CHECK(cudaEventRecord(events_[index], stream));
+    }
+
+    void Print() const
+    {
+        if (!enabled_) return;
+        constexpr std::array names{"encoder", "dit", "decoder"};
+        std::cout << "SeedVR GPU stages:";
+        for (size_t i = 0; i < names.size(); ++i)
+        {
+            float ms = 0;
+            SEEDVR_CUDA_CHECK(cudaEventElapsedTime(&ms, events_[2 * i], events_[2 * i + 1]));
+            std::cout << ' ' << names[i] << "_ms=" << ms;
+        }
+        std::cout << std::endl;
+    }
+
+private:
+    bool enabled_ = false;
+    std::array<cudaEvent_t, 6> events_{};
+};
+
 // Fixed tile geometry, bindings and scratch, reused for every call.
 class VaeExecution
 {
@@ -235,8 +282,8 @@ public:
         if (config_.transformer_precision != "fp16" && config_.transformer_precision != "bf16" && config_.transformer_precision != "fp8_wo" &&
             config_.transformer_precision != "nvfp4")
             throw std::invalid_argument("Invalid transformer precision");
-        if (video && config_.transformer_precision != "fp16" && config_.transformer_precision != "bf16")
-            throw std::invalid_argument("Video DiT requires BF16 or FP16");
+        if (video && config_.transformer_precision == "fp8_wo")
+            throw std::invalid_argument("Video DiT supports BF16, FP16, or NVFP4");
         ValidateVaeTiling(config_.vae_encoder_tile_size, config_.vae_encoder_overlap);
         ValidateVaeTiling(config_.vae_decoder_tile_size, config_.vae_decoder_overlap);
         padded_height = DivRoundUp(shape.target_height, 16) * 16;
@@ -273,7 +320,11 @@ public:
             config_.model_dir / (video ? "seedvr2_video_vae_encoder.onnx" : "seedvr2_ema_vae_encoder.onnx");
         const fs::path dit_path =
             config_.model_dir /
-            (video ? "seedvr2_video_dit.onnx" : "seedvr2_" + variant + "_" + config_.transformer_precision + "_dit.onnx");
+            (video
+                 ? (config_.transformer_precision == "nvfp4"
+                        ? "seedvr2_video_nvfp4_dit.onnx"
+                        : "seedvr2_video_dit.onnx")
+                 : "seedvr2_" + variant + "_" + config_.transformer_precision + "_dit.onnx");
         const fs::path decoder_path =
             config_.model_dir / (video ? "seedvr2_video_vae_decoder.onnx" : "seedvr2_ema_vae_decoder.onnx");
         const std::string encoder_label =
@@ -288,7 +339,6 @@ public:
         decoder_label_ = decoder_label;
         clip_label_ = "SeedVR2 / Clip / " + std::to_string(frames) + " frames / " + config_.model_dir.generic_string();
 
-        if (!sessions_)
         {
             [[maybe_unused]] common::nvtx_scoped_range load_range{"SeedVR2 / Load models"};
             const auto session_start = std::chrono::steady_clock::now();
@@ -309,46 +359,28 @@ public:
             compute_stream_ = common::CreateTensorRTRTXComputeStream(env_);
             auto* stream = &compute_stream_;
             const common::EpContextOptions ep_context{.output_dir = config_.ep_context_dir.string()};
-            const std::string video_prefix = video ? "video" + std::to_string(frames) + "_" : "";
-            const std::string image_size =
-                video_prefix + std::to_string(padded_width) + "x" + std::to_string(padded_height);
-
-            auto sessions = std::make_unique<SessionBundle>();
-            sessions->padded_height = padded_height;
-            sessions->padded_width = padded_width;
-            // VAE tiling/buffers keep exact geometry per instance; the shared
-            // profile below applies only to the DiT.
-            auto encoder_profile = ExactProfile(
-                "image:" + (video ? ShapeString({1, 3, static_cast<int64_t>(frames), encoder_height, encoder_width})
-                                  : ShapeString({1, 3, encoder_height, encoder_width})),
-                video_prefix + "vae_encoder_" + std::to_string(encoder_width) + "x" + std::to_string(encoder_height));
-            if (video)
-                encoder_profile.free_dimension_overrides = {{"image_dim2", static_cast<int64_t>(frames)},
-                                                           {"image_dim3", encoder_height},
-                                                           {"image_dim4", encoder_width}};
+            SessionBundle sessions;
+            const bool static_shapes = config_.shape_mode == ShapeMode::Static;
+            std::cout << "Shape mode: " << (static_shapes
+                                                ? "static (fresh EP compilation)"
+                                                : "dynamic (cached EP context)")
+                << "; shared persistent JIT cache" << std::endl;
             if (!native_vae)
             {
                 [[maybe_unused]] common::nvtx_scoped_range model_range{encoder_label.c_str()};
-                sessions->encoder = std::make_unique<common::OrtRunner>(env_, encoder_path.string(), "trt-rtx",
-                                                                        config_.ep_cache_dir.string(), ep_context,
-                                                                        encoder_profile, stream);
+                auto profile = static_shapes
+                                   ? ExactVaeProfile(video, true, frames, encoder_height, encoder_width)
+                                   : RangedVaeProfile(video, true);
+                ConfigureCache(profile, encoder_path);
+                sessions.encoder = std::make_unique<common::OrtRunner>(env_, encoder_path.string(), "trt-rtx",
+                                                                       config_.ep_cache_dir.string(), ep_context,
+                                                                       profile, stream);
             }
-            common::ModelProfile dit_profile;
-            if (video)
-            {
-                dit_profile = RangedVideoDitProfile(version_7b ? 30 : kRopePairs);
-                dit_profile.cache_subpath = "dit_" + config_.transformer_precision + "_video_range";
-            }
-            else
-            {
-                dit_profile = ExactProfile(DitProfile(padded_height, padded_width, normal_profile, shifted_profile,
-                                                     latent_frames, version_7b ? 30 : kRopePairs),
-                                           "dit_" + config_.transformer_precision + "_" + image_size);
-                dit_profile.free_dimension_overrides = {{"latent_dim3", latent_height}, {"latent_dim4", latent_width}};
-                if (video) dit_profile.free_dimension_overrides.emplace_back("latent_dim2", latent_frames);
-                AddMetadataOverrides(dit_profile, "normal", normal_profile, normal_profile);
-                AddMetadataOverrides(dit_profile, "shifted", shifted_profile, shifted_profile);
-            }
+            auto dit_profile = static_shapes
+                                   ? ExactDitProfile(padded_height, padded_width, latent_frames,
+                                                     version_7b ? 30 : kRopePairs)
+                                   : RangedDitProfile(video, version_7b ? 30 : kRopePairs);
+            ConfigureCache(dit_profile, dit_path);
             if (!config_.weight_streaming_budget.empty())
             {
                 dit_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
@@ -357,29 +389,23 @@ public:
             std::cerr << "[SeedVR initialization] creating DiT ORT session" << std::endl;
             {
                 [[maybe_unused]] common::nvtx_scoped_range model_range{dit_label.c_str()};
-                sessions->dit = std::make_unique<common::OrtRunner>(
+                sessions.dit = std::make_unique<common::OrtRunner>(
                     env_, dit_path.string(), "trt-rtx", config_.ep_cache_dir.string(), ep_context, dit_profile, stream);
             }
             std::cerr << "[SeedVR initialization] DiT ORT session ready" << std::endl;
             if (!native_vae)
             {
                 [[maybe_unused]] common::nvtx_scoped_range model_range{decoder_label.c_str()};
-                auto decoder_profile =
-                    ExactProfile("latent:" + (video ? ShapeString({1, kLatentChannels, latent_frames, decoder_height,
-                                                                   decoder_width})
-                                                    : ShapeString({1, kLatentChannels, decoder_height, decoder_width})),
-                                 video_prefix + std::string("vae_decoder_unclamped_") +
-                                     std::to_string(decoder_width * 8) + "x" + std::to_string(decoder_height * 8));
-                if (video)
-                    decoder_profile.free_dimension_overrides = {{"latent_dim2", latent_frames},
-                                                               {"latent_dim3", decoder_height},
-                                                               {"latent_dim4", decoder_width}};
-                sessions->decoder = std::make_unique<common::OrtRunner>(
+                auto profile = static_shapes
+                                   ? ExactVaeProfile(video, false, latent_frames, decoder_height, decoder_width)
+                                   : RangedVaeProfile(video, false);
+                ConfigureCache(profile, decoder_path);
+                sessions.decoder = std::make_unique<common::OrtRunner>(
                     env_, decoder_path.string(), "trt-rtx", config_.ep_cache_dir.string(), ep_context,
-                    decoder_profile, stream);
+                    profile, stream);
             }
-            if (!sessions->dit->HasDeviceIo() ||
-                (!native_vae && (!sessions->encoder->HasDeviceIo() || !sessions->decoder->HasDeviceIo())))
+            if (!sessions.dit->HasDeviceIo() ||
+                (!native_vae && (!sessions.encoder->HasDeviceIo() || !sessions.decoder->HasDeviceIo())))
             {
                 throw std::runtime_error("SeedVR requires CUDA-backed TensorRT RTX I/O");
             }
@@ -392,11 +418,11 @@ public:
                                                   static_cast<int>(encoder_width)};
                 shapes.decoder = NativeVae::Shape{static_cast<int>(latent_frames), static_cast<int>(decoder_height),
                                                   static_cast<int>(decoder_width)};
-                sessions->native = std::make_unique<NativeVae>(
+                sessions.native = std::make_unique<NativeVae>(
                     config_.vae_weights_dir, reinterpret_cast<cudaStream_t>(compute_stream_.GetHandle()), shapes,
                     size_t(config_.vae_workspace_mib) << 20, config_.vae_autotune, config_.vae_tuning_cache,
                     config_.vae_tuning_candidates);
-                const auto memory = sessions->native->GetWorkingMemoryStats();
+                const auto memory = sessions.native->GetWorkingMemoryStats();
                 std::cout << "VAE encoder physical working memory required: " << memory.encoder_bytes << " bytes\n"
                           << "VAE decoder physical working memory required: " << memory.decoder_bytes << " bytes\n"
                           << "VAE shared physical working memory capacity (max, not sum): " << memory.shared_bytes
@@ -415,9 +441,9 @@ public:
 
         try
         {
-            auto& encoder = *(native_vae ? sessions_->dit : sessions_->encoder);
-            auto& dit = *sessions_->dit;
-            auto& decoder = *(native_vae ? sessions_->dit : sessions_->decoder);
+            auto& encoder = *(native_vae ? sessions_.dit : sessions_.encoder);
+            auto& dit = *sessions_.dit;
+            auto& decoder = *(native_vae ? sessions_.dit : sessions_.decoder);
             std::vector<int64_t> pixel_shape{1, 3, static_cast<int64_t>(padded_height), static_cast<int64_t>(padded_width)};
             std::vector<int64_t> encoded_shape{1, kLatentChannels, latent_height, latent_width};
             const std::vector<int64_t> latent_shape{1, kLatentChannels, latent_frames, latent_height, latent_width};
@@ -478,11 +504,11 @@ public:
             {
                 encode = [this](const void* x, void* y, int, int)
                 {
-                    sessions_->native->Encode(x, y);
+                    sessions_.native->Encode(x, y);
                 };
                 decode = [this](const void* x, void* y, int, int)
                 {
-                    sessions_->native->Decode(x, y);
+                    sessions_.native->Decode(x, y);
                 };
             }
     #endif
@@ -528,7 +554,7 @@ public:
         }
         if (device != ImageDevice::Cuda)
             throw std::invalid_argument("Invalid image device");
-        auto allocator = sessions_->dit->DeviceAllocator();
+        auto allocator = sessions_.dit->DeviceAllocator();
         return Ort::Value::CreateTensor<float>(allocator, s.data(), s.size());
     }
 
@@ -555,7 +581,7 @@ public:
             const char* keys[]{"nv_weight_streaming_budget"};
             const char* values[]{update.weight_streaming_budget->c_str()};
             // Provider validates the budget and rejects unsupported dynamic updates.
-            sessions_->dit->session.SetEpDynamicOptions(keys, values, 1);
+            sessions_.dit->session.SetEpDynamicOptions(keys, values, 1);
         }
         options_ = std::move(next);
     }
@@ -571,6 +597,7 @@ public:
             ValidateTensor(outputs[t], ImageRole::Output);
         }
         const auto start = std::chrono::steady_clock::now();
+        StageTiming stage_timing;
         const size_t plane = padded_height * padded_width;
         const size_t rh = shape_.target_height / 2 * 2, rw = shape_.target_width / 2 * 2;
         const size_t output_elements = 3 * rh * rw;
@@ -594,7 +621,9 @@ public:
             }
             {
                 [[maybe_unused]] common::nvtx_scoped_range range{encoder_label_.c_str()};
+                stage_timing.Record(0, Stream());
                 encoder_exec_->Run(run_options_, Stream());
+                stage_timing.Record(1, Stream());
             }
             LaunchSeedVrConditionKernel(Stream(), encoded_->BindingValue().GetTensorData<Fp16>(),
                                         condition_->BindingValue().GetTensorMutableData<Fp16>(), spatial_size);
@@ -639,14 +668,18 @@ public:
             }
             {
                 [[maybe_unused]] common::nvtx_scoped_range range{dit_label_.c_str()};
-                sessions_->dit->session.Run(run_options_, *dit_io_);
+                stage_timing.Record(2, Stream());
+                sessions_.dit->session.Run(run_options_, *dit_io_);
+                stage_timing.Record(3, Stream());
             }
             LaunchSeedVrEulerKernel(Stream(), latent_->BindingValue().GetTensorData<Fp16>(),
                                     velocity_->BindingValue().GetTensorData<Fp16>(),
                                     encoded_->BindingValue().GetTensorMutableData<Fp16>(), noise_count);
             {
                 [[maybe_unused]] common::nvtx_scoped_range range{decoder_label_.c_str()};
+                stage_timing.Record(4, Stream());
                 decoder_exec_->Run(run_options_, Stream());
+                stage_timing.Record(5, Stream());
             }
             for (size_t t = 0; t < frames; ++t)
             {
@@ -681,6 +714,7 @@ public:
                 std::memcpy(outputs[t].GetTensorMutableData<float>(), output_host_.GetTensorData<float>() + t * output_elements,
                             output_elements * sizeof(float));
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        stage_timing.Print();
         std::cout << "SeedVR inference: " << ms << " ms total, " << ms / frames << " ms/image (" << frames << " images)"
                   << std::endl;
     }
@@ -718,7 +752,7 @@ private:
         if (memory.GetDeviceType() == OrtMemoryInfoDeviceType_CPU)
             return;
         const auto name = memory.GetAllocatorName();
-        const bool cuda_memory = name == "Cuda" || name == sessions_->dit->DeviceMemory().GetAllocatorName();
+        const bool cuda_memory = name == "Cuda" || name == sessions_.dit->DeviceMemory().GetAllocatorName();
         if (memory.GetDeviceType() != OrtMemoryInfoDeviceType_GPU || !cuda_memory ||
             memory.GetDeviceMemoryType() != OrtDeviceMemoryType_DEFAULT || memory.GetDeviceId() != cuda_device)
             throw std::invalid_argument("SeedVR supports CPU tensors or CUDA tensors on its configured device; got " +
@@ -727,7 +761,6 @@ private:
     }
     struct SessionBundle
     {
-        size_t padded_height = 0, padded_width = 0;
         std::unique_ptr<common::OrtRunner> encoder, dit, decoder;
 #ifdef DIN_SEEDVR_NATIVE_VAE
         std::unique_ptr<NativeVae> native;
@@ -744,7 +777,7 @@ private:
     // Declared before the stream, sessions and buffers so it outlives them.
     Ort::Env env_{ORT_LOGGING_LEVEL_WARNING, "din_seedvr2"};
     Ort::SyncStream compute_stream_{nullptr};
-    std::unique_ptr<SessionBundle> sessions_;
+    SessionBundle sessions_;
     std::unique_ptr<common::TensorBuffer<Fp16>> pixels_, encoded_, condition_, latent_, velocity_, context_, timestep_;
     Ort::Value noise_{nullptr}, noise_host_{nullptr}, output_device_{nullptr}, output_host_{nullptr};
     Ort::Value input_device_{nullptr}, reference_{nullptr};
