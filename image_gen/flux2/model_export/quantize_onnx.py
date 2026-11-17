@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 #!/usr/bin/env python3
-"""Insert FLUX.2 NVFP4 quantizers into an existing unquantized ONNX model.
+"""Insert FLUX.2 FP8 or NVFP4 quantizers into an existing unquantized ONNX model.
 
 This is intentionally ONNX-only: it does not instantiate the PyTorch model and
 does not modify the export scripts. It uses the quantized checkpoint metadata
@@ -17,22 +17,32 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import shutil
 import tempfile
 from dataclasses import dataclass
+from graphlib import TopologicalSorter
 from pathlib import Path
 
 import numpy as np
 import onnx
 import torch
 from comfy_kitchen.float_utils import from_blocked, swap_nibbles
-from modelopt_export_compat import topologically_sort_graph
 from onnx import TensorProto, helper, numpy_helper
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
 
 EXTERNAL_DATA_NAME = "model.onnx_data"
 BLOCK_SIZE = 16
+
+
+def topologically_sort_graph(model: onnx.ModelProto) -> None:
+    nodes = list(model.graph.node)
+    producers = {output: index for index, node in enumerate(nodes) for output in node.output if output}
+    sorter = TopologicalSorter()
+    for index, node in enumerate(nodes):
+        sorter.add(index, *(producers[name] for name in node.input if name in producers))
+    ordered = [nodes[index] for index in sorter.static_order()]
+    del model.graph.node[:]
+    model.graph.node.extend(ordered)
 
 DEFAULT_BASE_MODEL_NAME = "black-forest-labs/FLUX.2-klein-4b"
 DEFAULT_FP8_MODEL_NAME = "black-forest-labs/FLUX.2-klein-4b-fp8"
@@ -882,27 +892,25 @@ def resolve_output_model_path(path: Path) -> Path:
     return path
 
 
-def prepare_output(input_path: Path, output_path: Path) -> Path:
-    output_model_path = resolve_output_model_path(output_path)
-    output_model_path.parent.mkdir(parents=True, exist_ok=True)
-    if input_path.resolve() != output_model_path.resolve():
-        shutil.copy2(input_path, output_model_path)
-        input_data = input_path.parent / EXTERNAL_DATA_NAME
-        if input_data.exists():
-            shutil.copy2(input_data, output_model_path.parent / EXTERNAL_DATA_NAME)
-    return output_model_path
-
-
 def save_external_model(model: onnx.ModelProto, onnx_path: Path) -> None:
-    onnx.save_model(
-        model,
-        str(onnx_path),
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=EXTERNAL_DATA_NAME,
-        size_threshold=1024,
-        convert_attribute=False,
-    )
+    # Save to fresh external data; ONNX otherwise appends to any existing file,
+    # retaining an unused copy of the original BF16 weights.
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".quantize_onnx.", dir=onnx_path.parent) as staging:
+        staging_path = Path(staging)
+        model_path = staging_path / onnx_path.name
+        onnx.save_model(
+            model,
+            str(model_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=EXTERNAL_DATA_NAME,
+            size_threshold=1024,
+            convert_attribute=False,
+        )
+        onnx.checker.check_model(str(model_path))
+        (staging_path / EXTERNAL_DATA_NAME).replace(onnx_path.parent / EXTERNAL_DATA_NAME)
+        model_path.replace(onnx_path)
 
 
 def save_streaming_nvfp4_model(
@@ -913,7 +921,7 @@ def save_streaming_nvfp4_model(
     payloads: dict[str, Nvfp4Payload],
     compute_dtype: int,
 ) -> tuple[int, int, int]:
-    """Build a static NVFP4 model without loading the baseline weight data."""
+    """Build an NVFP4 model without loading baseline weights, preserving input shapes."""
     if input_model_path.resolve() == output_model_path.resolve():
         raise ValueError(
             "The streaming NVFP4 path requires --output to differ from --input"
@@ -961,7 +969,8 @@ def save_streaming_nvfp4_model(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path, help="Unquantized ONNX model file or directory containing model.onnx")
-    parser.add_argument("--model_name", default=None, help="Base Hugging Face model repo ID used for transformer config")
+    parser.add_argument("--model_name", default=None,
+                        help="Quantized checkpoint repo ID or local snapshot; default selected by --quant")
     parser.add_argument("--output", required=True, type=Path, help="Output ONNX model file or directory")
     parser.add_argument("--quant", choices=["nvfp4", "fp8"], default="nvfp4")
     parser.add_argument("--compute-dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -1011,9 +1020,7 @@ def main() -> None:
     checkpoint /= FP8_FILE
     payloads = load_fp8_payloads(checkpoint)
     model = onnx.load(str(input_model_path), load_external_data=True)
-    output_model_path = prepare_output(input_model_path, args.output)
-    if output_model_path != input_model_path:
-        model = onnx.load(str(output_model_path), load_external_data=True)
+    output_model_path = resolve_output_model_path(args.output)
     inserted, removed = quantize_fp8(
         model,
         payloads,

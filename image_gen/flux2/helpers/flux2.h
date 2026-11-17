@@ -47,17 +47,10 @@ static constexpr int64_t BATCH_SIZE = 1;
 static constexpr int64_t SEQUENCE_LENGTH = 512;
 static constexpr int64_t TEXT_ENCODER_EMBED_DIM = 7680;
 
-static constexpr int64_t IMAGE_HEIGHT = 1024;
-static constexpr int64_t IMAGE_WIDTH = 1024;
 static constexpr int64_t IMAGE_CHANNELS = 3;
-
-static constexpr int64_t LATENT_HEIGHT = IMAGE_HEIGHT / 16;  // 64
-static constexpr int64_t LATENT_WIDTH = IMAGE_WIDTH / 16;    // 64
 static constexpr int64_t LATENT_CHANNELS = 128;
 static constexpr int64_t PATCH_SIZE = 2;
 
-static constexpr int64_t IMAGE_SEQUENCE = LATENT_HEIGHT * LATENT_WIDTH;
-static constexpr int64_t TRANSFORMER_HIDDEN_DIM = IMAGE_SEQUENCE;
 
 static constexpr int FLOW_STEPS = 4;
 static constexpr float T_START = 1.0f;
@@ -90,14 +83,14 @@ inline std::string FormatFlux2Prompt(const std::string& prompt)
     return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
-inline std::vector<float> MakeFlux2Schedule(int steps)
+inline std::vector<float> MakeFlux2Schedule(int steps, int64_t image_sequence)
 {
     if (steps < 1 || steps > 50)
         throw std::invalid_argument("Denoise steps must be in [1, 50]");
-    constexpr double m200 = 0.00016927 * IMAGE_SEQUENCE + 0.45666666;
-    constexpr double m10 = 8.73809524e-05 * IMAGE_SEQUENCE + 1.89833333;
-    constexpr double a = (m200 - m10) / 190.0;
-    const double mu = IMAGE_SEQUENCE > 4300 ? m200 : a * steps + m200 - 200.0 * a;
+    const double m200 = 0.00016927 * image_sequence + 0.45666666;
+    const double m10 = 8.73809524e-05 * image_sequence + 1.89833333;
+    const double a = (m200 - m10) / 190.0;
+    const double mu = image_sequence > 4300 ? m200 : a * steps + m200 - 200.0 * a;
     const double e = std::exp(mu);
     std::vector<float> schedule(steps + 1);
     for (int i = 0; i < steps; ++i)

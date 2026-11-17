@@ -100,7 +100,8 @@ public:
 private:
     static bool SameBackend(const Flux2Config& a, const Flux2Config& b)
     {
-        return a.processing == b.processing && a.provider == b.provider;
+        return a.processing == b.processing && a.provider == b.provider &&
+            a.width == b.width && a.height == b.height;
     }
 
     void UpdateMemory()
@@ -256,6 +257,7 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
     int budget = 50;
     int count = static_cast<int>(config.num_images);
     int encoder = config.text_encoder.variant == Flux2TextEncoder::Qwen3_4B ? 0 : 1;
+    int decoder = config.vae.small_decoder ? 1 : 0;
     int precision = config.transformer.precision == "bf16" ? 0 : config.transformer.precision == "fp16" ? 1 : config.transformer.precision == "fp8" ? 2 : 3;
     const char* precisions[] = {"bf16", "fp16", "fp8", "nvfp4"};
     const char* backends[] = {"CPU", "CUDA", "DirectX", "DirectX CIG", "Vulkan", "Vulkan CIG"};
@@ -320,6 +322,18 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
         if (!translator_exists)
             ImGui::TextWrapped("Translator ONNX is missing from this model root.");
         ImGui::Combo("Precision", &precision, precisions, IM_ARRAYSIZE(precisions));
+        if (ImGui::BeginCombo("VAE decoder", decoder == 0 ? "Full" : "Small"))
+        {
+            if (ImGui::Selectable("Full", decoder == 0))
+                decoder = 0;
+            const bool small_exists = model[0] && std::filesystem::is_regular_file(
+                std::filesystem::u8path(model.data()) / "vae_decoder_small/model.onnx");
+            ImGui::BeginDisabled(!small_exists);
+            if (ImGui::Selectable("Small", decoder == 1))
+                decoder = 1;
+            ImGui::EndDisabled();
+            ImGui::EndCombo();
+        }
         ImGui::Combo("Provider", &provider, "CPU\0TensorRT RTX\0");
         if (provider == 0)
         {
@@ -359,8 +373,13 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
         ImGui::EndDisabled();
         ImGui::InputScalar("Seed", ImGuiDataType_U32, &config.seed);
         ImGui::SliderInt("Denoise steps", &config.steps, 1, 50);
+        ImGui::InputInt("Width", &config.width, 16, 128);
+        ImGui::InputInt("Height", &config.height, 16, 128);
+        const bool resolution_valid = IsFlux2ResolutionValid(config.width, config.height);
+        if (!resolution_valid)
+            ImGui::TextWrapped("Use multiples of 16: width 32-3840, height 32-2160.");
         ImGui::SliderInt("Images", &count, 1, 16);
-        const bool paths_valid = model[0] && (!cache_changed || cache[0]);
+        const bool paths_valid = model[0] && (!cache_changed || cache[0]) && resolution_valid;
         ImGui::BeginDisabled(!paths_valid);
         bool generate = ImGui::Button("Generate", ImVec2(-1, 35));
         bool random = ImGui::Button("Random sweep", ImVec2(-1, 30));
@@ -385,6 +404,7 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
                 cache_namespace;
             config.text_encoder.variant = encoder == 0 ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
             config.transformer.precision = precisions[precision];
+            config.vae.small_decoder = decoder == 1;
             config.num_images = static_cast<unsigned int>(count);
             config.processing = static_cast<Flux2ProcessingBackend>(backend);
             config.provider = provider == 0 ? Flux2ExecutionProvider::Cpu : Flux2ExecutionProvider::TrtRtx;
@@ -420,8 +440,10 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
         if (selected >= 0)
         {
             const auto available = ImGui::GetContentRegionAvail();
-            const float side = std::max(1.0f, std::min(available.x, available.y));
-            ImGui::Image(static_cast<ImTextureID>(results[selected].texture), ImVec2(side, side));
+            const auto& image = results[selected].image;
+            const float scale = std::max(0.001f, std::min(available.x / image.width, available.y / image.height));
+            ImGui::Image(static_cast<ImTextureID>(results[selected].texture),
+                         ImVec2(image.width * scale, image.height * scale));
         }
         else
             ImGui::TextDisabled("Generated images will appear here.");
@@ -433,9 +455,13 @@ int Studio(const Flux2Config& initial, bool smoke, bool auto_generate, bool exit
                 ImGui::SameLine();
             ImGui::PushID(i);
             ImGui::BeginGroup();
-            if (ImGui::ImageButton("image", static_cast<ImTextureID>(results[i].texture), ImVec2(72, 72)))
+            const auto& image = results[i].image;
+            const float scale = 72.0f / std::max(image.width, image.height);
+            if (ImGui::ImageButton("image", static_cast<ImTextureID>(results[i].texture),
+                                   ImVec2(image.width * scale, image.height * scale)))
                 selected = i;
             ImGui::Text("%u", results[i].seed);
+            ImGui::TextDisabled("%dx%d", image.width, image.height);
             ImGui::EndGroup();
             ImGui::PopID();
         }
@@ -486,12 +512,19 @@ int main(int argc, char** argv)
             .default_value(std::string(reinterpret_cast<const char*>(context_cache_utf8.c_str())));
         args.add_argument("--prompt").default_value(std::string(DEFAULT_PROMPT));
         args.add_argument("--encoder").default_value(std::string("auto")).choices("auto", "4b", "translator");
+        args.add_argument("--decoder").default_value(std::string("full")).choices("full", "small");
         args.add_argument("--precision").default_value(std::string("bf16")).choices("bf16", "fp16", "fp8", "nvfp4");
+        args.add_argument("--width").default_value(1024).scan<'i', int>();
+        args.add_argument("--height").default_value(1024).scan<'i', int>();
         args.add_argument("--smoke-test").default_value(false).implicit_value(true);
         args.add_argument("--auto-generate").default_value(false).implicit_value(true);
         args.add_argument("--exit-after-generation").default_value(false).implicit_value(true);
         args.parse_args(argc, argv);
         Flux2Config config;
+        config.width = args.get<int>("--width");
+        config.height = args.get<int>("--height");
+        if (!IsFlux2ResolutionValid(config.width, config.height))
+            throw std::invalid_argument("Resolution must be a multiple of 16 from 32x32 through 3840x2160");
         const std::filesystem::path model_root = args.get<std::string>("--model-dir");
         if (model_root.empty() && args.get<bool>("--auto-generate"))
             throw std::runtime_error("--auto-generate requires --model-dir");
@@ -502,6 +535,7 @@ int main(int argc, char** argv)
         std::filesystem::create_directories(config.text_encoder.ep_context_dir);
         config.prompt = args.get<std::string>("--prompt");
         config.transformer.precision = args.get<std::string>("--precision");
+        config.vae.small_decoder = args.get<std::string>("--decoder") == "small";
         config.num_images = 1;
         const auto encoder = args.get<std::string>("--encoder");
         const bool translator =

@@ -2,6 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "flux2_models.h"
 
+din::common::ModelProfile Flux2TransformerProfile(din::common::ModelProfile profile)
+{
+    const auto shapes = [](int tokens)
+    {
+        const auto count = std::to_string(tokens);
+        return "hidden_states:1x" + count + "x128,encoder_hidden_states:1x512x7680,timestep:1,img_ids:1x" +
+            count + "x4,txt_ids:1x512x4";
+    };
+    profile.min_shapes = shapes(4); // 32x32
+    profile.opt_shapes = shapes(4096); // 1024x1024
+    profile.max_shapes = shapes(32400); // 3840x2160
+    return profile;
+}
+
+din::common::ModelProfile Flux2VaeProfile(din::common::ModelProfile profile)
+{
+    profile.min_shapes = "latent_sample:1x32x4x4";
+    profile.opt_shapes = "latent_sample:1x32x128x128";
+    profile.max_shapes = "latent_sample:1x32x270x480";
+    return profile;
+}
+
 void ConfigureFlux2Models(Flux2Config& config, const std::filesystem::path& model_root,
                           const std::filesystem::path& cache_root, const std::filesystem::path& context_root)
 {
@@ -19,6 +41,7 @@ void ConfigureFlux2Models(Flux2Config& config, const std::filesystem::path& mode
     const std::string encoder = config.text_encoder.variant == Flux2TextEncoder::Qwen3_4B
                                     ? "text_encoder" : "text_encoder_translator";
     const std::string transformer = "transformer_" + config.transformer.precision;
+    const std::string decoder = config.vae.small_decoder ? "vae_decoder_small" : "vae_decoder";
     for (Flux2ModelConfig* model : {static_cast<Flux2ModelConfig*>(&config.text_encoder),
                                    static_cast<Flux2ModelConfig*>(&config.transformer),
                                    static_cast<Flux2ModelConfig*>(&config.vae)})
@@ -29,13 +52,13 @@ void ConfigureFlux2Models(Flux2Config& config, const std::filesystem::path& mode
     config.text_encoder.cache_subpath = prefix + encoder;
     config.transformer.cache_subpath = prefix + transformer +
         (config.transformer.initial_weight_streaming_budget.empty() ? "" : "_ws");
-    config.vae.cache_subpath = prefix + "vae_decoder";
+    config.vae.cache_subpath = prefix + decoder;
     if (root.empty()) return; // The studio can start before a model root is selected.
     config.text_encoder.model_path = root / encoder / "model.onnx";
     config.text_encoder.tokenizer_dir = root / "tokenizer";
     config.transformer.model_path = root / transformer / "model.onnx";
-    config.vae.model_path = root / "vae_decoder/model.onnx";
-    config.vae.latent_stats_path = root / "vae_decoder/latent_stats.json";
+    config.vae.model_path = root / decoder / "model.onnx";
+    config.vae.latent_stats_path = root / decoder / "latent_stats.json";
 }
 
 std::unique_ptr<Ort::IoBinding> BindFlux2Model(Ort::Session& session,

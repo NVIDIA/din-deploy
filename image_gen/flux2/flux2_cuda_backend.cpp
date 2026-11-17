@@ -127,16 +127,16 @@ bool should_run_stage_on_cuda(SamplingBackend backend, bool cuda_available, std:
     return cuda_available;
 }
 
-void fill_position_ids(std::vector<int64_t>& img_ids, std::vector<int64_t>& txt_ids)
+void fill_position_ids(std::vector<int64_t>& img_ids, std::vector<int64_t>& txt_ids, const Flux2Dimensions& dimensions)
 {
     for (int64_t b = 0; b < BATCH_SIZE; ++b)
     {
         int64_t idx = 0;
-        for (int64_t h = 0; h < LATENT_HEIGHT; ++h)
+        for (int64_t h = 0; h < dimensions.latent_height; ++h)
         {
-            for (int64_t w = 0; w < LATENT_WIDTH; ++w, ++idx)
+            for (int64_t w = 0; w < dimensions.latent_width; ++w, ++idx)
             {
-                const int64_t base = (b * IMAGE_SEQUENCE + idx) * 4;
+                const int64_t base = (b * dimensions.image_sequence + idx) * 4;
                 img_ids[base + 0] = 0;
                 img_ids[base + 1] = h;
                 img_ids[base + 2] = w;
@@ -237,6 +237,8 @@ private:
 class PostprocessStage
 {
 public:
+    Flux2Dimensions dimensions;
+
     void BindInput(const char* name, din::common::TensorBuffer<float>& tensor)
     {
         if (std::string_view{name} == "hidden_states")
@@ -285,15 +287,15 @@ public:
                 throw std::runtime_error("PostprocessStage CUDA path requires an ORT sync stream");
             }
             const size_t postprocess_count = static_cast<size_t>(LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-                                             static_cast<size_t>(LATENT_HEIGHT * PATCH_SIZE) *
-                                             static_cast<size_t>(LATENT_WIDTH * PATCH_SIZE);
+                static_cast<size_t>(dimensions.latent_height * PATCH_SIZE) *
+                static_cast<size_t>(dimensions.latent_width * PATCH_SIZE);
             launch_flux_postprocess_kernel(
                 reinterpret_cast<cudaStream_t>(stream->GetHandle()),
                 hidden_states_->BindingValue().GetTensorMutableData<float>(),
                 decoder_input_->BindingValue().GetTensorMutableData<float>(),
                 bn_mean_->BindingValue().GetTensorMutableData<float>(),
                 bn_std_->BindingValue().GetTensorMutableData<float>(), static_cast<unsigned int>(LATENT_CHANNELS),
-                static_cast<unsigned int>(LATENT_HEIGHT), static_cast<unsigned int>(LATENT_WIDTH),
+                static_cast<unsigned int>(dimensions.latent_height), static_cast<unsigned int>(dimensions.latent_width),
                 static_cast<unsigned int>(PATCH_SIZE), static_cast<unsigned int>(PATCH_SIZE), postprocess_count);
             return;
         }
@@ -308,11 +310,12 @@ public:
         float* scratch = scratch_->HostData();
         float* decoder_input = decoder_input_->HostData();
 
-        constexpr int HW = static_cast<int>(LATENT_HEIGHT * LATENT_WIDTH);
-        unpack_latents_with_ids(hidden, scratch, LATENT_HEIGHT, LATENT_WIDTH, LATENT_CHANNELS);
+        const int HW = static_cast<int>(dimensions.latent_height * dimensions.latent_width);
+        unpack_latents_with_ids(hidden, scratch, dimensions.latent_height, dimensions.latent_width, LATENT_CHANNELS);
         denormalize_latents(scratch, bn_mean_->HostData(), bn_std_->HostData(), LATENT_CHANNELS, HW);
-        unpatchify_latents(scratch, decoder_input, 1, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE, LATENT_HEIGHT,
-                           LATENT_WIDTH, PATCH_SIZE, PATCH_SIZE);
+        unpatchify_latents(scratch, decoder_input, 1, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
+                           dimensions.latent_height,
+                           dimensions.latent_width, PATCH_SIZE, PATCH_SIZE);
         if (device_is_cuda)
         {
             auto decoder_input_uploaded = decoder_input_->CopyAsyncToDeviceWithNotification();
@@ -343,6 +346,8 @@ struct FluxPipeline
 
 struct CudaPipelineState
 {
+    Flux2Dimensions dimensions;
+
     explicit CudaPipelineState(Ort::Env& environment)
         : env(environment)
     {
@@ -482,6 +487,8 @@ Ort::ConstEpDevice find_cpu_device(Ort::Env& env)
 void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const Flux2Config& config,
                    ExecutionProviderMode provider_mode, SamplingBackend sampling_backend)
 {
+    state.dimensions = Flux2Dimensions(config);
+    state.postprocess.dimensions = state.dimensions;
     const bool trt_rtx_device = is_trt_rtx_device(ep_device);
     const bool cpu_device = is_cpu_device(ep_device);
     const bool has_separate_binding = !cpu_device;
@@ -533,11 +540,11 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
     state.timestep = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, timestep_shape,
                                                                         has_separate_binding);
 
-    std::vector<int64_t> hidden_shape = {BATCH_SIZE, TRANSFORMER_HIDDEN_DIM, LATENT_CHANNELS};
+    std::vector<int64_t> hidden_shape = {BATCH_SIZE, state.dimensions.image_sequence, LATENT_CHANNELS};
     state.hidden_states = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, hidden_shape,
                                                                              has_separate_binding);
 
-    std::vector<int64_t> img_ids_shape = {BATCH_SIZE, IMAGE_SEQUENCE, 4};
+    std::vector<int64_t> img_ids_shape = {BATCH_SIZE, state.dimensions.image_sequence, 4};
     state.img_ids = std::make_unique<din::common::TensorBuffer<int64_t>>(state.env, state.ep_device, compute_stream_ptr, img_ids_shape,
                                                                          has_separate_binding);
 
@@ -549,11 +556,12 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
                                                                                   hidden_shape, has_separate_binding);
 
     std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
+        state.dimensions.latent_height * PATCH_SIZE, state.dimensions.latent_width * PATCH_SIZE
+    };
     state.decoder_latent = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr,
                                                                               dec_latent_shape, has_separate_binding);
 
-    std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH};
+    std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, state.dimensions.height, state.dimensions.width};
     state.decoded_image = std::make_unique<din::common::TensorBuffer<float>>(state.env, state.ep_device, compute_stream_ptr, image_shape,
                                                                              has_separate_binding);
 
@@ -566,7 +574,7 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
 
     std::vector<int64_t> img_ids_cpu(state.img_ids->BindingValue().GetTensorTypeAndShapeInfo().GetElementCount());
     std::vector<int64_t> txt_ids_cpu(state.txt_ids->BindingValue().GetTensorTypeAndShapeInfo().GetElementCount());
-    fill_position_ids(img_ids_cpu, txt_ids_cpu);
+    fill_position_ids(img_ids_cpu, txt_ids_cpu, state.dimensions);
     std::copy(img_ids_cpu.begin(), img_ids_cpu.end(), state.img_ids->HostData());
     std::copy(txt_ids_cpu.begin(), txt_ids_cpu.end(), state.txt_ids->HostData());
 
@@ -579,7 +587,7 @@ void initialize_ep(CudaPipelineState& state, Ort::ConstEpDevice ep_device, const
         txt_ids_ready.Sync();
     }
 
-    state.time_schedule = MakeFlux2Schedule(config.steps);
+    state.time_schedule = MakeFlux2Schedule(config.steps, state.dimensions.image_sequence);
 
     state.euler.BindInput("hidden_states", *state.hidden_states);
     state.euler.BindInput("sample", *state.transformer_output);
@@ -626,7 +634,7 @@ static void update_cuda_models(CudaPipelineState& state, const Flux2Config& conf
             upload_cuda_prompt(state, config);
             return binding;
         });
-    auto transformer_profile = state.model_profile;
+    auto transformer_profile = Flux2TransformerProfile(state.model_profile);
     if (!config.transformer.initial_weight_streaming_budget.empty())
         transformer_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
                                                           config.transformer.initial_weight_streaming_budget);
@@ -635,8 +643,8 @@ static void update_cuda_models(CudaPipelineState& state, const Flux2Config& conf
         [&](Ort::Session& session) { return BindFlux2Model(session, {{"hidden_states", &state.hidden_states->BindingValue()}, {"encoder_hidden_states", &state.text_encoder_embeds->BindingValue()}, {"timestep", &state.timestep->BindingValue()}, {"img_ids", &state.img_ids->BindingValue()}, {"txt_ids", &state.txt_ids->BindingValue()}}, {{"sample", &state.transformer_output->BindingValue()}}); }))
         state.applied_budget.reset();
     ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io,
-        state.env, provider, stream, state.model_profile, [&](Ort::Session& session)
-        {
+                     state.env, provider, stream, Flux2VaeProfile(state.model_profile), [&](Ort::Session& session)
+                     {
             auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_latent->BindingValue()}}, {{"sample", &state.decoded_image->BindingValue()}});
             const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
             std::copy_n(stats.mean.data(), LATENT_CHANNELS, state.bn_mean->HostData());
@@ -684,11 +692,12 @@ Flux2Image run_initialized_pipeline(CudaPipelineState& state, unsigned int seed,
             const auto stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr->GetHandle());
             din::common::GenerateNormalCudaPacked(
                 stream, state.hidden_states->BindingValue().GetTensorMutableData<float>(), hidden_count, seed,
-                LATENT_CHANNELS, LATENT_HEIGHT * LATENT_WIDTH, true);
+                LATENT_CHANNELS, state.dimensions.latent_height * state.dimensions.latent_width, true);
         }
         else
             initialize_cpu_latent(state.hidden_states->HostData(), hidden_count, seed, rng,
-                                  BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH);
+                                  BATCH_SIZE, LATENT_CHANNELS, state.dimensions.latent_height,
+                                  state.dimensions.latent_width);
         if (state.binding_is_cuda && rng != din::common::Rng::CudaPhilox)
         {
             auto hidden_uploaded = state.hidden_states->CopyAsyncToDeviceWithNotification();
@@ -701,8 +710,8 @@ Flux2Image run_initialized_pipeline(CudaPipelineState& state, unsigned int seed,
     state.prompt_embeds_valid = true;
 
     Flux2Image image;
-    image.height = static_cast<int>(IMAGE_HEIGHT);
-    image.width = static_cast<int>(IMAGE_WIDTH);
+    image.height = static_cast<int>(state.dimensions.height);
+    image.width = static_cast<int>(state.dimensions.width);
     image.data.resize(state.decoded_image->BindingValue().GetTensorTypeAndShapeInfo().GetElementCount());
     if (state.binding_is_cuda)
     {
@@ -768,8 +777,9 @@ public:
     void UpdateModels(const Flux2Config& requested) override
     {
         if (!state_) throw std::runtime_error("Pipeline resources are not initialized");
-        if (requested.processing != config_.processing || requested.provider != config_.provider)
-            throw std::invalid_argument("Changing processing backend or provider requires a new pipeline");
+        if (requested.processing != config_.processing || requested.provider != config_.provider ||
+            requested.width != config_.width || requested.height != config_.height)
+            throw std::invalid_argument("Changing processing backend, provider, or resolution requires a new pipeline");
         // Keep the previous prompt until SetPrompt decides whether embeddings can be reused.
         const auto previous_prompt = config_.prompt;
         config_ = requested;
@@ -815,7 +825,8 @@ public:
         }
         const din::common::Rng rng = options.rng.value_or(config_.rng);
         ValidateFlux2Rng(rng, config_.processing);
-        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps));
+        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps),
+                                                  state_->dimensions.image_sequence);
         const std::string budget = options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
         const std::string& previous = state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
         if (budget != previous)

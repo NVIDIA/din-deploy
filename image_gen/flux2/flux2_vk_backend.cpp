@@ -432,7 +432,7 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
                       VkCommandBuffer cmd_postprocess, ComputePipelineResources& euler_shader,
                       ComputePipelineResources& postprocess_shader, VulkanBuffer& hidden_states_buf,
                       VulkanBuffer& transformer_output_buf, VulkanBuffer& decoder_latent_buf, StagingBuffer& staging,
-                      bool encode_prompt, Flux2Telemetry& telemetry)
+                      bool encode_prompt, Flux2Telemetry& telemetry, const Flux2Dimensions& dimensions)
 {
     nvtx3::scoped_range nvtx_pipeline("run_pipeline");
 
@@ -563,12 +563,12 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
                                 1, &postprocess_shader.descriptorSet, 0, nullptr);
         PostprocessPushConstants pp_pc{};
         pp_pc.C = static_cast<uint32_t>(LATENT_CHANNELS);
-        pp_pc.I = static_cast<uint32_t>(LATENT_HEIGHT);
-        pp_pc.J = static_cast<uint32_t>(LATENT_WIDTH);
+        pp_pc.I = static_cast<uint32_t>(dimensions.latent_height);
+        pp_pc.J = static_cast<uint32_t>(dimensions.latent_width);
         pp_pc.pi = static_cast<uint32_t>(PATCH_SIZE);
         pp_pc.pj = static_cast<uint32_t>(PATCH_SIZE);
         pp_pc.total_elements = static_cast<uint32_t>((LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-                                                     (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
+            (dimensions.latent_height * PATCH_SIZE) * (dimensions.latent_width * PATCH_SIZE));
         vkCmdPushConstants(cmd_postprocess, postprocess_shader.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            sizeof(pp_pc), &pp_pc);
         vkCmdDispatch(cmd_postprocess, (pp_pc.total_elements + 255) / 256, 1, 1);
@@ -596,6 +596,8 @@ uint64_t run_pipeline(Ort::Session& text_encoder_session, Ort::Session& transfor
 
 struct VkPipelineState
 {
+    Flux2Dimensions dimensions;
+
     explicit VkPipelineState(Ort::Env& environment)
         : env(environment)
     {
@@ -711,6 +713,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     {
         throw std::runtime_error("Vulkan processing requires --provider trt-rtx");
     }
+    state.dimensions = Flux2Dimensions(config);
     state.use_cig = config.processing == Flux2ProcessingBackend::VkCig;
 
 
@@ -798,14 +801,14 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         state.tensor_importer->create_tensor(state.timestep_buf, timestep_shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
     // Transformer hidden states (GPU)
-    std::vector<int64_t> hidden_shape = {BATCH_SIZE, TRANSFORMER_HIDDEN_DIM, LATENT_CHANNELS};
+    std::vector<int64_t> hidden_shape = {BATCH_SIZE, state.dimensions.image_sequence, LATENT_CHANNELS};
     state.hidden_states = state.vk->createExternalBuffer(shape_numel(hidden_shape) * sizeof(float));
     state.hidden_count = shape_numel(hidden_shape);
     state.hidden_states_tensor =
         state.tensor_importer->create_tensor(state.hidden_states, hidden_shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
     // Position IDs (GPU — uploaded once, never change)
-    std::vector<int64_t> img_ids_shape = {BATCH_SIZE, IMAGE_SEQUENCE, 4};
+    std::vector<int64_t> img_ids_shape = {BATCH_SIZE, state.dimensions.image_sequence, 4};
     state.img_ids_buf = state.vk->createExternalBuffer(shape_numel(img_ids_shape) * sizeof(int64_t));
     state.img_ids_tensor =
         state.tensor_importer->create_tensor(state.img_ids_buf, img_ids_shape, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
@@ -822,13 +825,14 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
 
     // VAE decoder input (GPU)
     std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
+        state.dimensions.latent_height * PATCH_SIZE, state.dimensions.latent_width * PATCH_SIZE
+    };
     state.decoder_latent = state.vk->createExternalBuffer(shape_numel(dec_latent_shape) * sizeof(float));
     state.decoder_input_tensor = state.tensor_importer->create_tensor(state.decoder_latent, dec_latent_shape,
                                                                       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
     // VAE decoder output (GPU — downloaded to CPU for image saving)
-    std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH};
+    std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, state.dimensions.height, state.dimensions.width};
     state.decoded_image_bytes = shape_numel(image_shape) * sizeof(float);
     state.decoded_image_buf = state.vk->createExternalBuffer(state.decoded_image_bytes);
     state.decoded_image_tensor =
@@ -912,10 +916,10 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
         for (int64_t b = 0; b < BATCH_SIZE; ++b)
         {
             int64_t idx = 0;
-            for (int64_t h = 0; h < LATENT_HEIGHT; ++h)
-                for (int64_t w = 0; w < LATENT_WIDTH; ++w, ++idx)
+            for (int64_t h = 0; h < state.dimensions.latent_height; ++h)
+                for (int64_t w = 0; w < state.dimensions.latent_width; ++w, ++idx)
                 {
-                    int64_t base = (b * IMAGE_SEQUENCE + idx) * 4;
+                    int64_t base = (b * state.dimensions.image_sequence + idx) * 4;
                     img_ids_cpu[base + 0] = 0;
                     img_ids_cpu[base + 1] = h;
                     img_ids_cpu[base + 2] = w;
@@ -952,7 +956,7 @@ static void initialize_vk_state(VkPipelineState& state, const Flux2Config& confi
     // -----------------------------------------------------------------
     // Initial time schedule; generation options can replace it per image.
     // -----------------------------------------------------------------
-    state.time_schedule = MakeFlux2Schedule(config.steps);
+    state.time_schedule = MakeFlux2Schedule(config.steps, state.dimensions.image_sequence);
 
     // -----------------------------------------------------------------
     // Load prompt tokens & upload to GPU (once for all images)
@@ -1000,7 +1004,7 @@ static void update_vk_models(VkPipelineState& state, const Flux2Config& config)
             upload_vk_prompt(state, config);
             return binding;
         });
-    auto transformer_profile = state.model_profile;
+    auto transformer_profile = Flux2TransformerProfile(state.model_profile);
     if (!config.transformer.initial_weight_streaming_budget.empty())
         transformer_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
                                                           config.transformer.initial_weight_streaming_budget);
@@ -1009,8 +1013,8 @@ static void update_vk_models(VkPipelineState& state, const Flux2Config& config)
         [&](Ort::Session& session) { return BindFlux2Model(session, {{"hidden_states", &state.hidden_states_tensor}, {"encoder_hidden_states", &state.text_encoder_embeds_tensor}, {"timestep", &state.timestep_tensor}, {"img_ids", &state.img_ids_tensor}, {"txt_ids", &state.txt_ids_tensor}}, {{"sample", &state.transformer_output_tensor}}); }))
         state.applied_budget.reset();
     ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io,
-        state.env, provider, stream, state.model_profile, [&](Ort::Session& session)
-        {
+                     state.env, provider, stream, Flux2VaeProfile(state.model_profile), [&](Ort::Session& session)
+                     {
             auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_input_tensor}}, {{"sample", &state.decoded_image_tensor}});
             const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
             for (const auto& upload : {std::pair{&state.bn_mean_buf, stats.mean.data()},
@@ -1035,7 +1039,7 @@ static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed, din::c
                                  VK_CHECK(vkQueueWaitIdle(state.vk->queue));
                              });
     initialize_cpu_latent(static_cast<float*>(state.staging.mapped), state.hidden_count, seed, rng,
-                          BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH);
+                          BATCH_SIZE, LATENT_CHANNELS, state.dimensions.latent_height, state.dimensions.latent_width);
 
     const uint64_t vae_done = run_pipeline(
         state.text_encoder_runner->session, state.transformer_runner->session, state.vae_decoder_runner->session,
@@ -1043,7 +1047,7 @@ static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed, din::c
         *state.vk, *state.sync_semaphore, *state.sync_stream, state.cmd_upload_lat, state.cmd_bufs_time.data(),
         state.cmd_bufs_euler.data(), state.cmd_postprocess, state.euler_shader, state.postprocess_shader,
         state.hidden_states, state.transformer_output, state.decoder_latent, state.staging, !state.prompt_embeds_valid,
-        telemetry);
+        telemetry, state.dimensions);
     state.prompt_embeds_valid = true;
 
     vkResetCommandBuffer(state.cmd_download, 0);
@@ -1059,8 +1063,8 @@ static Flux2Image run_vk_image(VkPipelineState& state, unsigned int seed, din::c
     state.sync_semaphore->wait_vulkan(state.vk->device, download_done);
 
     Flux2Image image;
-    image.height = static_cast<int>(IMAGE_HEIGHT);
-    image.width = static_cast<int>(IMAGE_WIDTH);
+    image.height = static_cast<int>(state.dimensions.height);
+    image.width = static_cast<int>(state.dimensions.width);
     image.data.resize(state.decoded_image_bytes / sizeof(float));
     std::copy_n(static_cast<const float*>(state.staging.mapped), image.data.size(), image.data.data());
     image.timings = telemetry.Finish();
@@ -1093,8 +1097,9 @@ public:
     void UpdateModels(const Flux2Config& requested) override
     {
         if (!state_) throw std::runtime_error("Pipeline resources are not initialized");
-        if (requested.processing != config_.processing || requested.provider != config_.provider)
-            throw std::invalid_argument("Changing processing backend or provider requires a new pipeline");
+        if (requested.processing != config_.processing || requested.provider != config_.provider ||
+            requested.width != config_.width || requested.height != config_.height)
+            throw std::invalid_argument("Changing processing backend, provider, or resolution requires a new pipeline");
         // Keep the previous prompt until SetPrompt decides whether embeddings can be reused.
         const auto previous_prompt = config_.prompt;
         config_ = requested;
@@ -1140,7 +1145,8 @@ public:
         }
         const din::common::Rng rng = options.rng.value_or(config_.rng);
         ValidateFlux2Rng(rng, config_.processing);
-        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps));
+        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps),
+                                                  state_->dimensions.image_sequence);
         const std::string budget = options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
         const std::string& previous = state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
         if (budget != previous)

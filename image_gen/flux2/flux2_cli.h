@@ -6,6 +6,7 @@
 #include "rng.h"
 
 #include <filesystem>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -83,6 +84,7 @@ struct Flux2TransformerConfig : Flux2ModelConfig
 
 struct Flux2VaeConfig : Flux2ModelConfig
 {
+    bool small_decoder = false;
     std::filesystem::path latent_stats_path;
     bool operator==(const Flux2VaeConfig&) const = default;
 };
@@ -102,12 +104,39 @@ struct Flux2Config
     Flux2TransformerConfig transformer;
     Flux2VaeConfig vae;
     int steps = 4;
+    int width = 1024;
+    int height = 1024;
     std::filesystem::path output_path;
     std::string prompt;
     unsigned int seed = 42;
     // CPU standard noise, CUDA Philox, or CPU Philox with fixed H100 SXM5 ordering.
     din::common::Rng rng = din::common::Rng::CpuStd;
     unsigned int num_images = 5;
+};
+
+inline bool IsFlux2ResolutionValid(int width, int height)
+{
+    return width >= 32 && height >= 32 && width <= 3840 && height <= 2160 &&
+        width % 16 == 0 && height % 16 == 0;
+}
+
+struct Flux2Dimensions
+{
+    int64_t width = 1024;
+    int64_t height = 1024;
+    int64_t latent_width = 64;
+    int64_t latent_height = 64;
+    int64_t image_sequence = 4096;
+
+    Flux2Dimensions() = default;
+
+    explicit Flux2Dimensions(const Flux2Config& config)
+        : width(config.width), height(config.height), latent_width(width / 16),
+          latent_height(height / 16), image_sequence(latent_width * latent_height)
+    {
+        if (!IsFlux2ResolutionValid(config.width, config.height))
+            throw std::invalid_argument("Resolution must be a multiple of 16 from 32x32 through 3840x2160");
+    }
 };
 
 struct Flux2GenerationOptions

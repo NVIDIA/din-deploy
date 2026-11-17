@@ -84,6 +84,8 @@ bool IsFlux2BackendAvailable(Flux2ProcessingBackend backend)
 
 void ValidateFlux2Config(const Flux2Config& config)
 {
+    if (!IsFlux2ResolutionValid(config.width, config.height))
+        throw std::invalid_argument("Resolution must be a multiple of 16 from 32x32 through 3840x2160");
     if (!IsFlux2BackendAvailable(config.processing))
         throw std::invalid_argument("Selected processing backend was not built");
     if (config.provider == Flux2ExecutionProvider::Cpu && config.processing != Flux2ProcessingBackend::Cpu)

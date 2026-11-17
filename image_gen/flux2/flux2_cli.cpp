@@ -189,6 +189,8 @@ Flux2Config parse_args(int argc, char* argv[])
         .metavar("cpu-std|cuda-philox|cpu-philox")
         .help("Noise generator: cpu-std (default), cuda-philox (CUDA only), or cpu-philox (fixed H100 SXM5 ordering).");
     parser.add_argument("--encoder").default_value(std::string("4b")).help("4b or translator.");
+    parser.add_argument("--decoder").default_value(std::string("full")).choices("full", "small")
+          .help("VAE decoder: full or small.");
     parser.add_argument("--steps").default_value(std::string("4")).help("Denoise steps, 1 through 50.");
     parser.add_argument("--ws")
         .default_value(std::string("off"))
@@ -230,6 +232,7 @@ Flux2Config parse_args(int argc, char* argv[])
     if (encoder != "4b" && encoder != "translator")
         throw std::invalid_argument("--encoder must be 4b or translator");
     config.text_encoder.variant = encoder == "4b" ? Flux2TextEncoder::Qwen3_4B : Flux2TextEncoder::Qwen3_06BTranslator;
+    config.vae.small_decoder = parser.get<std::string>("--decoder") == "small";
     const auto steps = parse_uint(parser.get<std::string>("--steps"), "--steps");
     if (steps < 1 || steps > 50)
         throw std::invalid_argument("--steps must be 1 through 50");

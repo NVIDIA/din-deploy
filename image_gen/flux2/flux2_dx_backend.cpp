@@ -291,7 +291,7 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
                             DxPostprocessPipeline& postprocess_pipeline, OrtD3D12Fence& sync_fence,
                             Ort::SyncStream& ort_stream, DxBuffer& timestep_buf, DxBuffer& hidden_states,
                             DxBuffer& transformer_output, DxBuffer& decoder_latent, DxBuffer& bn_mean, DxBuffer& bn_std,
-                            bool encode_prompt, Flux2Telemetry& telemetry)
+                            bool encode_prompt, Flux2Telemetry& telemetry, const Flux2Dimensions& dimensions)
 {
     Ort::RunOptions transformer_options;
     transformer_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
@@ -347,12 +347,12 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
     telemetry.Begin("decode", &Flux2Timings::decode_ms);
     DxPostprocessConstants constants{};
     constants.C = static_cast<uint32_t>(LATENT_CHANNELS);
-    constants.I = static_cast<uint32_t>(LATENT_HEIGHT);
-    constants.J = static_cast<uint32_t>(LATENT_WIDTH);
+    constants.I = static_cast<uint32_t>(dimensions.latent_height);
+    constants.J = static_cast<uint32_t>(dimensions.latent_width);
     constants.pi = static_cast<uint32_t>(PATCH_SIZE);
     constants.pj = static_cast<uint32_t>(PATCH_SIZE);
     constants.total_elements = static_cast<uint32_t>((LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE) *
-                                                     (LATENT_HEIGHT * PATCH_SIZE) * (LATENT_WIDTH * PATCH_SIZE));
+        (dimensions.latent_height * PATCH_SIZE) * (dimensions.latent_width * PATCH_SIZE));
 
     postprocess_pipeline.dispatch(dx, hidden_states, decoder_latent, bn_mean, bn_std, constants);
     const uint64_t postprocess_done = sync_fence.signal_d3d12(dx.queue.Get());
@@ -365,6 +365,8 @@ static void run_pipeline_dx(Ort::Session& text_encoder_session, Ort::Session& tr
 
 struct DxPipelineState
 {
+    Flux2Dimensions dimensions;
+
     DxPipelineState(Ort::Env& environment, uint64_t ort_luid)
         : dx(ort_luid)
         , env(environment)
@@ -457,6 +459,7 @@ struct DxPipelineState
 
 static void initialize_dx_state(DxPipelineState& state, const Flux2Config& config, Ort::ConstEpDevice trt_device)
 {
+    state.dimensions = Flux2Dimensions(config);
     state.use_cig = config.processing == Flux2ProcessingBackend::DxCig;
     if (config.provider != Flux2ExecutionProvider::TrtRtx)
     {
@@ -504,12 +507,13 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
     std::vector<int64_t> attn_mask_shape = {BATCH_SIZE, SEQUENCE_LENGTH};
     std::vector<int64_t> te_out_shape = {BATCH_SIZE, SEQUENCE_LENGTH, TEXT_ENCODER_EMBED_DIM};
     std::vector<int64_t> timestep_shape = {BATCH_SIZE};
-    std::vector<int64_t> hidden_shape = {BATCH_SIZE, TRANSFORMER_HIDDEN_DIM, LATENT_CHANNELS};
-    std::vector<int64_t> img_ids_shape = {BATCH_SIZE, IMAGE_SEQUENCE, 4};
+    std::vector<int64_t> hidden_shape = {BATCH_SIZE, state.dimensions.image_sequence, LATENT_CHANNELS};
+    std::vector<int64_t> img_ids_shape = {BATCH_SIZE, state.dimensions.image_sequence, 4};
     std::vector<int64_t> txt_ids_shape = {BATCH_SIZE, SEQUENCE_LENGTH, 4};
     std::vector<int64_t> dec_latent_shape = {BATCH_SIZE, LATENT_CHANNELS / PATCH_SIZE / PATCH_SIZE,
-                                             LATENT_HEIGHT * PATCH_SIZE, LATENT_WIDTH * PATCH_SIZE};
-    std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH};
+        state.dimensions.latent_height * PATCH_SIZE, state.dimensions.latent_width * PATCH_SIZE
+    };
+    std::vector<int64_t> image_shape = {BATCH_SIZE, IMAGE_CHANNELS, state.dimensions.height, state.dimensions.width};
 
     state.token_buf = state.dx.create_shared_default_buffer(shape_numel(token_shape) * sizeof(int64_t));
     state.attn_mask_buf = state.dx.create_shared_default_buffer(shape_numel(attn_mask_shape) * sizeof(int64_t));
@@ -566,11 +570,11 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         for (int64_t b = 0; b < BATCH_SIZE; ++b)
         {
             int64_t idx = 0;
-            for (int64_t h = 0; h < LATENT_HEIGHT; ++h)
+            for (int64_t h = 0; h < state.dimensions.latent_height; ++h)
             {
-                for (int64_t w = 0; w < LATENT_WIDTH; ++w, ++idx)
+                for (int64_t w = 0; w < state.dimensions.latent_width; ++w, ++idx)
                 {
-                    int64_t base = (b * IMAGE_SEQUENCE + idx) * 4;
+                    int64_t base = (b * state.dimensions.image_sequence + idx) * 4;
                     img_ids_cpu[base + 0] = 0;
                     img_ids_cpu[base + 1] = h;
                     img_ids_cpu[base + 2] = w;
@@ -597,7 +601,7 @@ static void initialize_dx_state(DxPipelineState& state, const Flux2Config& confi
         state.dx.record_upload(state.txt_ids_buf, txt_ids_cpu.data(), state.txt_ids_buf.size);
     }
 
-    state.time_schedule = MakeFlux2Schedule(config.steps);
+    state.time_schedule = MakeFlux2Schedule(config.steps, state.dimensions.image_sequence);
 
     state.dx.execute();
     const uint64_t static_uploads_done = state.sync_fence->signal_d3d12(state.dx.queue.Get());
@@ -641,7 +645,7 @@ static void update_dx_models(DxPipelineState& state, const Flux2Config& config)
             upload_dx_prompt(state, config);
             return binding;
         });
-    auto transformer_profile = state.model_profile;
+    auto transformer_profile = Flux2TransformerProfile(state.model_profile);
     if (!config.transformer.initial_weight_streaming_budget.empty())
         transformer_profile.extra_ep_options.emplace_back("nv_weight_streaming_budget",
                                                           config.transformer.initial_weight_streaming_budget);
@@ -650,8 +654,8 @@ static void update_dx_models(DxPipelineState& state, const Flux2Config& config)
         [&](Ort::Session& session) { return BindFlux2Model(session, {{"hidden_states", &state.hidden_states_tensor}, {"encoder_hidden_states", &state.text_encoder_embeds_tensor}, {"timestep", &state.timestep_tensor}, {"img_ids", &state.img_ids_tensor}, {"txt_ids", &state.txt_ids_tensor}}, {{"sample", &state.transformer_output_tensor}}); }))
         state.applied_budget.reset();
     ReloadFlux2Stage("VAE", config.vae, state.loaded.vae, state.vae_decoder_runner, state.vae_decoder_io,
-        state.env, provider, stream, state.model_profile, [&](Ort::Session& session)
-        {
+                     state.env, provider, stream, Flux2VaeProfile(state.model_profile), [&](Ort::Session& session)
+                     {
             auto binding = BindFlux2Model(session, {{"latent_sample", &state.decoder_input_tensor}}, {{"sample", &state.decoded_image_tensor}});
             const auto stats = LoadFlux2LatentStats(config.vae.latent_stats_path, LATENT_CHANNELS);
             state.dx.begin();
@@ -676,7 +680,7 @@ static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed, din::c
                              });
     std::vector<float> latent_cpu(state.hidden_count);
     initialize_cpu_latent(latent_cpu.data(), latent_cpu.size(), seed, rng,
-                          BATCH_SIZE, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH);
+                          BATCH_SIZE, LATENT_CHANNELS, state.dimensions.latent_height, state.dimensions.latent_width);
     state.dx.begin();
     state.dx.record_upload(state.hidden_states, latent_cpu.data(), state.hidden_states.size);
     state.dx.execute();
@@ -688,15 +692,15 @@ static Flux2Image run_dx_image(DxPipelineState& state, unsigned int seed, din::c
                     *state.vae_decoder_io, state.time_schedule, state.dx, *state.euler_pipeline,
                     *state.postprocess_pipeline, *state.sync_fence, *state.sync_stream, state.timestep_buf,
                     state.hidden_states, state.transformer_output, state.decoder_latent, state.bn_mean_buf,
-                    state.bn_std_buf, !state.prompt_embeds_valid, telemetry);
+                    state.bn_std_buf, !state.prompt_embeds_valid, telemetry, state.dimensions);
     state.prompt_embeds_valid = true;
 
     state.dx.readback(state.decoded_image_buf, state.readback_buffer, state.decoded_image_bytes);
     void* mapped = state.dx.map(state.readback_buffer);
     const float* image_data = static_cast<const float*>(mapped);
     Flux2Image image;
-    image.height = static_cast<int>(IMAGE_HEIGHT);
-    image.width = static_cast<int>(IMAGE_WIDTH);
+    image.height = static_cast<int>(state.dimensions.height);
+    image.width = static_cast<int>(state.dimensions.width);
     image.data.resize(state.decoded_image_bytes / sizeof(float));
     std::copy_n(image_data, image.data.size(), image.data.data());
     state.dx.unmap(state.readback_buffer);
@@ -732,8 +736,9 @@ public:
     void UpdateModels(const Flux2Config& requested) override
     {
         if (!state_) throw std::runtime_error("Pipeline resources are not initialized");
-        if (requested.processing != config_.processing || requested.provider != config_.provider)
-            throw std::invalid_argument("Changing processing backend or provider requires a new pipeline");
+        if (requested.processing != config_.processing || requested.provider != config_.provider ||
+            requested.width != config_.width || requested.height != config_.height)
+            throw std::invalid_argument("Changing processing backend, provider, or resolution requires a new pipeline");
         // Keep the previous prompt until SetPrompt decides whether embeddings can be reused.
         const auto previous_prompt = config_.prompt;
         config_ = requested;
@@ -779,7 +784,8 @@ public:
         }
         const din::common::Rng rng = options.rng.value_or(config_.rng);
         ValidateFlux2Rng(rng, config_.processing);
-        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps));
+        state_->time_schedule = MakeFlux2Schedule(options.steps.value_or(config_.steps),
+                                                  state_->dimensions.image_sequence);
         const std::string budget = options.weight_streaming_budget.value_or(config_.transformer.initial_weight_streaming_budget);
         const std::string& previous = state_->applied_budget ? *state_->applied_budget : config_.transformer.initial_weight_streaming_budget;
         if (budget != previous)

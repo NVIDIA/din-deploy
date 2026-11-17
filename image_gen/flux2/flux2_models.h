@@ -16,6 +16,10 @@ struct Flux2TensorBinding
 std::unique_ptr<Ort::IoBinding> BindFlux2Model(Ort::Session& session,
     std::initializer_list<Flux2TensorBinding> inputs, std::initializer_list<Flux2TensorBinding> outputs);
 
+// Shared across selected resolutions so compiled engines and contexts are reused.
+din::common::ModelProfile Flux2TransformerProfile(din::common::ModelProfile profile);
+din::common::ModelProfile Flux2VaeProfile(din::common::ModelProfile profile);
+
 struct Flux2LoadedModels
 {
     std::optional<Flux2TextEncoderConfig> text_encoder;
