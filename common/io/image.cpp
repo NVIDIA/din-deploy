@@ -4,7 +4,9 @@
 #include "image.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 
@@ -74,6 +76,46 @@ RgbImage LoadPng(const std::filesystem::path& path)
     if (error)
         throw std::runtime_error("failed to load PNG " + path.string() + ": " + lodepng_error_text(error));
     return image;
+}
+
+RgbImageView LoadPng(const std::filesystem::path& path, std::span<uint8_t> destination)
+{
+    std::vector<uint8_t> compressed, native;
+    lodepng::State state;
+    state.decoder.color_convert = 0;
+    uint32_t width = 0, height = 0;
+    unsigned error = lodepng::load_file(compressed, path.string());
+    if (!error)
+        error = lodepng_inspect(&width, &height, &state, compressed.data(), compressed.size());
+    if (!error && ImageSize(width, height, 3) > destination.size())
+        throw std::invalid_argument("PNG exceeds destination capacity: " + path.string());
+    if (!error)
+        error = lodepng::decode(native, width, height, state, compressed);
+    if (!error)
+    {
+        lodepng::State rgb;
+        rgb.info_raw.colortype = LCT_RGB;
+        rgb.info_raw.bitdepth = 8;
+        error = lodepng_convert(destination.data(), native.data(), &rgb.info_raw,
+                                &state.info_png.color, width, height);
+    }
+    if (error)
+        throw std::runtime_error("failed to load PNG " + path.string() + ": " + lodepng_error_text(error));
+    return {width, height, destination.first(ImageSize(width, height, 3))};
+}
+
+std::pair<uint32_t, uint32_t> ReadPngSize(const std::filesystem::path& path)
+{
+    std::array<uint8_t, 33> header{};
+    std::ifstream file(path, std::ios::binary);
+    file.read(reinterpret_cast<char*>(header.data()), header.size());
+    lodepng::State state;
+    uint32_t width = 0, height = 0;
+    const unsigned error = lodepng_inspect(&width, &height, &state, header.data(), size_t(file.gcount()));
+    if (error)
+        throw std::runtime_error("failed to read PNG size " + path.string() + ": " + lodepng_error_text(error));
+    ImageSize(width, height, 3);
+    return {width, height};
 }
 
 void SaveRgbPng(const std::filesystem::path& path, const uint8_t* rgb, uint32_t width, uint32_t height)

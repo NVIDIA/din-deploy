@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "sam_kernels.h"
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "sam_precision.h"
 #include <cmath>
 #include <stdexcept>
 
@@ -62,8 +62,9 @@ namespace din::sam::detail
             return ((m.next_slot - 1 - (m.history_count - 1) + (history_index - 1) + 15) % 15) + 1;
         }
 
-        __global__ void PackSpatial(const TemporalMeta* state, const float* ring, const float* embeddings,
-                                    float* mi, float* mip, float* mem, float* mp, bool* valid)
+        template <class T>
+        __global__ void PackSpatial(const TemporalMeta* state, const T* ring, const float* embeddings,
+                                    T* mi, T* mip, T* mem, T* mp, bool* valid)
         {
             const auto& m = *state;
             const size_t n = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -81,9 +82,9 @@ namespace din::sam::detail
                 const int t = age >= 7 ? 6 : (i == 0 ? 6 - int(age) : int(age) - 1);
                 const size_t offset = size_t(slot) * Sam3Entry + size_t(channel) * 5184 + pixel;
                 a = ring[offset];
-                b = ring[offset + Feature] + embeddings[t * 256 + channel];
+                b = float(ring[offset + Feature]) + embeddings[t * 256 + channel];
                 c = ring[offset + 2 * Feature];
-                d = ring[offset + 3 * Feature] + embeddings[t * 256 + channel];
+                d = float(ring[offset + 3 * Feature]) + embeddings[t * 256 + channel];
             }
             mi[n] = a;
             mip[n] = b;
@@ -91,9 +92,10 @@ namespace din::sam::detail
             mp[n] = d;
         }
 
-        __global__ void PackPointers(const TemporalMeta* state, const float* ring, const float* weights,
+        template <class T>
+        __global__ void PackPointers(const TemporalMeta* state, const T* ring, const float* weights,
                                      const float* bias,
-                                     float* pointers, float* positions, bool* valid, float* object_valid)
+                                     T* pointers, T* positions, bool* valid, T* object_valid)
         {
             const auto& m = *state;
             const int i = blockIdx.x, c = threadIdx.x;
@@ -119,24 +121,26 @@ namespace din::sam::detail
             for (int o = 0; o < 16; ++o)
             {
                 const size_t n = (size_t(i) * 16 + o) * 256 + c;
-                pointers[n] = active ? ring[size_t(slot) * Sam3Entry + 4 * Feature + o * 256 + c] : 0;
+                pointers[n] = active ? float(ring[size_t(slot) * Sam3Entry + 4 * Feature + o * 256 + c]) : 0;
                 positions[n] = value;
             }
         }
 
-        __global__ void Decide(const TemporalMeta* state, const float* seed_valid, Decision* result)
+        template <class T>
+        __global__ void Decide(const TemporalMeta* state, const T* seed_valid, Decision* result)
         {
             bool any = false;
-            for (int i = 0; i < 16; ++i) any = any || seed_valid[i] > 0;
+            for (int i = 0; i < 16; ++i) any = any || float(seed_valid[i]) > 0;
             result->seed = !state->initialized;
             result->commit = state->initialized || any;
             result->slot = state->initialized ? state->next_slot : 0;
         }
 
-        __global__ void CommitFeatures(const TemporalMeta* state, float* ring, const Decision* decision,
-                                       const float* image, const float* position, const float* sm, const float* sp,
-                                       const float* so,
-                                       const float* sv, const float* tm, const float* tp, const float* to)
+        template <class T>
+        __global__ void CommitFeatures(const TemporalMeta* state, T* ring, const Decision* decision,
+                                       const T* image, const T* position, const T* sm, const T* sp,
+                                       const T* so,
+                                       const T* sv, const T* tm, const T* tp, const T* to)
         {
             const size_t n = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
             if (n >= Sam3Entry || !decision->commit) return;
@@ -149,22 +153,23 @@ namespace din::sam::detail
             else
             {
                 const size_t p = n - 4 * Feature;
-                const float active = seed ? sv[p / 256] : state->valid[p / 256];
-                value = active > 0 ? (seed ? so : to)[p] : 0;
+                const float active = seed ? float(sv[p / 256]) : state->valid[p / 256];
+                value = active > 0 ? float((seed ? so : to)[p]) : 0;
             }
             ring[size_t(decision->slot) * Sam3Entry + n] = value;
         }
 
+        template <class T>
         __global__ void CommitMasks(const TemporalMeta* state, const Decision* decision,
-                                    const float* sv, const float* sm, const float* sl, const float* tm, const float* tl,
+                                    const T* sv, const T* sm, const T* sl, const T* tm, const T* tl,
                                     float* masks, float* valid, float* scores, float* logits)
         {
             const size_t n = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
             if (n >= 16 * 288 * 288) return;
             int object = int(n / (288 * 288));
             float logit = decision->seed ? sl[object] : tl[object];
-            float active = decision->seed ? sv[object] : state->valid[object];
-            masks[n] = decision->commit && active > 0 ? (decision->seed ? sm : tm)[n] : -1024.f;
+            float active = decision->seed ? float(sv[object]) : state->valid[object];
+            masks[n] = decision->commit && active > 0 ? float((decision->seed ? sm : tm)[n]) : -1024.f;
             if (n % (288 * 288) == 0)
             {
                 valid[object] = decision->commit && active > 0 && logit > 0 ? 1.f : 0.f;
@@ -173,7 +178,8 @@ namespace din::sam::detail
             }
         }
 
-        __global__ void Finish(TemporalMeta* state, const Decision* decision, const float* seed_valid)
+        template <class T>
+        __global__ void Finish(TemporalMeta* state, const Decision* decision, const T* seed_valid)
         {
             if (decision->commit)
             {
@@ -194,44 +200,48 @@ namespace din::sam::detail
             ++state->step;
         }
 
-        __global__ void Scores(const float* classes, const float* presence, const int* selected, const float* valid,
+        template <class T>
+        __global__ void Scores(const T* classes, const T* presence, const int* selected, const T* valid,
                                float* scores, float* logits,
-                               const float* boxes, float* output_boxes, int width, int height)
+                               const T* boxes, float* output_boxes, int width, int height)
         {
             int i = threadIdx.x;
             if (i < 16)
             {
-                const float score = valid[i] > 0 && selected[i] >= 0
-                                        ? Sigmoid(classes[selected[i]]) * Sigmoid(presence[0])
+                const float score = float(valid[i]) > 0 && selected[i] >= 0
+                                        ? Sigmoid(float(classes[selected[i]])) * Sigmoid(float(presence[0]))
                                         : 0;
                 scores[i] = score;
                 logits[i] = score <= 0 ? -1024.f : score >= 1 ? 1024.f : logf(score / (1 - score));
                 for (int k = 0; k < 4; ++k)
-                    output_boxes[i * 4 + k] = valid[i] > 0 && selected[i] >= 0
-                                                  ? boxes[selected[i] * 4 + k] * (k % 2
+                    output_boxes[i * 4 + k] = float(valid[i]) > 0 && selected[i] >= 0
+                                                  ? float(boxes[selected[i] * 4 + k]) * (k % 2
                                                           ? height
                                                           : width)
                                                   : 0;
             }
         }
 
-        __global__ void Result2(const void* logits, const void* presence, bool half, float* masks, float* valid,
+        template <class T>
+        __global__ void Result2(const T* logits, const T* presence, float* masks, float* valid,
                                 float* scores, float* output_logits)
         {
             const int i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i < 256 * 256)
-                masks[i] = half
-                               ? __half2float(static_cast<const __half*>(logits)[i])
-                               : static_cast<const float*>(logits)[i];
+            if (i < 256 * 256) masks[i] = float(logits[i]);
             if (i == 0)
             {
-                const float score = half
-                                        ? __half2float(*static_cast<const __half*>(presence))
-                                        : *static_cast<const float*>(presence);
+                const float score = float(presence[0]);
                 valid[0] = 1;
                 scores[0] = Sigmoid(score);
                 output_logits[0] = score;
             }
+        }
+
+        template <class T>
+        __global__ void ToFloat(const T* src, float* dst, size_t count)
+        {
+            const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+            if (i < count) dst[i] = float(src[i]);
         }
 
         __global__ void Validity(bool* valid, int active)
@@ -318,56 +328,94 @@ namespace din::sam::detail
         Check();
     }
 
-    void PreprocessSam2(const uint8_t* rgb, int w, int h, void* image, bool half, void* stream)
+    void PreprocessSam2(const uint8_t* rgb, int w, int h, void* image, ModelPrecision precision, void* stream)
     {
-        const dim3 grid(64, 64), block(16, 16);
-        if (half)
-            Preprocess<<<grid,block,0,static_cast<cudaStream_t>(stream)>>
-                >(rgb, w, h, static_cast<__half*>(image));
-        else Preprocess<<<grid,block,0,static_cast<cudaStream_t>(stream)>>>(rgb, w, h, static_cast<float*>(image));
+        DispatchModelPrecision(precision, [&]<class T>
+        {
+            Preprocess<<<dim3(64, 64),dim3(16, 16),0,static_cast<cudaStream_t>(stream)>>>(
+                rgb, w, h, static_cast<T*>(image));
+        });
         Check();
     }
 
-    void PackSam3(const TemporalMeta* m, const float* ring, const float* embeddings, const float* weights,
-                  const float* bias,
-                  float* mi, float* mip, float* mem, float* mp, float* pointers, float* positions, bool* mv, bool* pv,
-                  float* ov, void* stream)
+    void PackSam3(const TemporalMeta* m, const void* ring, const float* embeddings, const float* weights,
+                  const float* bias, void* mi, void* mip, void* mem, void* mp, void* pointers, void* positions,
+                  bool* mv, bool* pv, void* ov, ModelPrecision precision, void* stream)
     {
         auto s = static_cast<cudaStream_t>(stream);
-        PackSpatial<<<(7 * Feature + 255) / 256,256,0,s>>>(m, ring, embeddings, mi, mip, mem, mp, mv);
-        PackPointers<<<16,256,0,s>>>(m, ring, weights, bias, pointers, positions, pv, ov);
+        DispatchModelPrecision(precision, [&]<class T>
+        {
+            PackSpatial<<<(7 * Feature + 255) / 256,256,0,s>>>(m, static_cast<const T*>(ring), embeddings,
+                                                               static_cast<T*>(mi), static_cast<T*>(mip),
+                                                               static_cast<T*>(mem), static_cast<T*>(mp), mv);
+            PackPointers<<<16,256,0,s>>>(m, static_cast<const T*>(ring), weights, bias,
+                                         static_cast<T*>(pointers), static_cast<T*>(positions), pv,
+                                         static_cast<T*>(ov));
+        });
         Check();
     }
 
-    void CommitSam3(TemporalMeta* m, float* ring, Decision* decision, const float* image, const float* pos,
-                    const float* sm, const float* sp, const float* so, const float* sv, const float* masks,
-                    const float* sl,
-                    const float* tm, const float* tp, const float* to, const float* tmask, const float* tl,
-                    float* output, float* valid, float* scores, float* logits, void* stream)
+    void CommitSam3(TemporalMeta* m, void* ring, Decision* decision, const void* image, const void* pos,
+                    const void* sm, const void* sp, const void* so, const void* sv, const void* masks, const void* sl,
+                    const void* tm, const void* tp, const void* to, const void* tmask, const void* tl,
+                    float* output, float* valid, float* scores, float* logits, ModelPrecision precision, void* stream)
     {
         auto s = static_cast<cudaStream_t>(stream);
-        Decide<<<1,1,0,s>>>(m, sv, decision);
-        CommitFeatures<<<(Sam3Entry + 255) / 256,256,0,s>>>(m, ring, decision, image, pos, sm, sp, so, sv, tm, tp, to);
-        CommitMasks<<<(16 * 288 * 288 + 255) / 256,256,0,s>>>(m, decision, sv, masks, sl, tmask, tl, output, valid,
-                                                              scores, logits);
-        Finish<<<1,1,0,s>>>(m, decision, sv);
+        DispatchModelPrecision(precision, [&]<class T>
+        {
+            auto seed_valid = static_cast<const T*>(sv);
+            Decide<<<1,1,0,s>>>(m, seed_valid, decision);
+            CommitFeatures<<<(Sam3Entry + 255) / 256,256,0,s>>>(m, static_cast<T*>(ring), decision,
+                                                                static_cast<const T*>(image),
+                                                                static_cast<const T*>(pos), static_cast<const T*>(sm),
+                                                                static_cast<const T*>(sp), static_cast<const T*>(so),
+                                                                seed_valid,
+                                                                static_cast<const T*>(tm), static_cast<const T*>(tp),
+                                                                static_cast<const T*>(to));
+            CommitMasks<<<(16 * 288 * 288 + 255) / 256,256,0,s>>>(m, decision, seed_valid, static_cast<const T*>(masks),
+                                                                  static_cast<const T*>(sl),
+                                                                  static_cast<const T*>(tmask),
+                                                                  static_cast<const T*>(tl), output, valid, scores,
+                                                                  logits);
+            Finish<<<1,1,0,s>>>(m, decision, seed_valid);
+        });
         Check();
     }
 
-    void DetectionScores(const float* classes, const float* presence, const int* selected, const float* valid,
-                         float* scores, float* logits,
-                         const float* boxes, float* output_boxes, int width, int height, void* stream)
+    void DetectionScores(const void* classes, const void* presence, const int* selected, const void* valid,
+                         float* scores, float* logits, const void* boxes, float* output_boxes,
+                         int width, int height, ModelPrecision precision, void* stream)
     {
-        Scores<<<1,16,0,static_cast<cudaStream_t>(stream)>>>(classes, presence, selected, valid, scores, logits, boxes,
-                                                             output_boxes, width, height);
+        DispatchModelPrecision(precision, [&]<class T>
+        {
+            Scores<<<1,16,0,static_cast<cudaStream_t>(stream)>>>(static_cast<const T*>(classes),
+                                                                 static_cast<const T*>(presence), selected,
+                                                                 static_cast<const T*>(valid), scores, logits,
+                                                                 static_cast<const T*>(boxes), output_boxes, width,
+                                                                 height);
+        });
         Check();
     }
 
-    void Sam2Result(const void* logits, const void* presence, bool half, float* masks, float* valid, float* scores,
-                    float* output_logits, void* stream)
+    void Sam2Result(const void* logits, const void* presence, ModelPrecision precision, float* masks,
+                    float* valid, float* scores, float* output_logits, void* stream)
     {
-        Result2<<<256,256,0,static_cast<cudaStream_t>(stream)>>>(logits, presence, half, masks, valid, scores,
-                                                                 output_logits);
+        DispatchModelPrecision(precision, [&]<class T>
+        {
+            Result2<<<256,256,0,static_cast<cudaStream_t>(stream)>>>(static_cast<const T*>(logits),
+                                                                     static_cast<const T*>(presence), masks, valid,
+                                                                     scores, output_logits);
+        });
+        Check();
+    }
+
+    void ModelToFloat(const void* src, float* dst, size_t count, ModelPrecision precision, void* stream)
+    {
+        DispatchModelPrecision(precision, [&]<class T>
+        {
+            ToFloat<<<(count + 255) / 256,256,0,static_cast<cudaStream_t>(stream)>>>(
+                static_cast<const T*>(src), dst, count);
+        });
         Check();
     }
 

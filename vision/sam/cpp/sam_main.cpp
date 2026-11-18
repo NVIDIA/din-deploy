@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -39,12 +40,10 @@ namespace
               , state_(runtime.AcquireState())
               , initialization_{std::move(prompt), count, false}
               , validity_(runtime.MaxObjects())
-              , scores_(runtime.MaxObjects())
-              , boxes_(runtime.MaxObjects() * 4)
         {
         }
 
-        void Run(const din::io::RgbImage& image, bool tracking)
+        void Run(const din::io::RgbImageView& image, bool tracking)
         {
             probabilities_.resize(size_t(runtime_.MaxObjects()) * image.width * image.height);
             din::sam::FrameView frame;
@@ -59,8 +58,6 @@ namespace
             output.memory = din::sam::MemoryLocation::Host;
             output.format = din::sam::MaskFormat::Probabilities;
             output.validity = validity_.data();
-            output.scores = scores_.data();
-            output.detection_boxes = boxes_.data();
             const auto* previous = tracking && started_ ? state_.get() : nullptr;
             initialization_.tracking = tracking;
             auto submitted = runtime_.RunFrame(frame, output, *state_, previous, &initialization_);
@@ -68,7 +65,7 @@ namespace
             started_ = tracking;
         }
 
-        din::sam3::FrameResult Result(const din::io::RgbImage& image, bool detector_boxes) const
+        din::sam3::FrameResult Result(const din::io::RgbImageView& image) const
         {
             din::sam3::FrameResult result{image.width, image.height, {}};
             const size_t pixels = size_t(image.width) * image.height;
@@ -78,28 +75,8 @@ namespace
                     continue;
                 din::sam3::Instance instance;
                 instance.id = uint32_t(i + 1);
-                instance.score = scores_[i];
                 instance.probabilities.assign(probabilities_.begin() + i * pixels,
                                               probabilities_.begin() + (i + 1) * pixels);
-                std::array<float, 4> box{float(image.width), float(image.height), 0, 0};
-                for (size_t p = 0; p < pixels; ++p)
-                {
-                    const float value = instance.probabilities[p];
-                    if (!std::isfinite(value) || value < 0 || value > 1)
-                        throw std::runtime_error("SAM produced invalid probabilities");
-                    if (value > .5f)
-                    {
-                        const float x = float(p % image.width), y = float(p / image.width);
-                        box[0] = std::min(box[0], x);
-                        box[1] = std::min(box[1], y);
-                        box[2] = std::max(box[2], x + 1);
-                        box[3] = std::max(box[3], y + 1);
-                    }
-                }
-                if (detector_boxes)
-                    std::copy_n(boxes_.data() + i * 4, 4, instance.box.data());
-                else if (box[2] > 0)
-                    instance.box = box;
                 result.instances.push_back(std::move(instance));
             }
             return result;
@@ -118,7 +95,7 @@ namespace
         din::sam::Sam& runtime_;
         din::sam::StateLease state_;
         din::sam::Initialization initialization_;
-        std::vector<float> probabilities_, validity_, scores_, boxes_;
+        std::vector<float> probabilities_, validity_;
         bool started_ = false;
     };
 } // namespace
@@ -144,29 +121,20 @@ int main(int argc, char** argv)
               .default_value(.5f)
               .scan<'g', float>()
               .help("SAM3 detection confidence threshold; mask probabilities are thresholded at 0.5.");
-        parser.add_argument("--track").default_value(false).implicit_value(true).help(
-            "Propagate recurrent state (SAM3 tracking is experimental).");
-        parser.add_argument("--framewise")
+        parser.add_argument("--tracking").default_value(std::string{"temporal"}).choices("temporal", "none").help(
+            "temporal propagates recurrent state between frames (default, SAM3 tracking is experimental); "
+            "none segments each frame independently.");
+        parser.add_argument("--no-dump-masks")
               .default_value(false)
               .implicit_value(true)
-              .help("Segment each frame independently.");
-        parser.add_argument("--dump-masks")
-              .default_value(false)
-              .implicit_value(true)
-              .help("Write combined/instance PNGs, label NPYs and instance JSON for both families.");
+              .help("Skip per-instance mask PNGs; run.json is still written.");
         parser.add_argument("--max-frames").default_value(0).scan<'i', int>();
-        parser.add_argument("--warmup").default_value(0).scan<'i', int>();
-        parser.add_argument("--repeat").default_value(1).scan<'i', int>();
-        parser.add_argument("--diagnostic-dir").default_value(std::string{});
-        parser.add_argument("--diagnostic-decoder").default_value(std::string{});
-        parser.add_argument("--diagnostic-graph-dir").default_value(std::string{});
         parser.parse_args(argc, argv);
 
         const std::string family = parser.get<std::string>("--model");
         const bool sam2 = family == "sam2";
-        const bool track = parser.get<bool>("--track"), framewise = parser.get<bool>("--framewise");
-        const bool dump = parser.get<bool>("--dump-masks");
-        const int warmup = parser.get<int>("--warmup"), repeat = parser.get<int>("--repeat");
+        const bool track = parser.get<std::string>("--tracking") == "temporal";
+        const bool dump = !parser.get<bool>("--no-dump-masks");
         const int maximum = parser.get<int>("--max-frames");
         const auto prompt_path = parser.present<std::string>("--prompt");
         const auto text = parser.present<std::string>("--text");
@@ -174,10 +142,8 @@ int main(int argc, char** argv)
             throw std::invalid_argument("SAM2 requires --prompt and SAM3 requires --text; do not combine them");
         if (text && text->find_first_not_of(" \t\r\n") == std::string::npos)
             throw std::invalid_argument("SAM3 text prompt is empty");
-        if (warmup < 0 || repeat < 1 || maximum < 0)
-            throw std::invalid_argument("warmup/max-frames must be nonnegative and repeat must be positive");
-        if (track && (framewise || repeat != 1))
-            throw std::invalid_argument("Tracking requires repeat=1 and cannot use --framewise");
+        if (maximum < 0)
+            throw std::invalid_argument("max-frames must be nonnegative");
 
         din::sam::SamConfig config;
         config.model = sam2 ? din::sam::ModelFamily::Sam2 : din::sam::ModelFamily::Sam3;
@@ -186,28 +152,22 @@ int main(int argc, char** argv)
         config.provider = parser.get<std::string>("--provider");
         config.device = parser.get<int>("--device");
         config.confidence_threshold = parser.get<float>("--threshold");
-        config.diagnostic_dir = parser.get<std::string>("--diagnostic-dir");
-        config.diagnostic_decoder = parser.get<std::string>("--diagnostic-decoder");
-        config.diagnostic_graph_dir = parser.get<std::string>("--diagnostic-graph-dir");
         if (config.device < 0 || !std::isfinite(config.confidence_threshold) || config.confidence_threshold < 0 ||
             config.confidence_threshold > 1)
             throw std::invalid_argument("device must be nonnegative and threshold must be between 0 and 1");
-        if (sam2 && (parser.is_used("--threshold") || !config.diagnostic_dir.empty() ||
-            !config.diagnostic_decoder.empty() || !config.diagnostic_graph_dir.empty()))
-            throw std::invalid_argument("threshold and diagnostic options require --model sam3");
+        if (sam2 && parser.is_used("--threshold"))
+            throw std::invalid_argument("--threshold requires --model sam3");
 
         const auto input_start = Clock::now();
         const fs::path input = parser.get<std::string>("input"), output = parser.get<std::string>("output");
-        if (fs::is_directory(input) && !track && !framewise)
-            throw std::invalid_argument("Frame folders require --track or --framewise");
         const auto frames = din::sam2::ResolveInputFrames(input, size_t(maximum));
-        const auto first = din::io::LoadPng(frames.front());
+        const auto [first_width, first_height] = din::io::ReadPngSize(frames.front());
         din::sam::Prompt prompt;
         if (sam2)
         {
             const auto metadata = din::sam2::LoadSam2Config(config.model_dir / "metadata.json");
             config.max_source_width = config.max_source_height = int(metadata.max_input_size);
-            auto points = din::sam2::LoadPrompt(*prompt_path, first.height, first.width, metadata.image_size);
+            auto points = din::sam2::LoadPrompt(*prompt_path, first_height, first_width, metadata.image_size);
             if (points.labels.size() != size_t(metadata.max_points))
                 throw std::invalid_argument("SAM2 prompt count does not match exported model");
             prompt.coordinates = std::move(points.coords);
@@ -218,7 +178,7 @@ int main(int argc, char** argv)
             config.max_source_width = config.max_source_height = 8192;
             prompt.text = *text;
         }
-        if (first.width > uint32_t(config.max_source_width) || first.height > uint32_t(config.max_source_height))
+        if (first_width > uint32_t(config.max_source_width) || first_height > uint32_t(config.max_source_height))
             throw std::invalid_argument("Input exceeds the model's maximum source dimensions");
         fs::create_directories(output);
         const double input_setup = Seconds(input_start);
@@ -230,47 +190,74 @@ int main(int argc, char** argv)
         auto prepared = runtime.PreparePrompt(prompt);
         FrameProcessor processor(runtime, std::move(prepared), frames.size());
         const double prompt_setup = Seconds(started);
-        started = Clock::now();
-        for (int i = 0; i < warmup; ++i)
-            processor.Run(first, false);
-        const double warmup_seconds = Seconds(started);
 
         std::vector<double> latency;
+        double output_overhead = 0;
         auto records = json::array();
+        // One owned result in flight bounds memory and overlaps PNG encoding with
+        // the next frame. get() propagates write failures before run.json is saved.
+        std::future<double> pending_write;
+        size_t pending_frame = 0;
+        const auto finish_write = [&]
+        {
+            if (pending_write.valid())
+            {
+                din::common::nvtx_scoped_range wait{"sam.cli.WaitForWriter"};
+                records[pending_frame]["output_seconds"] =
+                    records[pending_frame]["output_seconds"].get<double>() + pending_write.get();
+            }
+        };
         const auto processing_start = Clock::now();
         for (size_t frame = 0; frame < frames.size(); ++frame)
         {
             din::common::nvtx_scoped_range trace{"sam.cli.Frame"};
             started = Clock::now();
-            const auto image = frame == 0 ? first : din::io::LoadPng(frames[frame]);
+            const auto image = [&]
+            {
+                din::common::nvtx_scoped_range load{"sam.cli.LoadPng"};
+                return din::io::LoadPng(frames[frame], runtime.HostInputBuffer());
+            }();
             const double load_seconds = Seconds(started);
             if (image.width > uint32_t(config.max_source_width) || image.height > uint32_t(config.max_source_height))
                 throw std::invalid_argument("Input exceeds the model's maximum source dimensions");
-            std::vector<double> frame_latency;
-            for (int i = 0; i < repeat; ++i)
-            {
-                started = Clock::now();
-                processor.Run(image, track);
-                const double elapsed = Seconds(started);
-                frame_latency.push_back(elapsed);
-                latency.push_back(elapsed);
-            }
+            started = Clock::now();
+            processor.Run(image, track);
+            const double inference_seconds = Seconds(started);
+            latency.push_back(inference_seconds);
             const size_t instances = processor.InstanceCount();
             started = Clock::now();
+            finish_write();
+            const double output_wait = Seconds(started);
+            started = Clock::now();
             if (dump)
-                din::sam3::SaveResult(processor.Result(image, !sam2 && !track), output, frame);
-            const double output_seconds = Seconds(started);
+            {
+                din::common::nvtx_scoped_range snapshot{"sam.cli.SnapshotAndSubmitWriter"};
+                pending_write = std::async(std::launch::async,
+                                           [result = processor.Result(image), output, frame]
+                                           {
+                                               din::common::nvtx_scoped_range write{"sam.cli.WriteMasks"};
+                                               const auto write_start = Clock::now();
+                                               din::sam3::SaveResult(result, output, frame);
+                                               return Seconds(write_start);
+                                           });
+                pending_frame = frame;
+            }
+            const double output_snapshot = Seconds(started);
+            output_overhead += output_wait + output_snapshot;
             records.push_back({
                 {"frame_index", frame},
                 {"source", frames[frame].filename().string()},
                 {"instances", instances},
                 {"load_seconds", load_seconds},
-                {"inference_seconds", frame_latency},
-                {"output_seconds", output_seconds}
+                {"inference_seconds", inference_seconds},
+                {"output_seconds", output_snapshot},
+                {"output_wait_seconds", output_wait}
             });
             std::cout << "Frame " << frame + 1 << '/' << frames.size() << ": " << instances << " instances\n";
         }
-        const double processing = Seconds(processing_start);
+        const double processing = Seconds(processing_start) - output_overhead;
+        finish_write();
+        const double wall = Seconds(processing_start);
         const double inference = std::accumulate(latency.begin(), latency.end(), 0.);
         const double mean = inference / latency.size();
         const double fps = processing > 0 ? frames.size() / processing : 0;
@@ -281,9 +268,9 @@ int main(int argc, char** argv)
             {"model_dir", fs::absolute(config.model_dir).string()},
             {"cache_dir", fs::absolute(config.cache_dir).string()},
             {
-                "mode", track
+                "mode", track && frames.size() > 1
                             ? (sam2 ? "tracking" : "experimental_tracking")
-                            : framewise
+                            : frames.size() > 1
                             ? "independent_frames"
                             : "image"
             },
@@ -293,21 +280,20 @@ int main(int argc, char** argv)
             {"session_load_seconds", session_load},
             {"prompt_setup_seconds", prompt_setup},
             {"initialization_seconds", session_load + prompt_setup},
-            {"warmup_iterations", warmup},
-            {"warmup_seconds", warmup_seconds},
-            {"repeat", repeat},
             {"inference_seconds", latency},
             {"mean_inference_seconds", mean},
             {"processing_seconds", processing},
             {"processing_fps", fps},
+            {"wall_seconds", wall},
+            {"wall_fps", wall > 0 ? frames.size() / wall : 0},
             {"frames", records},
             {
                 "timing_scope", "Host wall time; inference includes upload, mask resize/download and completion. "
-                "Processing includes frame I/O and repeats; excludes input setup (including first "
-                "PNG decode), initialization, warmup and report writing."
-            },
-            {"diagnostic_graph_dir", config.diagnostic_graph_dir.string()},
-            {"diagnostic_decoder", config.diagnostic_decoder.string()}
+                "Processing includes every PNG decode and frame I/O; excludes input setup, initialization, "
+                "output snapshot/submission and writer waits. PNG writing overlaps processing; output_seconds "
+                "includes snapshot/submission plus worker time, so frame times are not additive. "
+                "Wall time includes writer waits and the final drain; excludes initialization and report writing."
+            }
         };
         if (sam2)
             report["prompt"] = fs::absolute(*prompt_path).string();
@@ -320,8 +306,8 @@ int main(int argc, char** argv)
         report_file.exceptions(std::ios::failbit | std::ios::badbit);
         report_file << report.dump(2) << '\n';
         std::cout << std::fixed << std::setprecision(3) << "Session load: " << session_load
-            << " s\nPrompt setup: " << prompt_setup << " s\nWarmup: " << warmup_seconds
-            << " s\nMean inference: " << mean << " s\nProcessing: " << processing << " s (" << fps << " FPS)\n";
+            << " s\nPrompt setup: " << prompt_setup << " s\nMean inference: " << mean
+            << " s\nProcessing: " << processing << " s (" << fps << " FPS)\n";
         return 0;
     }
     catch (const std::exception& error)

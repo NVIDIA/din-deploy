@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "sam3_cuda.h"
 #include "sam3_nvtx.h"
+#include "sam_precision.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdexcept>
@@ -13,8 +14,9 @@ namespace din::sam3
         constexpr int Size = 1008;
         __device__ float Probability(float x) { return x >= 0 ? 1.f / (1.f + expf(-x)) : expf(x) / (1.f + expf(x)); }
 
-        __global__ void Select(const float* classes, const float* presence, int queries, float threshold,
-                               int* selected, float* valid, int* error)
+        template <class T>
+        __global__ void Select(const T* classes, const T* presence, int queries, float threshold,
+                               int* selected, T* valid, int* error)
         {
             int count = 0;
             for (int i = 0; i < 16; ++i)
@@ -22,19 +24,19 @@ namespace din::sam3
                 selected[i] = -1;
                 valid[i] = 0;
             }
-            if (!isfinite(presence[0]))
+            if (!isfinite(float(presence[0])))
             {
                 *error = 2;
                 return;
             }
             for (int i = 0; i < queries; ++i)
             {
-                if (!isfinite(classes[i]))
+                if (!isfinite(float(classes[i])))
                 {
                     *error = 2;
                     continue;
                 }
-                if (Probability(classes[i]) * Probability(presence[0]) <= threshold) continue;
+                if (Probability(float(classes[i])) * Probability(float(presence[0])) <= threshold) continue;
                 if (count < 16)
                 {
                     selected[count] = i;
@@ -53,12 +55,13 @@ namespace din::sam3
             }
         }
 
-        __global__ void Gather(const float* masks, const int* selected, float* packed)
+        template <class T>
+        __global__ void Gather(const T* masks, const int* selected, T* packed)
         {
             int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= 16 * 288 * 288) return;
             int slot = i / (288 * 288), query = selected[slot];
-            packed[i] = query < 0 ? -1000.f : masks[query * 288 * 288 + i % (288 * 288)];
+            packed[i] = query < 0 ? -1000.f : float(masks[query * 288 * 288 + i % (288 * 288)]);
         }
 
         __global__ void ClearPointers(float* pointers, const float* valid)
@@ -156,13 +159,14 @@ namespace din::sam3
             for (int sx = first; sx < last; ++sx)
             {
                 const float w = fmaxf(0.f, 1.f - fabsf((sx + .5f - center) / support));
-                sum += source[y * stride + sx * 3 + c] * w;
+                sum += float(source[y * stride + sx * 3 + c]) * w;
                 weight += w;
             }
             output[i] = sum / weight;
         }
 
-        __global__ void Vertical(const float* source, int height, float* output)
+        template <class T>
+        __global__ void Vertical(const float* source, int height, T* output)
         {
             const int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= Size * Size * 3) return;
@@ -175,13 +179,14 @@ namespace din::sam3
             for (int sy = first; sy < last; ++sy)
             {
                 const float w = fmaxf(0.f, 1.f - fabsf((sy + .5f - center) / support));
-                sum += source[(sy * Size + x) * 3 + c] * w;
+                sum += float(source[(sy * Size + x) * 3 + c]) * w;
                 weight += w;
             }
             output[i] = float(__float2int_rn(fminf(255.f, fmaxf(0.f, sum / weight)))) / 127.5f - 1.f;
         }
 
-        __global__ void ResizeMask(const float* source, int mw, int mh, float* output, int width, int height,
+        template <class T>
+        __global__ void ResizeMask(const T* source, int mw, int mh, T* output, int width, int height,
                                    bool binary)
         {
             const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -190,8 +195,8 @@ namespace din::sam3
             const float y = fmaxf(0.f, (i / width + .5f) * mh / height - .5f);
             const int x0 = min(int(x), mw - 1), x1 = min(x0 + 1, mw - 1);
             const int y0 = min(int(y), mh - 1), y1 = min(y0 + 1, mh - 1);
-            const float a = source[y0 * mw + x0] * (1.f - (x - x0)) + source[y0 * mw + x1] * (x - x0);
-            const float b = source[y1 * mw + x0] * (1.f - (x - x0)) + source[y1 * mw + x1] * (x - x0);
+            const float a = float(source[y0 * mw + x0]) * (1.f - (x - x0)) + float(source[y0 * mw + x1]) * (x - x0);
+            const float b = float(source[y1 * mw + x0]) * (1.f - (x - x0)) + float(source[y1 * mw + x1]) * (x - x0);
             const float value = a * (1.f - (y - y0)) + b * (y - y0);
             output[i] = binary
                             ? (value > 0 ? 1.f : 0.f)
@@ -200,7 +205,8 @@ namespace din::sam3
                             : expf(value) / (1.f + expf(value));
         }
 
-        __global__ void ConsolidateSeedMasks(const float* logits, const float* valid, float* output)
+        template <class T>
+        __global__ void ConsolidateSeedMasks(const T* logits, const T* valid, T* output)
         {
             constexpr int Size = 1008, Low = 288, Pixels = Size * Size;
             const int p = blockIdx.x * blockDim.x + threadIdx.x;
@@ -214,10 +220,12 @@ namespace din::sam3
             for (int slot = 0; slot < 16; ++slot)
             {
                 values[slot] = -1024.f;
-                if (valid[slot] <= 0) continue;
-                const float* source = logits + slot * Low * Low;
-                const float a = source[y0 * Low + x0] * (1.f - (x - x0)) + source[y0 * Low + x1] * (x - x0);
-                const float b = source[y1 * Low + x0] * (1.f - (x - x0)) + source[y1 * Low + x1] * (x - x0);
+                if (float(valid[slot]) <= 0) continue;
+                const T* source = logits + slot * Low * Low;
+                const float a = float(source[y0 * Low + x0]) * (1.f - (x - x0)) + float(source[y0 * Low + x1]) * (x -
+                    x0);
+                const float b = float(source[y1 * Low + x0]) * (1.f - (x - x0)) + float(source[y1 * Low + x1]) * (x -
+                    x0);
                 values[slot] = a * (1.f - (y - y0)) + b * (y - y0);
                 if (values[slot] > best)
                 {
@@ -309,7 +317,7 @@ namespace din::sam3
     }
 
     void PreprocessDeviceRgb(const uint8_t* input, int width, int height, std::ptrdiff_t row_bytes,
-                             float* scratch, float* output, void* stream)
+                             float* scratch, void* output, void* stream, sam::detail::ModelPrecision precision)
     {
         TraceRange horizontal{"kernel.Horizontal"};
         Horizontal<<<(height * Size * 3 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -318,28 +326,37 @@ namespace din::sam3
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         horizontal.Stop();
         TraceRange vertical{"kernel.Vertical"};
-        Vertical<<<(Size * Size * 3 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(scratch, height, output);
+        sam::detail::DispatchModelPrecision(precision, [&]<class T>
+        {
+            Vertical<<<(Size * Size * 3 + 255) / 256,256,0,static_cast<cudaStream_t>(stream)>>>(
+                scratch, height, static_cast<T*>(output));
+        });
         status = cudaGetLastError();
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     }
 
-    void ResizeMaskProbability(const float* logits, int mask_width, int mask_height,
-                               float* probabilities, int width, int height, void* stream, bool binary)
+    void ResizeMaskProbability(const void* logits, int mw, int mh, void* output, int width, int height,
+                               void* stream, bool binary, sam::detail::ModelPrecision precision)
     {
-        TraceRange trace{"kernel.ResizeMask"};
-        ResizeMask<<<(width * height + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-            logits, mask_width, mask_height, probabilities, width, height, binary);
-        const auto status = cudaGetLastError();
-        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        sam::detail::DispatchModelPrecision(precision, [&]<class T>
+        {
+            ResizeMask<<<(width * height + 255) / 256,256,0,static_cast<cudaStream_t>(stream)>>>(
+                static_cast<const T*>(logits), mw, mh, static_cast<T*>(output), width, height, binary);
+        });
+        const auto e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
     }
 
-    void PrepareSeedMemoryMasks(const float* logits, const float* valid, float* consolidated, void* stream)
+    void PrepareSeedMemoryMasks(const void* logits, const void* valid, void* output, void* stream,
+                                sam::detail::ModelPrecision precision)
     {
-        TraceRange trace{"kernel.ConsolidateSeedMasks"};
-        ConsolidateSeedMasks<<<(1008 * 1008 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-            logits, valid, consolidated);
-        const auto status = cudaGetLastError();
-        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        sam::detail::DispatchModelPrecision(precision, [&]<class T>
+        {
+            ConsolidateSeedMasks<<<(1008 * 1008 + 255) / 256,256,0,static_cast<cudaStream_t>(stream)>>>(
+                static_cast<const T*>(logits), static_cast<const T*>(valid), static_cast<T*>(output));
+        });
+        const auto e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
     }
 
     void PackTemporalFeatures(const float* source, float* destination, const float* temporal, void* stream)
@@ -351,22 +368,29 @@ namespace din::sam3
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     }
 
-    void SelectQueries(const float* classes, const float* presence, int queries, float threshold,
-                       int* selected, float* valid, int* error, void* stream)
+    void SelectQueries(const void* classes, const void* presence, int queries, float threshold,
+                       int* selected, void* valid, int* error, void* stream, sam::detail::ModelPrecision precision)
     {
-        TraceRange trace{"kernel.Select"};
-        Select<<<1,1,0,static_cast<cudaStream_t>(stream)>>>(classes, presence, queries, threshold, selected, valid,
-                                                            error);
-        const auto s = cudaGetLastError();
-        if (s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s));
+        sam::detail::DispatchModelPrecision(precision, [&]<class T>
+        {
+            Select<<<1,1,0,static_cast<cudaStream_t>(stream)>>>(static_cast<const T*>(classes),
+                                                                static_cast<const T*>(presence), queries, threshold,
+                                                                selected, static_cast<T*>(valid), error);
+        });
+        const auto e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
     }
 
-    void GatherMasks(const float* masks, const int* selected, float* packed, void* stream)
+    void GatherMasks(const void* masks, const int* selected, void* packed, void* stream,
+                     sam::detail::ModelPrecision precision)
     {
-        TraceRange trace{"kernel.Gather"};
-        Gather<<<(16 * 288 * 288 + 255) / 256,256,0,static_cast<cudaStream_t>(stream)>>>(masks, selected, packed);
-        const auto s = cudaGetLastError();
-        if (s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s));
+        sam::detail::DispatchModelPrecision(precision, [&]<class T>
+        {
+            Gather<<<(16 * 288 * 288 + 255) / 256,256,0,static_cast<cudaStream_t>(stream)>>>(
+                static_cast<const T*>(masks), selected, static_cast<T*>(packed));
+        });
+        const auto e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
     }
 
     void MaskPointers(float* pointers, const float* valid, void* stream)

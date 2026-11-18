@@ -138,10 +138,6 @@ def specialize_fixtures(path: Path, family: str) -> None:
             inputs[name] = np.pad(inputs[name], ((0, (16 - p) * 16), (0, 0), (0, 0)))
         inputs["pointer_valid"] = np.arange(16) < p
     np.savez(fixture, **inputs)
-    raw = path.parent / (path.stem + ".fixtures")
-    raw.mkdir(exist_ok=True)
-    for name, value in inputs.items():
-        value.tofile(raw / (name + ".bin"))
 
 
 def cpu_mask_compatibility(path: Path, family: str, chunk_size: int = 128) -> None:

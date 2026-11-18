@@ -28,9 +28,6 @@ namespace din::sam3
             result.cache_dir = config.cache_dir;
             result.provider = config.provider;
             result.confidence_threshold = config.confidence_threshold;
-            result.diagnostic_dir = config.diagnostic_dir;
-            result.diagnostic_graph_dir = config.diagnostic_graph_dir;
-            result.diagnostic_decoder = config.diagnostic_decoder;
             result.max_source_width = result.max_source_height = 8192;
             Check(cudaGetDevice(&result.device));
             return result;

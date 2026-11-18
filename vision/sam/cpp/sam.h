@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -66,8 +68,6 @@ namespace din::sam
         size_t state_capacity = 1, completion_capacity = 8;
         float confidence_threshold = .5f;
         bool cuda_graph = true;
-        // Optional explicit diagnostic mode; readback/file I/O is outside the fast-path contract.
-        std::filesystem::path diagnostic_dir, diagnostic_graph_dir, diagnostic_decoder;
     };
 
     struct Prompt
@@ -170,6 +170,10 @@ namespace din::sam
         void ReserveStates(size_t capacity);
         StateLease AcquireState();
         void ReleaseState(StateLease&&);
+        // Reusable RGB8 decode/upload storage. GPU storage uses ORT's host-accessible
+        // allocator. Waits for prior stream work before allowing host writes.
+        // The view lasts until Sam destruction; serialize access with RunFrame().
+        std::span<uint8_t> HostInputBuffer();
         FrameSubmission RunFrame(const FrameView&, const MaskOutputView&, State& destination,
                                  const State* previous = nullptr, const Initialization* = nullptr);
         int MaxObjects() const;

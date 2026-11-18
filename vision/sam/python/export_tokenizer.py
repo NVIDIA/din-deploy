@@ -11,7 +11,7 @@ from pathlib import Path
 from sam3_common import load_upstream
 
 
-def export_tokenizer(output: Path, tokenizer, context_length: int):
+def export_tokenizer(output: Path, tokenizer, context_length: int, *, fixtures=False):
     import ftfy
 
     # ftfy's character-level compatibility fixes; NFC and lowercasing run through
@@ -35,6 +35,8 @@ def export_tokenizer(output: Path, tokenizer, context_length: int):
     }
     output.mkdir(parents=True, exist_ok=True)
     (output / "tokenizer.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    if not fixtures:
+        return
     prompts = [
         "bicycle",
         "A RED bicycle!",
@@ -72,8 +74,10 @@ def export_tokenizer(output: Path, tokenizer, context_length: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("artifacts/sam3/onnx-fp32"))
+    parser.add_argument("--fixtures", action="store_true", help="Also save tokenizer test cases (off by default)")
     args = parser.parse_args()
     source = load_upstream()
     from sam3.model.tokenizer_ve import SimpleTokenizer
 
-    export_tokenizer(args.output, SimpleTokenizer(str(source / "sam3/assets/bpe_simple_vocab_16e6.txt.gz")), 32)
+    export_tokenizer(args.output, SimpleTokenizer(str(source / "sam3/assets/bpe_simple_vocab_16e6.txt.gz")), 32,
+                     fixtures=args.fixtures)

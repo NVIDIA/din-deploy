@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "sam.h"
+#include "sam_precision.h"
 
 namespace din::sam::detail
 {
@@ -22,22 +23,23 @@ namespace din::sam::detail
     };
 
     void ConvertFrame(const FrameView&, uint8_t* rgb, void* stream);
-    void PreprocessSam2(const uint8_t*, int width, int height, void* image, bool half, void* stream);
-    void PackSam3(const TemporalMeta*, const float* ring, const float* embeddings,
-                  const float* weights, const float* bias, float* mi, float* mip, float* mem, float* mp,
-                  float* pointers, float* positions, bool* memory_valid, bool* pointer_valid,
-                  float* object_valid, void* stream);
-    void CommitSam3(TemporalMeta*, float* ring, Decision*, const float* image, const float* position,
-                    const float* seed_memory, const float* seed_position, const float* seed_pointers,
-                    const float* seed_valid, const float* seed_masks, const float* seed_logits,
-                    const float* track_memory, const float* track_position, const float* track_pointers,
-                    const float* track_masks, const float* track_logits,
-                    float* masks, float* valid, float* scores, float* logits, void* stream);
-    void DetectionScores(const float* classes, const float* presence, const int* selected,
-                         const float* valid, float* scores, float* logits, const float* boxes,
-                         float* output_boxes, int width, int height, void* stream);
-    void Sam2Result(const void* logits, const void* presence, bool half, float* masks,
+    void PreprocessSam2(const uint8_t*, int width, int height, void* image, ModelPrecision, void* stream);
+    void PackSam3(const TemporalMeta*, const void* ring, const float* embeddings,
+                  const float* weights, const float* bias, void* mi, void* mip, void* mem, void* mp,
+                  void* pointers, void* positions, bool* memory_valid, bool* pointer_valid,
+                  void* object_valid, ModelPrecision precision, void* stream);
+    void CommitSam3(TemporalMeta*, void* ring, Decision*, const void* image, const void* position,
+                    const void* seed_memory, const void* seed_position, const void* seed_pointers,
+                    const void* seed_valid, const void* seed_masks, const void* seed_logits,
+                    const void* track_memory, const void* track_position, const void* track_pointers,
+                    const void* track_masks, const void* track_logits,
+                    float* masks, float* valid, float* scores, float* logits, ModelPrecision precision, void* stream);
+    void DetectionScores(const void* classes, const void* presence, const int* selected,
+                         const void* valid, float* scores, float* logits, const void* boxes,
+                         float* output_boxes, int width, int height, ModelPrecision precision, void* stream);
+    void Sam2Result(const void* logits, const void* presence, ModelPrecision, float* masks,
                     float* valid, float* scores, float* output_logits, void* stream);
+    void ModelToFloat(const void*, float*, size_t count, ModelPrecision, void* stream);
     void MemoryValidity(bool* valid, int active, void* stream);
     void ResetMeta(TemporalMeta*, uint64_t length, void* stream);
     void WriteMasks(const float* masks, const float* valid, const float* scores, const float* logits,

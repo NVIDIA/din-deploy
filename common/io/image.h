@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace din::io
@@ -18,6 +20,13 @@ struct RgbImage
     std::vector<uint8_t> rgb;
 };
 
+struct RgbImageView
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::span<uint8_t> rgb;
+};
+
 enum class ImageValueRange
 {
     ZeroTo255,
@@ -27,6 +36,10 @@ enum class ImageValueRange
 // PNG helpers throw on failure. Writers create missing parent directories.
 // Byte buffers are tightly packed, interleaved RGB or single-channel gray.
 RgbImage LoadPng(const std::filesystem::path& path);
+std::pair<uint32_t, uint32_t> ReadPngSize(const std::filesystem::path& path);
+// Decode/convert RGB8 into caller-owned storage, retaining decoder scratch internally.
+// The returned view borrows destination; insufficient capacity throws.
+RgbImageView LoadPng(const std::filesystem::path& path, std::span<uint8_t> destination);
 void SaveRgbPng(const std::filesystem::path& path, const uint8_t* rgb, uint32_t width, uint32_t height);
 void SaveGrayPng(const std::filesystem::path& path, const uint8_t* gray, uint32_t width, uint32_t height);
 

@@ -11,7 +11,7 @@ import json
 import time
 from pathlib import Path
 
-from sam3_common import LOCK, build_predictor
+from sam3_common import add_checkpoint_arguments, build_predictor, checkpoint_options, upstream_metadata
 
 
 def expand_attention_masks(path):
@@ -61,14 +61,16 @@ def fixture_array(value):
 
 
 def export_graph(module, inputs, path, input_names, output_names, fixtures_only=False, opset_version=23,
-                 static_memory=False, cpu_compatible=False):
+                 static_memory=False, cpu_compatible=False, fixtures=False):
     import onnx
     import torch
 
     print(f"Exporting {path.name}", flush=True)
     module.eval()
-    with torch.inference_mode():
-        expected = module(*inputs)
+    fixtures = fixtures or fixtures_only
+    if fixtures:
+        with torch.inference_mode():
+            expected = module(*inputs)
     dynamic_shapes = None
     if path.stem == "image_preprocess":
         dynamic_shapes = {
@@ -113,41 +115,38 @@ def export_graph(module, inputs, path, input_names, output_names, fixtures_only=
                 optimize=False,
                 verbose=False,
             )
-        if path.stem in (
-            "tracking_decoder",
-            "memory_attention",
-            "seed_decoder",
-            "seed_memory",
-            "tracking_memory",
-            "memory_encoder",
-        ):
-            program.optimize()
+        # Optimize every graph, including text, vision and detection.
+        program.optimize()
         program.save(path, external_data=True)
         from lower_sequences import lower_sequences
 
         lower_sequences(path)
         expand_attention_masks(path)
     onnx.checker.check_model(str(path), full_check=True)
-    import numpy as np
+    if fixtures:
+        import numpy as np
 
-    np.savez(path.with_suffix(".inputs.npz"), **{k: fixture_array(v) for k, v in zip(input_names, inputs, strict=True)})
-    np.savez(
-        path.with_suffix(".outputs.npz"), **{k: fixture_array(v) for k, v in zip(output_names, expected, strict=True)}
-    )
-    raw_dir = path.parent / (path.stem + ".fixtures")
-    raw_dir.mkdir(exist_ok=True)
-    for names, values in ((input_names, inputs), (output_names, expected)):
-        for name, value in zip(names, values, strict=True):
-            fixture_array(value).tofile(raw_dir / (name + ".bin"))
+        np.savez(path.with_suffix(".inputs.npz"),
+                 **{k: fixture_array(v) for k, v in zip(input_names, inputs, strict=True)})
+        np.savez(
+            path.with_suffix(".outputs.npz"),
+            **{k: fixture_array(v) for k, v in zip(output_names, expected, strict=True)}
+        )
     if static_memory and path.stem == "memory_attention":
         from static_attention import specialize_fixtures, specialize_memory_attention
         if not any(value.name == "memory_valid" for value in onnx.load(path, load_external_data=False).graph.input):
             specialize_memory_attention(path, "sam3")
-        specialize_fixtures(path, "sam3")
+        if fixtures:
+            specialize_fixtures(path, "sam3")
         if cpu_compatible and not fixtures_only:
             from static_attention import cpu_mask_compatibility
 
             cpu_mask_compatibility(path, "sam3")
+    optimization = None
+    if not fixtures_only:
+        from sam_onnx_optimization import fold_graph
+
+        optimization = fold_graph(path)
     graph = onnx.load(path, load_external_data=False).graph
     if path.stem in ('seed_memory', 'tracking_memory') and not any(
         'valid' in node.input for node in graph.node
@@ -164,20 +163,21 @@ def export_graph(module, inputs, path, input_names, output_names, fixtures_only=
             for value in values
         ]
 
-    fixture_shapes = {name: list(value.shape) for name, value in zip(input_names, inputs, strict=True)}
-    if static_memory and path.stem == "memory_attention":
-        with np.load(path.with_suffix(".inputs.npz")) as saved:
-            fixture_shapes = {name: list(value.shape) for name, value in saved.items()}
-    return {
+    contract = {
         "file": path.name,
         "inputs": describe(graph.input),
         "outputs": describe(graph.output),
-        "fixture_inputs": fixture_shapes,
+        "constant_folding": optimization,
     }
+    if fixtures:
+        with np.load(path.with_suffix(".inputs.npz")) as saved:
+            contract["fixture_inputs"] = {name: list(value.shape) for name, value in saved.items()}
+    return contract
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_checkpoint_arguments(parser)
     parser.add_argument("--output", type=Path, default=Path("artifacts/sam3/onnx-bf16"))
     graph_names = [
         "image_preprocess",
@@ -192,7 +192,11 @@ def main():
         "memory_attention",
     ]
     parser.add_argument("--graphs", nargs="+", choices=graph_names, default=graph_names)
-    parser.add_argument("--fixtures-only", action="store_true", help="Regenerate PyTorch fixtures for existing graphs")
+    fixture_mode = parser.add_mutually_exclusive_group()
+    fixture_mode.add_argument("--fixtures", action="store_true",
+                              help="Also save PyTorch input/output NPZ fixtures for per-graph numerical checks (off by default)")
+    fixture_mode.add_argument("--fixtures-only", action="store_true",
+                              help="Regenerate PyTorch fixtures for existing graphs without exporting ONNX")
     parser.add_argument("--dtype", choices=("bfloat16", "float32", "float16"), default="bfloat16",
                         help="BF16 is preferred; FP32 is required for CPU/reference use; FP16 has quality tradeoffs")
     parser.add_argument("--opset", type=int, default=23, help="ONNX opset (23+ preserves native attention)")
@@ -222,7 +226,7 @@ def main():
         VisionEncoder,
     )
 
-    predictor = build_predictor()
+    predictor = build_predictor(**checkpoint_options(args))
     model = predictor.model
     dtype = getattr(torch, args.dtype)
     # Module precision helpers retain complex rotary buffers.
@@ -239,7 +243,7 @@ def main():
             "memory_encoder": "Packed masks, 1008 or 1152 square",
         },
         "model_family": "sam3.1",
-        **LOCK,
+        **upstream_metadata(args),
         "dtype": args.dtype,
         "image_size": 1008,
         "backbone_stride": 14,
@@ -258,7 +262,7 @@ def main():
             "normalization": "x / 127.5 - 1",
             "native_gpu_implementation": "CUDA separable triangle filter",
         },
-        "tokenizer": {"file": "tokenizer.json", "fixtures": "tokenizer_tests.json", "context_length": 32},
+        "tokenizer": {"file": "tokenizer.json", "context_length": 32},
         "tracking_status": "exported boundaries; native sequence controller not validated",
     }
     metadata["environment"] = {
@@ -282,7 +286,9 @@ def main():
         token_ids = tokenizer(["bicycle"], context_length=text_encoder.text.context_length).cuda()
         text = text_encoder(token_ids)
         metadata["text_context_length"] = token_ids.shape[1]
-        export_tokenizer(args.output, tokenizer, token_ids.shape[1])
+        export_tokenizer(args.output, tokenizer, token_ids.shape[1], fixtures=args.fixtures or args.fixtures_only)
+        if args.fixtures or args.fixtures_only:
+            metadata["tokenizer"]["fixtures"] = "tokenizer_tests.json"
         jobs = {}
         if "image_preprocess" in args.graphs:
             jobs["image_preprocess"] = (
@@ -463,8 +469,11 @@ def main():
             start = time.perf_counter()
             contract = export_graph(
                 module, inputs, args.output / f"{name}.onnx", in_names, out_names,
-                args.fixtures_only, args.opset, static_memory=args.static_memory, cpu_compatible=args.cpu_compatible
+                args.fixtures_only, args.opset, static_memory=args.static_memory, cpu_compatible=args.cpu_compatible,
+                fixtures=args.fixtures
             )
+            if args.fixtures_only:
+                contract["constant_folding"] = metadata["graphs"].get(name, {}).get("constant_folding")
             metadata["graphs"][name] = contract
             if name == "memory_attention" and args.static_memory:
                 metadata["attention_contract"] = {"version": 1, "spatial_frames": 7,

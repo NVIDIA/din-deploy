@@ -196,41 +196,47 @@ private:
     OrtSyncNotificationImpl* ort_notification_ = nullptr;
 };
 
-template <typename T>
-class TensorBuffer
+// Runtime-typed storage shared by typed adapters and metadata-driven pipelines.
+// EP DEFAULT allocations are used on discrete GPUs; HOST_ACCESSIBLE allocations
+// are bound directly on UMA. Owners, logical views and execution pointers stay
+// stable until destruction or an explicit SwapWith().
+class TensorBufferBase
 {
 public:
-    TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma = false);
-    TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream, const std::vector<int64_t>& shape,
-                 bool use_device_io, bool disable_uma = false);
+    TensorBufferBase(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream,
+                     const std::vector<int64_t>& shape, ONNXTensorElementDataType type,
+                     bool use_device_io, bool disable_uma = false, size_t reserved_bytes = 0);
 
     Ort::Value& BindingValue();
-
-    T* HostData();
-
-    const T* HostData() const;
-
-    void Fill(T value);
-
+    void* HostData();
+    const void* HostData() const;
+    // CUDA device pointer on GPU, CPU pointer otherwise. UMA mapping is resolved
+    // once at allocation; it need not equal the CPU address returned by HostData().
+    void* Data();
+    const void* Data() const;
+    const std::vector<int64_t>& Shape() const { return shape_; }
+    ONNXTensorElementDataType Type() const { return type_; }
+    size_t ByteSize() const { return bytes_; }
+    size_t CapacityBytes() const { return capacity_bytes_; }
+    bool UsesUnifiedMemory() const { return use_unified_memory_; }
     void CopyFromHostValue(Ort::Value& value);
-
     void CopyAsyncToDevice();
-
+    // Copy only the active prefix of a reusable input buffer.
+    void CopyAsyncToDevice(size_t bytes);
     NotificationPtr CopyAsyncToDeviceWithNotification();
-
     void CopyAsyncToHost();
-
+    void CopyAsyncToHost(size_t bytes);
     NotificationPtr CopyAsyncToHostWithNotification();
+    void CopyFrom(TensorBufferBase& other);
+    void SwapWith(TensorBufferBase& other);
 
-    void CopyFrom(TensorBuffer& other);
-
-    void SwapWith(TensorBuffer& other);
+protected:
+    size_t ElementCount() const { return count_; }
 
 private:
+    void CopyPrefix(Ort::Value& source, Ort::Value& destination, size_t bytes);
     static void Copy(Ort::Env& env, std::initializer_list<Ort::Value*> src, std::initializer_list<Ort::Value*> dst,
                      Ort::SyncStream& stream);
-
-    [[nodiscard]] size_t ElementCount() const;
 
     // Allocators belong to the environment. External streams must outlive this
     // buffer, allowing a model session to be replaced without moving its tensors.
@@ -239,9 +245,29 @@ private:
     bool use_device_io_ = false;
     bool use_unified_memory_ = false;
     std::vector<int64_t> shape_;
+    ONNXTensorElementDataType type_;
+    size_t count_ = 1, bytes_ = 0, capacity_bytes_ = 0;
+    void* data_ = nullptr;
     Ort::AllocatorWithDefaultOptions cpu_allocator_;
+    // Storage owns capacity; views expose the requested dtype and logical shape.
+    Ort::Value host_storage_{nullptr};
+    Ort::Value device_storage_{nullptr};
     Ort::Value host_tensor_{nullptr};
     Ort::Value device_tensor_{nullptr};
+};
+
+template <typename T>
+class TensorBuffer : public TensorBufferBase
+{
+public:
+    TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma = false);
+    TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream, const std::vector<int64_t>& shape,
+                 bool use_device_io, bool disable_uma = false);
+    T* HostData();
+    const T* HostData() const;
+    T* Data() { return static_cast<T*>(TensorBufferBase::Data()); }
+    const T* Data() const { return static_cast<const T*>(TensorBufferBase::Data()); }
+    void Fill(T value);
 };
 
 inline void BindOutput(Ort::IoBinding& binding, const char* name, OrtRunner& runner, bool use_device_io)

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -100,6 +101,7 @@ public:
         cuDeviceGetUuid = LoadFunction<CuDeviceGetUuidFn>("cuDeviceGetUuid");
         cuDriverGetVersion = LoadFunction<CuDriverGetVersionFn>("cuDriverGetVersion");
         cuDeviceGetAttribute = LoadFunction<CuDeviceGetAttributeFn>("cuDeviceGetAttribute");
+        cuMemHostGetDevicePointer = LoadFunction<CuMemHostGetDevicePointerFn>("cuMemHostGetDevicePointer_v2");
         cuGetErrorName = LoadOptionalFunction<CuGetErrorNameFn>("cuGetErrorName");
 #ifdef _WIN32
         cuDeviceGetLuid = LoadOptionalFunction<CuDeviceGetLuidFn>("cuDeviceGetLuid");
@@ -131,6 +133,7 @@ public:
     using CuDeviceGetUuidFn = CUresult(CUDAAPI*)(CUuuid*, CUdevice);
     using CuDriverGetVersionFn = CUresult(CUDAAPI*)(int*);
     using CuDeviceGetAttributeFn = CUresult(CUDAAPI*)(int*, CUdevice_attribute, CUdevice);
+    using CuMemHostGetDevicePointerFn = CUresult(CUDAAPI*)(CUdeviceptr*, void*, unsigned int);
     using CuGetErrorNameFn = CUresult(CUDAAPI*)(CUresult, const char**);
 #ifdef _WIN32
     using CuDeviceGetLuidFn = CUresult(CUDAAPI*)(char*, unsigned int*, CUdevice);
@@ -143,6 +146,7 @@ public:
     CuDeviceGetUuidFn cuDeviceGetUuid = nullptr;
     CuDriverGetVersionFn cuDriverGetVersion = nullptr;
     CuDeviceGetAttributeFn cuDeviceGetAttribute = nullptr;
+    CuMemHostGetDevicePointerFn cuMemHostGetDevicePointer = nullptr;
     CuGetErrorNameFn cuGetErrorName = nullptr;
 #ifdef _WIN32
     CuDeviceGetLuidFn cuDeviceGetLuid = nullptr;
@@ -951,12 +955,65 @@ TensorBuffer<T>::TensorBuffer(OrtRunner& runner, const std::vector<int64_t>& sha
 template <typename T>
 TensorBuffer<T>::TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream,
                               const std::vector<int64_t>& shape, bool use_device_io, bool disable_uma)
-    : env_(&env)
-    , compute_stream_(stream)
-    , use_device_io_(use_device_io)
-    , use_unified_memory_(use_device_io && IsCudaUnifiedMemoryDevice(device) && !disable_uma)
-    , shape_(shape)
+    : TensorBufferBase(env, device, stream, shape, Ort::TypeToTensorType<T>::type, use_device_io, disable_uma)
 {
+}
+
+TensorBufferBase::TensorBufferBase(Ort::Env& env, Ort::ConstEpDevice device, Ort::SyncStream* stream,
+                                   const std::vector<int64_t>& shape, ONNXTensorElementDataType type,
+                                   bool use_device_io, bool disable_uma, size_t reserved_bytes)
+    : env_(&env)
+      , compute_stream_(stream)
+      , use_device_io_(use_device_io)
+      , use_unified_memory_(use_device_io && IsCudaUnifiedMemoryDevice(device) && !disable_uma)
+      , shape_(shape)
+      , type_(type)
+{
+    size_t element_bytes;
+    switch (type)
+    {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ: element_bytes = 1;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16: element_bytes = 2;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32: element_bytes = 4;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64: element_bytes = 8;
+        break;
+    default: throw std::invalid_argument("Unsupported tensor buffer element type");
+    }
+    for (const auto dimension : shape)
+    {
+        if (dimension < 0 || (dimension && count_ > std::numeric_limits<size_t>::max() / size_t(dimension)))
+            throw std::invalid_argument("Invalid tensor buffer dimensions");
+        count_ *= size_t(dimension);
+    }
+    if (count_ > std::numeric_limits<size_t>::max() / element_bytes)
+        throw std::invalid_argument("Tensor buffer byte size overflows");
+    bytes_ = count_ * element_bytes;
+    capacity_bytes_ = std::max(bytes_, reserved_bytes);
+    if (capacity_bytes_ > size_t(std::numeric_limits<int64_t>::max()))
+        throw std::invalid_argument("Tensor buffer capacity overflows");
+    const int64_t storage_shape[]{int64_t(capacity_bytes_)};
+    const auto allocate = [&](const auto& allocator, Ort::Value& storage, Ort::Value& tensor)
+    {
+        storage = Ort::Value::CreateTensor<uint8_t>(allocator, storage_shape, 1);
+        tensor = Ort::Value::CreateTensor(storage.GetTensorMemoryInfo(), storage.GetTensorMutableRawData(),
+                                          capacity_bytes_, shape_.data(), shape_.size(), type_);
+    };
     if (use_device_io_)
     {
         if (!device || stream == nullptr)
@@ -964,37 +1021,49 @@ TensorBuffer<T>::TensorBuffer(Ort::Env& env, Ort::ConstEpDevice device, Ort::Syn
         const auto pinned = env.GetSharedAllocator(device.GetMemoryInfo(OrtDeviceMemoryType_HOST_ACCESSIBLE));
         if (!pinned)
             throw std::runtime_error("Missing shared pinned allocator");
-        host_tensor_ = Ort::Value::CreateTensor<T>(pinned, shape_.data(), shape_.size());
+        allocate(pinned, host_storage_, host_tensor_);
         if (!use_unified_memory_)
         {
             const auto allocator = env.GetSharedAllocator(device.GetMemoryInfo(OrtDeviceMemoryType_DEFAULT));
             if (!allocator)
                 throw std::runtime_error("Missing shared device allocator");
-            device_tensor_ = Ort::Value::CreateTensor<T>(allocator, shape_.data(), shape_.size());
+            allocate(allocator, device_storage_, device_tensor_);
         }
     }
     else
     {
-        host_tensor_ = Ort::Value::CreateTensor<T>(cpu_allocator_, shape_.data(), shape_.size());
+        allocate(cpu_allocator_, host_storage_, host_tensor_);
+    }
+    data_ = BindingValue().GetTensorMutableRawData();
+    if (use_unified_memory_ && data_)
+    {
+        CUdeviceptr mapped = 0;
+        ThrowOnCudaDriverError(GetCudaDriverApi().cuMemHostGetDevicePointer(&mapped, data_, 0),
+                               "cuMemHostGetDevicePointer");
+        data_ = reinterpret_cast<void*>(mapped);
     }
 }
 
-template <typename T>
-Ort::Value& TensorBuffer<T>::BindingValue()
+Ort::Value& TensorBufferBase::BindingValue()
 {
     return use_device_io_ && !use_unified_memory_ ? device_tensor_ : host_tensor_;
 }
 
+void* TensorBufferBase::HostData() { return host_tensor_.GetTensorMutableRawData(); }
+const void* TensorBufferBase::HostData() const { return host_tensor_.GetTensorRawData(); }
+void* TensorBufferBase::Data() { return data_; }
+const void* TensorBufferBase::Data() const { return data_; }
+
 template <typename T>
 T* TensorBuffer<T>::HostData()
 {
-    return host_tensor_.GetTensorMutableData<T>();
+    return static_cast<T*>(TensorBufferBase::HostData());
 }
 
 template <typename T>
 const T* TensorBuffer<T>::HostData() const
 {
-    return host_tensor_.GetTensorData<T>();
+    return static_cast<const T*>(TensorBufferBase::HostData());
 }
 
 template <typename T>
@@ -1003,24 +1072,45 @@ void TensorBuffer<T>::Fill(T value)
     std::fill_n(HostData(), ElementCount(), value);
 }
 
-template <typename T>
-void TensorBuffer<T>::CopyFromHostValue(Ort::Value& value)
+void TensorBufferBase::CopyFromHostValue(Ort::Value& value)
 {
-    const auto count = value.GetTensorTypeAndShapeInfo().GetElementCount();
-    std::copy_n(value.GetTensorData<T>(), count, HostData());
+    const auto info = value.GetTensorTypeAndShapeInfo();
+    const auto count = info.GetElementCount();
+    if (info.GetElementType() != type_ || count > count_)
+        throw std::invalid_argument("Incompatible host tensor");
+    if (count && HostData() != value.GetTensorRawData())
+        std::memcpy(HostData(), value.GetTensorRawData(), count * (bytes_ / count_));
 }
 
-template <typename T>
-void TensorBuffer<T>::CopyAsyncToDevice()
+void TensorBufferBase::CopyAsyncToDevice()
 {
+    CopyAsyncToDevice(bytes_);
+}
+
+void TensorBufferBase::CopyAsyncToDevice(size_t bytes)
+{
+    if (bytes > bytes_)
+        throw std::invalid_argument("Tensor upload exceeds logical size");
     if (use_device_io_ && !use_unified_memory_)
+        CopyPrefix(host_tensor_, device_tensor_, bytes);
+}
+
+void TensorBufferBase::CopyPrefix(Ort::Value& source, Ort::Value& destination, size_t bytes)
+{
+    if (bytes == bytes_)
+        Copy(*env_, {&source}, {&destination}, *compute_stream_);
+    else if (bytes)
     {
-        Copy(*env_, {&host_tensor_}, {&device_tensor_}, *compute_stream_);
+        const int64_t shape[]{int64_t(bytes)};
+        auto src = Ort::Value::CreateTensor(source.GetTensorMemoryInfo(), source.GetTensorMutableRawData(), bytes,
+                                            shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+        auto dst = Ort::Value::CreateTensor(destination.GetTensorMemoryInfo(), destination.GetTensorMutableRawData(),
+                                            bytes, shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+        Copy(*env_, {&src}, {&dst}, *compute_stream_);
     }
 }
 
-template <typename T>
-NotificationPtr TensorBuffer<T>::CopyAsyncToDeviceWithNotification()
+NotificationPtr TensorBufferBase::CopyAsyncToDeviceWithNotification()
 {
     CopyAsyncToDevice();
     if (!use_device_io_)
@@ -1034,17 +1124,20 @@ NotificationPtr TensorBuffer<T>::CopyAsyncToDeviceWithNotification()
     return notification;
 }
 
-template <typename T>
-void TensorBuffer<T>::CopyAsyncToHost()
+void TensorBufferBase::CopyAsyncToHost()
 {
-    if (use_device_io_ && !use_unified_memory_)
-    {
-        Copy(*env_, {&device_tensor_}, {&host_tensor_}, *compute_stream_);
-    }
+    CopyAsyncToHost(bytes_);
 }
 
-template <typename T>
-NotificationPtr TensorBuffer<T>::CopyAsyncToHostWithNotification()
+void TensorBufferBase::CopyAsyncToHost(size_t bytes)
+{
+    if (bytes > bytes_)
+        throw std::invalid_argument("Tensor download exceeds logical size");
+    if (use_device_io_ && !use_unified_memory_)
+        CopyPrefix(device_tensor_, host_tensor_, bytes);
+}
+
+NotificationPtr TensorBufferBase::CopyAsyncToHostWithNotification()
 {
     CopyAsyncToHost();
     if (!use_device_io_)
@@ -1058,10 +1151,11 @@ NotificationPtr TensorBuffer<T>::CopyAsyncToHostWithNotification()
     return notification;
 }
 
-template <typename T>
-void TensorBuffer<T>::CopyFrom(TensorBuffer& other)
+void TensorBufferBase::CopyFrom(TensorBufferBase& other)
 {
-    if (use_device_io_ != other.use_device_io_ || shape_ != other.shape_)
+    if (this == &other) return;
+    if (use_device_io_ != other.use_device_io_ || use_unified_memory_ != other.use_unified_memory_ ||
+        shape_ != other.shape_ || type_ != other.type_)
     {
         throw std::runtime_error("cannot copy incompatible tensor buffers");
     }
@@ -1071,24 +1165,27 @@ void TensorBuffer<T>::CopyFrom(TensorBuffer& other)
     }
     else
     {
-        std::copy_n(other.HostData(), ElementCount(), HostData());
+        if (bytes_) std::memcpy(HostData(), other.HostData(), bytes_);
     }
 }
 
-template <typename T>
-void TensorBuffer<T>::SwapWith(TensorBuffer& other)
+void TensorBufferBase::SwapWith(TensorBufferBase& other)
 {
-    if (use_device_io_ != other.use_device_io_ || shape_ != other.shape_)
+    if (use_device_io_ != other.use_device_io_ || use_unified_memory_ != other.use_unified_memory_ ||
+        shape_ != other.shape_ || type_ != other.type_)
     {
         throw std::runtime_error("cannot swap incompatible tensor buffers");
     }
+    std::swap(host_storage_, other.host_storage_);
+    std::swap(device_storage_, other.device_storage_);
     std::swap(host_tensor_, other.host_tensor_);
     std::swap(device_tensor_, other.device_tensor_);
+    std::swap(data_, other.data_);
+    std::swap(capacity_bytes_, other.capacity_bytes_);
 }
 
-template <typename T>
-void TensorBuffer<T>::Copy(Ort::Env& env, std::initializer_list<Ort::Value*> src,
-                           std::initializer_list<Ort::Value*> dst, Ort::SyncStream& stream)
+void TensorBufferBase::Copy(Ort::Env& env, std::initializer_list<Ort::Value*> src,
+                            std::initializer_list<Ort::Value*> dst, Ort::SyncStream& stream)
 {
     std::vector<const OrtValue*> src_values;
     std::vector<OrtValue*> dst_values;
@@ -1105,16 +1202,6 @@ void TensorBuffer<T>::Copy(Ort::Env& env, std::initializer_list<Ort::Value*> src
                        return static_cast<OrtValue*>(*value);
                    });
     Ort::ThrowOnError(Ort::GetApi().CopyTensors(env, src_values.data(), dst_values.data(), stream, src_values.size()));
-}
-
-template <typename T>
-size_t TensorBuffer<T>::ElementCount() const
-{
-    return std::accumulate(shape_.begin(), shape_.end(), size_t{1},
-                           [](size_t count, int64_t dim)
-                           {
-                               return count * static_cast<size_t>(dim);
-                           });
 }
 
 // Explicitly instantiate TensorBuffer for every ONNXTensorElementDataType that

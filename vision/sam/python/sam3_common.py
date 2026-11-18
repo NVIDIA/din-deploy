@@ -4,38 +4,67 @@
 
 from __future__ import annotations
 
-import json
+import importlib.util
 import os
-import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-LOCK = json.loads((Path(__file__).parents[1] / "sam3_upstream.json").read_text(encoding="utf-8"))
+DEFAULT_CHECKPOINT_REPO = "facebook/sam3.1"
+DEFAULT_CHECKPOINT_FILE = "sam3.1_multiplex.pt"
+DEFAULT_CHECKPOINT_REVISION = "daa63191845a41281374e725f4c9e51c7a824460"
+
+
+def add_checkpoint_arguments(parser):
+    parser.add_argument(
+        "--checkpoint-repo", default=DEFAULT_CHECKPOINT_REPO, help="SAM3 Hugging Face checkpoint repository"
+    )
+    parser.add_argument("--checkpoint-file", default=DEFAULT_CHECKPOINT_FILE, help="SAM3 checkpoint filename")
+    parser.add_argument("--checkpoint-revision", default=DEFAULT_CHECKPOINT_REVISION, help="SAM3 checkpoint revision")
+
+
+def checkpoint_options(args):
+    return {name: getattr(args, name) for name in ("checkpoint_repo", "checkpoint_file", "checkpoint_revision")}
+
+
+def upstream_metadata(args):
+    with (ROOT / "pyproject.toml").open("rb") as stream:
+        dependencies = tomllib.load(stream)["project"]["optional-dependencies"]["sam3"]
+    source = next(dependency for dependency in dependencies if dependency.startswith("sam3 @ git+"))
+    repository, revision = source.split(" @ git+", 1)[1].rsplit("@", 1)
+    return {"source_repo": repository.removesuffix(".git"), "source_revision": revision, **checkpoint_options(args)}
 
 
 def load_upstream() -> Path:
     # Upstream's fused performance kernels force BF16 and are not ONNX operators.
     os.environ["USE_PERFLIB"] = "0"
-    source = ROOT / "artifacts/sam3/upstream" / ("sam3-" + LOCK["source_revision"])
-    if not (source / "sam3/model_builder.py").is_file():
-        raise FileNotFoundError("Run vision/sam/python/prepare_sam3.py first")
-    # Optional task-local dependencies preserve the configured interpreter's packages.
-    deps = ROOT / "artifacts/sam3/python_deps"
-    if deps.is_dir():
-        sys.path.insert(0, str(deps))
-    sys.path.insert(0, str(source))
-    return source
+    package = importlib.util.find_spec("sam3")
+    if package is None or package.origin is None:
+        raise ModuleNotFoundError('Install the pinned SAM3 dependency with uv pip install -e ".[sam3]"')
+    # Preserve the source-root contract used by the standalone tokenizer exporter.
+    return Path(package.origin).resolve().parent.parent
 
 
-def checkpoint_path() -> str:
+def checkpoint_path(
+        *,
+        checkpoint_repo=DEFAULT_CHECKPOINT_REPO,
+        checkpoint_file=DEFAULT_CHECKPOINT_FILE,
+        checkpoint_revision=DEFAULT_CHECKPOINT_REVISION,
+        local_files_only=True,
+) -> str:
     from huggingface_hub import hf_hub_download
 
     return hf_hub_download(
-        LOCK["checkpoint_repo"], LOCK["checkpoint_file"], revision=LOCK["checkpoint_revision"], local_files_only=True
+        checkpoint_repo, checkpoint_file, revision=checkpoint_revision, local_files_only=local_files_only
     )
 
 
-def build_predictor():
+def build_predictor(
+        *,
+        checkpoint_repo=DEFAULT_CHECKPOINT_REPO,
+        checkpoint_file=DEFAULT_CHECKPOINT_FILE,
+        checkpoint_revision=DEFAULT_CHECKPOINT_REVISION,
+):
     load_upstream()
     import sam3.model_builder as builder
     import torch
@@ -83,7 +112,11 @@ def build_predictor():
     model_type.load_state_dict = checked_loader
     try:
         predictor = builder.build_sam3_multiplex_video_predictor(
-            checkpoint_path=checkpoint_path(),
+            checkpoint_path=checkpoint_path(
+                checkpoint_repo=checkpoint_repo,
+                checkpoint_file=checkpoint_file,
+                checkpoint_revision=checkpoint_revision,
+            ),
             max_num_objects=16,
             multiplex_count=16,
             use_fa3=False,

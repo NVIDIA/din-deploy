@@ -23,9 +23,6 @@ namespace din::sam3
             result.cache_dir = config.cache_dir;
             result.provider = config.provider;
             result.confidence_threshold = config.confidence_threshold;
-            result.diagnostic_dir = config.diagnostic_dir;
-            result.diagnostic_graph_dir = config.diagnostic_graph_dir;
-            result.diagnostic_decoder = config.diagnostic_decoder;
             result.max_source_width = result.max_source_height = 8192;
             if (result.provider == "trt-rtx") cudaGetDevice(&result.device);
             return result;
@@ -66,7 +63,7 @@ namespace din::sam3
             }
         }
 
-        FrameResult Run(const Image& image, const DeviceFrame* device)
+        FrameResult Run(const io::RgbImage& image, const DeviceFrame* device)
         {
             if (!image.width || !image.height || image.width > 8192 || image.height > 8192 ||
                 (device && device->row_bytes > size_t(PTRDIFF_MAX) / image.height))
@@ -168,7 +165,7 @@ namespace din::sam3
 
     Sam3Pipeline::~Sam3Pipeline() = default;
 
-    FrameResult Sam3Pipeline::SegmentImage(const Image& image, const TextPrompt& prompt)
+    FrameResult Sam3Pipeline::SegmentImage(const io::RgbImage& image, const TextPrompt& prompt)
     {
         impl_->Prepare(prompt);
         impl_->sequence = false;
@@ -195,7 +192,7 @@ namespace din::sam3
         impl_->count = count;
     }
 
-    FrameResult Sam3Pipeline::ProcessNextFrame(const Image& image)
+    FrameResult Sam3Pipeline::ProcessNextFrame(const io::RgbImage& image)
     {
         if (!impl_->sequence) throw std::logic_error("ResetSequence is required");
         return impl_->Run(image, nullptr);

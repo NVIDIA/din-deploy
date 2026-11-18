@@ -21,10 +21,6 @@ namespace din::sam3
         bool profile = false;
         // Build compatibility export rasters from the returned host probabilities.
         bool rasterize_output = false;
-        // Optional decoder diagnostics. Requires an instrumented graph exposing debug_* outputs.
-        std::filesystem::path diagnostic_dir;
-        std::filesystem::path diagnostic_decoder;
-        std::filesystem::path diagnostic_graph_dir;
     };
 
     struct TextPrompt

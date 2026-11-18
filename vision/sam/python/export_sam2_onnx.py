@@ -13,6 +13,8 @@ import onnx
 import torch
 from onnx import TensorProto, helper
 
+from sam_onnx_optimization import fold_graph
+
 from sam2_modeling import (
     SAM2ImageEncoder,
     SAM2ImagePreprocessor,
@@ -158,6 +160,7 @@ def export_mask_postprocess(args: argparse.Namespace) -> None:
     model.ir_version = 10
     onnx.checker.check_model(model)
     onnx.save_model(model, path, save_as_external_data=False)
+    fold_graph(path)
     print(f"Exported {path}")
 
 
@@ -286,7 +289,7 @@ def export_onnx(
             from static_attention import cpu_mask_compatibility
 
             cpu_mask_compatibility(path, "sam2")
-    onnx.checker.check_model(str(path), full_check=True)
+    fold_graph(path)
     print(f"Exported {path}")
 
 
